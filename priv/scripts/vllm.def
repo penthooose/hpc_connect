@@ -1,0 +1,19 @@
+Bootstrap: docker
+From: vllm/vllm-openai:latest
+
+%post
+    mkdir -p /cache /models /work
+
+%environment
+    export HF_HOME=/cache/huggingface
+    export TRANSFORMERS_CACHE=/cache/huggingface
+    export VLLM_NO_USAGE_STATS=1
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    exec python3 -m vllm.entrypoints.openai.api_server "$@"
+
+%labels
+    Maintainer hpc_connect
+    Version 1.0
+    Description vLLM OpenAI-compatible inference server
