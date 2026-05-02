@@ -32,13 +32,38 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "${MODEL_PATH}" && -n "${VLLM_MODEL:-}" && -n "${HPC_MODELS_DIR:-}" ]]; then
+  MODEL_SUBDIR="${VLLM_MODEL//\//-}"
+  MODEL_PATH="${HPC_MODELS_DIR}/${MODEL_SUBDIR}"
+fi
+
+if [[ -n "${APP_ARGS:-}" ]]; then
+  read -r -a APP_ARG_ARRAY <<< "$APP_ARGS"
+  EXTRA_ARGS+=("${APP_ARG_ARRAY[@]}")
+fi
+
 if [[ -z "${MODEL_PATH}" ]]; then
-  echo "--model is required" >&2
+  echo "--model is required or set VLLM_MODEL/HPC_MODELS_DIR" >&2
   exit 1
 fi
 
-exec python -m vllm.entrypoints.openai.api_server \
+cmd=(python -m vllm.entrypoints.openai.api_server \
   --model "${MODEL_PATH}" \
   --host "${HOST}" \
-  --port "${PORT}" \
-  "${EXTRA_ARGS[@]}"
+  --port "${PORT}")
+
+if [[ -n "${VLLM_TP:-}" ]]; then
+  cmd+=(--tensor-parallel-size "${VLLM_TP}")
+fi
+
+if [[ -n "${VLLM_GPU_MEM:-}" ]]; then
+  cmd+=(--gpu-memory-utilization "${VLLM_GPU_MEM}")
+fi
+
+if [[ -n "${VLLM_MAX_LEN:-}" ]]; then
+  cmd+=(--max-model-len "${VLLM_MAX_LEN}")
+fi
+
+cmd+=("${EXTRA_ARGS[@]}")
+
+exec "${cmd[@]}"

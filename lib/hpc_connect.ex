@@ -431,11 +431,33 @@ defmodule HpcConnect do
   """
   @spec install_remote_scripts!(Session.t()) :: :ok
   def install_remote_scripts!(%Session{ssh_conn: nil} = session) do
-    session
-    |> Scripts.install_commands()
-    |> Enum.each(&run_command!/1)
+    scripts_dir = Path.join([:code.priv_dir(:hpc_connect), "scripts"])
+    remote_dir = session.work_dir <> "/scripts"
 
-    :ok
+    try do
+      session
+      |> Scripts.install_commands()
+      |> Enum.each(&run_command!/1)
+
+      :ok
+    rescue
+      e in RuntimeError ->
+        message = Exception.message(e)
+
+        if String.contains?(message, "scp failed") or
+             String.contains?(message, "Connection refused") or
+             String.contains?(message, "Connection closed") do
+          {session2, _tunnel} = open_connection!(session)
+
+          try do
+            SSH.upload!(session2, scripts_dir, remote_dir, recursive: true)
+          after
+            SSH.close_connection(session2)
+          end
+        else
+          raise e
+        end
+    end
   end
 
   def install_remote_scripts!(%Session{} = session) do
@@ -498,20 +520,49 @@ defmodule HpcConnect do
   Options: `:name`, `:local_def_path`, `:partition`, `:walltime`, `:cpus`,
   `:force_rebuild`, `:timeout`, `:interval`.
   """
-  @spec build_sif_job(Session.t(), keyword()) :: map()
-  def build_sif_job(%Session{} = session, opts \\ []),
+  @spec build_sif_job(Session.t(), keyword() | binary()) :: map()
+  def build_sif_job(session, opts \\ [])
+
+  def build_sif_job(%Session{} = session, name) when is_binary(name),
+    do: Slurm.build_sif_job(session, name)
+
+  def build_sif_job(%Session{} = session, opts),
     do: Slurm.build_sif_job(session, opts)
 
   @doc """
   Uploads the `.def` file, submits the build job, then **blocks** until the SIF
   is ready and returns its remote path.
 
+  Supports either a name string or options list.
+
   Options: same as `build_sif_job/2` plus `:timeout` (ms, default 3_600_000 = 1 h),
   `:interval` (ms between polls, default 15_000).
   """
-  @spec build_sif_blocking(Session.t(), keyword()) :: binary()
-  def build_sif_blocking(%Session{} = session, opts \\ []),
+  @spec build_sif_blocking(Session.t(), binary() | keyword(), keyword()) :: binary()
+  def build_sif_blocking(session, name_or_opts \\ [], opts \\ [])
+
+  def build_sif_blocking(%Session{} = session, name, opts) when is_binary(name) and is_list(opts),
+    do: Slurm.build_sif_blocking(session, [name: name] ++ opts)
+
+  def build_sif_blocking(%Session{} = session, opts, []) when is_list(opts),
     do: Slurm.build_sif_blocking(session, opts)
+
+  @doc """
+  Builds a Singularity/Apptainer image and waits for completion.
+
+  Supports both forms:
+  - `build_sif(session, "vllm")`
+  - `build_sif(session, "vllm", force_rebuild: true)`
+  - `build_sif(session, name: "vllm", force_rebuild: true)`
+  """
+  @spec build_sif(Session.t(), binary() | keyword(), keyword()) :: binary()
+  def build_sif(session, name_or_opts \\ [], opts \\ [])
+
+  def build_sif(%Session{} = session, name, opts) when is_binary(name) and is_list(opts),
+    do: build_sif_blocking(session, [name: name] ++ opts)
+
+  def build_sif(%Session{} = session, opts, []) when is_list(opts),
+    do: build_sif_blocking(session, opts)
 
   @doc """
   Submits a vLLM inference job using a pre-built Apptainer SIF image.
@@ -534,6 +585,35 @@ defmodule HpcConnect do
   def submit_vllm_apptainer(%Session{} = session, repo_id, opts) when is_binary(repo_id),
     do:
       submit_vllm_apptainer(session, new_model(repo_id, Keyword.get(opts, :model_opts, [])), opts)
+
+  @doc """
+  Submits a generalized Apptainer application job via `sbatch`.
+
+  The app name is used to auto-discover the startup script at `work_dir/scripts/start_<app>.sh`.
+  All dynamic variables are injected as `--export` into sbatch.
+
+  Returns `%{job_id, node, partition, gpus, walltime, port, sif_path, logs_dir}`.
+  The `node` field is populated after up to 10 seconds of polling; if still nil,
+  the job is waiting for resource availability.
+
+  Options:
+  - `:app`           – application name (required; used to find start_<app>.sh)
+  - `:partition`     – GPU partition (default: cluster default or `"a100"`)
+  - `:gpus`          – number of GPUs (default: `1`)
+  - `:walltime`      – time limit (default: `"02:00:00"`)
+  - `:port`          – app port (default: `8000`)
+  - `:cpus`          – cpus-per-task (default: `8`)
+  - `:sif_name`      – stem name of the .sif (default: app name)
+  - `:sif_path`      – override full remote sif path
+  - `:app_env`       – extra environment variables (map, default: `%{}`)
+
+  Example:
+      HpcConnect.submit_apptainer(session, app: "vllm", gpus: 2, port: 8080)
+      HpcConnect.submit_apptainer(session, app: "myservice", app_env: %{"VAR" => "value"})
+  """
+  @spec submit_apptainer(Session.t(), keyword()) :: map()
+  def submit_apptainer(%Session{} = session, opts \\ []),
+    do: Slurm.submit_apptainer(session, opts)
 
   @doc """
   Returns the compute node for a SLURM job, or `nil` if not yet running.
@@ -632,10 +712,42 @@ defmodule HpcConnect do
   Releases a GPU allocation obtained from `allocate_gpu/2`.
 
   Cancels the SLURM batch job via `scancel <job_id>`.
+
+  Works with:
+  - `release_gpu(session, alloc)`
+  - `release_gpu(session, job_id)`
+  - `release_gpu(alloc)` when `alloc` includes `:session`
+  - `release_gpu(job_id, alloc)` when `alloc` includes `:session`
   """
-  @spec release_gpu(Session.t(), map()) :: :ok
+  @spec release_gpu(Session.t(), map() | binary() | pos_integer()) :: :ok
   def release_gpu(%Session{} = session, %{job_id: job_id}) do
-    if job_id, do: cancel_job(session, job_id)
+    maybe_cancel_job(session, job_id)
+  end
+
+  def release_gpu(%Session{} = session, job_id)
+      when is_binary(job_id) or is_integer(job_id) do
+    maybe_cancel_job(session, job_id)
+  end
+
+  def release_gpu(job_id, %{job_id: alloc_job_id, session: %Session{} = session})
+      when is_binary(job_id) or is_integer(job_id) do
+    if to_string(job_id) == to_string(alloc_job_id) do
+      maybe_cancel_job(session, job_id)
+    else
+      maybe_cancel_job(session, alloc_job_id)
+    end
+  end
+
+  def release_gpu(%{job_id: job_id, session: %Session{} = session}) do
+    maybe_cancel_job(session, job_id)
+  end
+
+  defp maybe_cancel_job(_session, job_id) when job_id in [nil, ""] do
+    :ok
+  end
+
+  defp maybe_cancel_job(session, job_id) do
+    cancel_job(session, job_id)
     :ok
   end
 

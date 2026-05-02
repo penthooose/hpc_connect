@@ -436,9 +436,14 @@ defmodule HpcConnect.Slurm do
     # and the job keeps the allocation alive on the cluster for `walltime`.
     sleep_secs = walltime_to_seconds(walltime)
 
+    log_dir = Path.join(session.work_dir, "sbatch_logs")
+
     sbatch_cmd =
-      "sbatch --parsable --partition=#{partition} --gres=gpu:#{partition}:#{gpus}" <>
+      "mkdir -p #{Shell.escape(log_dir)}" <>
+        " && sbatch --parsable --partition=#{partition} --gres=gpu:#{gpus}" <>
         " --ntasks=#{ntasks} --time=#{walltime} --job-name=hpc_connect_hold" <>
+        " --output=#{Shell.escape(log_dir)}/hpc_connect_hold_%j.out" <>
+        " --error=#{Shell.escape(log_dir)}/hpc_connect_hold_%j.err" <>
         " --wrap=\"sleep #{sleep_secs}\""
 
     {output, status} =
@@ -465,7 +470,8 @@ defmodule HpcConnect.Slurm do
       node: node,
       partition: partition,
       gpus: gpus,
-      walltime: walltime
+      walltime: walltime,
+      session: session
     }
   end
 
@@ -540,7 +546,7 @@ defmodule HpcConnect.Slurm do
 
     script = Path.join(Scripts.remote_script_dir(session), "start_vllm.sh")
     model_dir = Model.remote_dir(session, model)
-    logs_dir = Path.join(session.work_dir, "logs")
+    logs_dir = Path.join(session.work_dir, "sbatch_logs")
     job_script_path = Path.join(session.work_dir, "vllm_submit.sh")
 
     module_lines =
@@ -561,7 +567,7 @@ defmodule HpcConnect.Slurm do
     #!/bin/bash -l
     #SBATCH --job-name=hpc_connect_vllm
     #SBATCH --partition=#{partition}
-    #SBATCH --gres=gpu:#{partition}:#{gpus}
+    #SBATCH --gres=gpu:#{gpus}
     #SBATCH --ntasks=#{ntasks}
     #SBATCH --cpus-per-task=#{cpus}
     #SBATCH --time=#{walltime}
@@ -728,52 +734,93 @@ defmodule HpcConnect.Slurm do
   - `:cpus`            – CPUs for build (default: `4`)
   - `:force_rebuild`   – set `"1"` to rebuild even if .sif exists (default: `"0"`)
   """
-  @spec build_sif_job(Session.t(), keyword()) :: map()
-  def build_sif_job(%Session{} = session, opts \\ []) do
-    name = Keyword.get(opts, :name, "vllm")
+  @spec build_sif_job(Session.t(), keyword() | binary()) :: map()
+  def build_sif_job(session, args \\ [])
+
+  def build_sif_job(%Session{} = session, name) when is_binary(name) do
+    build_sif_job(session, name: name)
+  end
+
+  def build_sif_job(%Session{} = session, opts) do
+    {name, opts} =
+      case opts do
+        name when is_binary(name) -> {name, []}
+        opts when is_list(opts) -> {Keyword.get(opts, :name, "vllm"), opts}
+      end
+
     local_def = Keyword.get(opts, :local_def_path)
 
-    partition =
-      to_string(Keyword.get(opts, :partition, session.cluster.default_partition || "standard"))
+    def_path =
+      if is_binary(local_def) do
+        upload_def_file(session, name, local_def)
+      else
+        remote_path = remote_def_path(session, name)
 
-    walltime = Keyword.get(opts, :walltime, "02:00:00")
-    cpus = Keyword.get(opts, :cpus, 4)
-    force = if Keyword.get(opts, :force_rebuild, false), do: "1", else: "0"
+        if remote_def_exists?(session, remote_path) do
+          remote_path
+        else
+          upload_def_file(session, name, nil)
+        end
+      end
 
-    def_path = upload_def_file(session, name, local_def)
     sif_path = remote_sif_path(session, name)
-    build_script = Path.join(Scripts.remote_script_dir(session), "build_sif.sh")
-    logs_dir = Path.join(session.work_dir, "logs")
     tmp_dir = Path.join(session.work_dir, "apptainer_tmp")
+    logs_dir = Path.join(session.work_dir, "logs")
+    force_rebuild = Keyword.get(opts, :force_rebuild, false)
 
-    sbatch_cmd =
-      "mkdir -p #{Shell.escape(logs_dir)} #{Shell.escape(tmp_dir)}" <>
-        " && sbatch --parsable" <>
-        " --job-name=hpc_connect_build_sif" <>
-        " --partition=#{partition}" <>
-        " --ntasks=1" <>
-        " --cpus-per-task=#{cpus}" <>
-        " --time=#{walltime}" <>
-        " --output=#{Shell.escape(logs_dir)}/build_sif_%j.out" <>
-        " --error=#{Shell.escape(logs_dir)}/build_sif_%j.err" <>
-        " --export=HPC_WORK_DIR=#{Shell.escape(session.work_dir)},DEF_NAME=#{Shell.escape(name)},FORCE_REBUILD=#{force},APPTAINER_TMPDIR=#{Shell.escape(tmp_dir)}" <>
-        " #{Shell.escape(build_script)}"
+    if not force_rebuild and remote_file_exists?(session, sif_path) do
+      %{
+        job_id: nil,
+        sif_path: sif_path,
+        def_path: def_path,
+        name: name
+      }
+    else
+      build_cmd =
+        "mkdir -p #{Shell.escape(tmp_dir)} #{Shell.escape(logs_dir)} && " <>
+          "export APPTAINER_TMPDIR=#{Shell.escape(tmp_dir)} && " <>
+          "apptainer build #{if force_rebuild, do: "--force ", else: ""}#{Shell.escape(sif_path)} #{Shell.escape(def_path)} " <>
+          ">> #{Shell.escape(logs_dir)}/build_sif_#{name}.log 2>&1 && " <>
+          "echo #{Shell.escape(sif_path)}"
 
-    {output, status} =
+      {output, status} =
+        session
+        |> SSH.ssh_command(build_cmd, "Build Apptainer image for #{name}.sif")
+        |> SSH.run(Keyword.get(opts, :connect_opts, []))
+
+      if status != 0, do: raise(RuntimeError, "apptainer build failed: #{output}")
+
+      %{
+        job_id: nil,
+        sif_path: String.trim(output),
+        def_path: def_path,
+        name: name
+      }
+    end
+  end
+
+  defp remote_def_exists?(session, remote_path) do
+    {output, _} =
       session
-      |> SSH.ssh_command(sbatch_cmd, "Submit Apptainer build job for #{name}.sif")
-      |> SSH.run(Keyword.get(opts, :connect_opts, []))
+      |> SSH.ssh_command(
+        "test -f #{Shell.escape(remote_path)} && echo ok || true",
+        "Check remote def exists"
+      )
+      |> SSH.run()
 
-    if status != 0, do: raise(RuntimeError, "sbatch build failed: #{output}")
+    String.trim(output) == "ok"
+  end
 
-    job_id = output |> String.trim() |> String.split(";") |> List.first()
+  defp remote_file_exists?(session, remote_path) do
+    {output, _} =
+      session
+      |> SSH.ssh_command(
+        "test -f #{Shell.escape(remote_path)} && echo ok || true",
+        "Check remote file exists"
+      )
+      |> SSH.run()
 
-    %{
-      job_id: job_id,
-      sif_path: sif_path,
-      def_path: def_path,
-      name: name
-    }
+    String.trim(output) == "ok"
   end
 
   @doc """
@@ -785,67 +832,148 @@ defmodule HpcConnect.Slurm do
 
   Raises if the job does not finish within the timeout.
   """
-  @spec build_sif_blocking(Session.t(), keyword()) :: binary()
-  def build_sif_blocking(%Session{} = session, opts \\ []) do
-    timeout_ms = Keyword.get(opts, :timeout, 3_600_000)
-    interval_ms = Keyword.get(opts, :interval, 15_000)
+  @spec build_sif_blocking(Session.t(), keyword() | binary()) :: binary()
+  def build_sif_blocking(session, opts \\ [])
 
-    %{job_id: job_id, sif_path: sif_path} = build_sif_job(session, opts)
-
-    deadline = System.monotonic_time(:millisecond) + timeout_ms
-    wait_for_job_done(session, job_id, sif_path, interval_ms, deadline, opts)
+  def build_sif_blocking(%Session{} = session, name) when is_binary(name) do
+    build_sif_blocking(session, name: name)
   end
 
-  defp wait_for_job_done(session, job_id, sif_path, interval_ms, deadline, opts) do
-    # Query squeue; if the job is no longer listed it has finished (or failed).
-    {out, _} =
+  def build_sif_blocking(%Session{} = session, opts) do
+    %{sif_path: sif_path} = build_sif_job(session, opts)
+    sif_path
+  end
+
+  @doc """
+  Submits a generalized Apptainer application job via `sbatch`.
+
+  The app name is used to find the startup script at `work_dir/scripts/start_<app>.sh`.
+  All dynamic variables are injected as `--export` into sbatch.
+
+  Returns `%{job_id, node, partition, gpus, walltime, port, sif_path, logs_dir}`.
+  The `node` field is populated after up to 10 seconds of polling; if still nil,
+  the job is waiting for resource availability.
+
+  Options:
+  - `:partition`     – GPU partition (default: cluster default or `"a100"`)
+  - `:gpus`          – number of GPUs (default: `1`)
+  - `:walltime`      – time limit (default: `"02:00:00"`)
+  - `:port`          – app port (default: `8000`)
+  - `:cpus`          – cpus-per-task (default: `8`)
+  - `:sif_name`      – stem name of the .sif (default: app name)
+  - `:sif_path`      – override full remote sif path
+  - `:app_env`       – extra env vars to pass (map, default: `%{}`)
+  """
+  @spec submit_apptainer(Session.t(), keyword()) :: map()
+  def submit_apptainer(%Session{} = session, opts \\ []) do
+    app = Keyword.get(opts, :app) || raise ArgumentError, ":app is required"
+
+    partition =
+      to_string(Keyword.get(opts, :partition, session.cluster.default_partition || "a100"))
+
+    gpus = Keyword.get(opts, :gpus, 1)
+    walltime = Keyword.get(opts, :walltime, "02:00:00")
+    port = Keyword.get(opts, :port, 8000)
+    cpus = Keyword.get(opts, :cpus, 8)
+    sif_name = Keyword.get(opts, :sif_name, app)
+    sif_path = Keyword.get(opts, :sif_path) || remote_sif_path(session, sif_name)
+    app_env = Keyword.get(opts, :app_env, %{})
+    args = Keyword.get(opts, :args, [])
+
+    logs_dir = Path.join(session.work_dir, "sbatch_logs")
+    run_script = Path.join(Scripts.remote_script_dir(session), "start_#{app}.sh")
+
+    app_args = args_to_cli_string(args)
+
+    export_vars =
+      [
+        "HPC_MODELS_DIR=#{Shell.escape(session.vault_dir)}",
+        "HPC_WORK_DIR=#{Shell.escape(session.work_dir)}",
+        "HPC_SIF_PATH=#{Shell.escape(sif_path)}",
+        "APP_PORT=#{port}"
+      ]
+      |> Kernel.++(Enum.map(app_env, fn {k, v} -> "#{k}=#{Shell.escape(to_string(v))}" end))
+      |> Kernel.++(if app_args != "", do: ["APP_ARGS=#{Shell.escape(app_args)}"], else: [])
+      |> Enum.join(",")
+
+    sbatch_cmd =
+      "mkdir -p #{Shell.escape(logs_dir)}" <>
+        " && sbatch --parsable" <>
+        " --job-name=hpc_connect_#{app}" <>
+        " --partition=#{partition}" <>
+        " --gres=gpu:#{gpus}" <>
+        " --ntasks=1" <>
+        " --cpus-per-task=#{cpus}" <>
+        " --time=#{walltime}" <>
+        " --output=#{Shell.escape(logs_dir)}/#{app}_%j.out" <>
+        " --error=#{Shell.escape(logs_dir)}/#{app}_%j.err" <>
+        " --export=#{export_vars}" <>
+        " #{Shell.escape(run_script)}"
+
+    {output, status} =
       session
-      |> SSH.ssh_command(
-        "squeue -j #{job_id} -h -o '%T' 2>/dev/null || true",
-        "Poll build job #{job_id}"
-      )
+      |> SSH.ssh_command(sbatch_cmd, "Submit #{app} Apptainer job")
       |> SSH.run(Keyword.get(opts, :connect_opts, []))
 
-    state = String.trim(out)
+    if status != 0, do: raise(RuntimeError, "sbatch failed: #{output}")
 
-    cond do
-      state == "" ->
-        # Job gone from queue — check if .sif was actually written
-        {check, _} =
-          session
-          |> SSH.ssh_command(
-            "test -f #{Shell.escape(sif_path)} && echo ok || echo missing",
-            "Check sif exists"
-          )
-          |> SSH.run(Keyword.get(opts, :connect_opts, []))
+    job_id = output |> String.trim() |> String.split(";") |> List.first()
 
-        if String.trim(check) == "ok" do
-          sif_path
+    node =
+      case get_job_node_quick(session, job_id, timeout_ms: 10_000) do
+        {:ok, node} -> node
+        :timeout -> nil
+      end
+
+    %{
+      job_id: job_id,
+      node: node,
+      partition: partition,
+      gpus: gpus,
+      walltime: walltime,
+      port: port,
+      sif_path: sif_path,
+      logs_dir: logs_dir
+    }
+  end
+
+  defp get_job_node_quick(session, job_id, opts) do
+    timeout_ms = Keyword.get(opts, :timeout_ms, 10_000)
+    interval_ms = Keyword.get(opts, :interval_ms, 1_000)
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_poll_node_quick(session, job_id, interval_ms, deadline)
+  end
+
+  defp do_poll_node_quick(session, job_id, interval_ms, deadline) do
+    case get_job_node(session, job_id) do
+      nil ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(interval_ms)
+          do_poll_node_quick(session, job_id, interval_ms, deadline)
         else
-          raise RuntimeError, "Build job #{job_id} finished but #{sif_path} was not created"
+          :timeout
         end
 
-      state in ["FAILED", "CANCELLED", "TIMEOUT", "NODE_FAIL"] ->
-        raise RuntimeError, "Build job #{job_id} ended with state: #{state}"
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        raise RuntimeError, "Build job #{job_id} did not complete within the timeout"
-
-      true ->
-        Process.sleep(interval_ms)
-        wait_for_job_done(session, job_id, sif_path, interval_ms, deadline, opts)
+      node ->
+        {:ok, node}
     end
+  end
+
+  defp args_to_cli_string(args) when is_list(args) do
+    args
+    |> Enum.map(fn
+      {k, v} -> "--#{k} #{Shell.escape(to_string(v))}"
+      arg when is_binary(arg) -> arg
+      other -> to_string(other)
+    end)
+    |> Enum.join(" ")
   end
 
   @doc """
   Submits a vLLM inference job using a pre-built Apptainer SIF image.
 
-  Uploads `vllm_run.sh` (if not already present), then calls `sbatch` injecting
-  all dynamic variables as `--export` arguments. No CMD window, no Erlang Port.
-
-  Returns `%{job_id, node (nil until RUNNING), partition, gpus, walltime, port, sif_path, logs_dir}`.
-
-  Use `wait_for_job_node/3` to block until the node is assigned.
+  Deprecated: use `submit_apptainer/2` instead for generalized app submission.
+  This is now a wrapper around `submit_apptainer/2`.
 
   Options:
   - `:partition`     – GPU partition (default: cluster default or `"a100"`)
@@ -860,78 +988,41 @@ defmodule HpcConnect.Slurm do
   - `:max_model_len` – max context tokens (default: `8192`)
   - `:hf_token`      – HuggingFace token env value
   """
-  @spec submit_vllm_apptainer(Session.t(), Model.t(), keyword()) :: map()
-  def submit_vllm_apptainer(%Session{} = session, %Model{} = model, opts \\ []) do
-    partition =
-      to_string(Keyword.get(opts, :partition, session.cluster.default_partition || "a100"))
+  @spec submit_vllm_apptainer(Session.t(), Model.t() | binary(), keyword()) :: map()
+  def submit_vllm_apptainer(%Session{} = session, model_or_repo, opts \\ []) do
+    model_repo =
+      if is_binary(model_or_repo) do
+        model_or_repo
+      else
+        model_or_repo.repo_id
+      end
 
-    gpus = Keyword.get(opts, :gpus, 1)
-    walltime = Keyword.get(opts, :walltime, "02:00:00")
-    port = Keyword.get(opts, :port, 8000)
-    cpus = Keyword.get(opts, :cpus, 8)
     tp = Keyword.get(opts, :tensor_parallel, 1)
     gpu_mem = Keyword.get(opts, :gpu_mem_util, "0.90")
     max_len = Keyword.get(opts, :max_model_len, 8192)
-    sif_name = Keyword.get(opts, :sif_name, "vllm")
-
-    sif_path =
-      Keyword.get(opts, :sif_path) || remote_sif_path(session, sif_name)
-
-    logs_dir = Path.join(session.work_dir, "logs")
-    run_script = Path.join(Scripts.remote_script_dir(session), "vllm_run.sh")
-
     hf_token = Keyword.get(opts, :hf_token) || Map.get(session.env, "HUGGINGFACE_HUB_TOKEN", "")
 
-    model_repo = model.repo_id
-
-    export_vars =
-      [
-        "HPC_MODELS_DIR=#{Shell.escape(session.vault_dir)}",
-        "HPC_WORK_DIR=#{Shell.escape(session.work_dir)}",
-        "HPC_SIF_PATH=#{Shell.escape(sif_path)}",
-        "VLLM_MODEL=#{Shell.escape(model_repo)}",
-        "VLLM_PORT=#{port}",
-        "VLLM_TP=#{tp}",
-        "VLLM_GPU_MEM=#{gpu_mem}",
-        "VLLM_MAX_LEN=#{max_len}"
-      ]
-      |> then(fn vars ->
-        if hf_token != "", do: vars ++ ["HF_TOKEN=#{Shell.escape(hf_token)}"], else: vars
+    app_env =
+      %{
+        "VLLM_MODEL" => model_repo,
+        "VLLM_TP" => tp,
+        "VLLM_GPU_MEM" => gpu_mem,
+        "VLLM_MAX_LEN" => max_len
+      }
+      |> then(fn env ->
+        if hf_token != "", do: Map.put(env, "HF_TOKEN", hf_token), else: env
       end)
-      |> Enum.join(",")
 
-    sbatch_cmd =
-      "mkdir -p #{Shell.escape(logs_dir)}" <>
-        " && sbatch --parsable" <>
-        " --job-name=hpc_connect_vllm" <>
-        " --partition=#{partition}" <>
-        " --gres=gpu:#{partition}:#{gpus}" <>
-        " --ntasks=1" <>
-        " --cpus-per-task=#{cpus}" <>
-        " --time=#{walltime}" <>
-        " --output=#{Shell.escape(logs_dir)}/vllm_%j.out" <>
-        " --error=#{Shell.escape(logs_dir)}/vllm_%j.err" <>
-        " --export=#{export_vars}" <>
-        " #{Shell.escape(run_script)}"
-
-    {output, status} =
-      session
-      |> SSH.ssh_command(sbatch_cmd, "Submit vLLM Apptainer job")
-      |> SSH.run(Keyword.get(opts, :connect_opts, []))
-
-    if status != 0, do: raise(RuntimeError, "sbatch failed: #{output}")
-
-    job_id = output |> String.trim() |> String.split(";") |> List.first()
-
-    %{
-      job_id: job_id,
-      node: nil,
-      partition: partition,
-      gpus: gpus,
-      walltime: walltime,
-      port: port,
-      sif_path: sif_path,
-      logs_dir: logs_dir
-    }
+    submit_apptainer(session,
+      app: "vllm",
+      app_env: app_env,
+      partition: Keyword.get(opts, :partition),
+      gpus: Keyword.get(opts, :gpus),
+      walltime: Keyword.get(opts, :walltime),
+      port: Keyword.get(opts, :port),
+      cpus: Keyword.get(opts, :cpus),
+      sif_name: Keyword.get(opts, :sif_name),
+      sif_path: Keyword.get(opts, :sif_path)
+    )
   end
 end
