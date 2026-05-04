@@ -104,7 +104,9 @@ defmodule HpcConnect.Livebook do
         Keyword.drop(opts, [:remote_command, :uploaded_filename, :connect_fun, :connect_opts])
       )
 
-    probe = connect_fun.(session, remote_command, connect_opts)
+    probe =
+      connect_fun.(session, remote_command, connect_opts)
+      |> sanitize_probe()
 
     command_preview =
       session |> HpcConnect.connect_command(remote_command) |> HpcConnect.command_preview()
@@ -271,7 +273,9 @@ defmodule HpcConnect.Livebook do
       Keyword.get(opts, :connect_fun) ||
         fn s, cmd, copts -> HpcConnect.connect!(s, cmd, copts) end
 
-    probe = connect_fun.(session, remote_command, Keyword.get(opts, :connect_opts, []))
+    probe =
+      connect_fun.(session, remote_command, Keyword.get(opts, :connect_opts, []))
+      |> sanitize_probe()
 
     command_preview =
       session |> HpcConnect.connect_command(remote_command) |> HpcConnect.command_preview()
@@ -320,5 +324,24 @@ defmodule HpcConnect.Livebook do
 
   defp compact_opts(opts) do
     Enum.reject(opts, fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp sanitize_probe(probe) when is_binary(probe) do
+    probe
+    |> String.replace(~r/\e\[[0-9;]*m/, "")
+    |> String.split("\n")
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&header_or_warning_probe_line?/1)
+    |> Enum.join("\n")
+  end
+
+  defp header_or_warning_probe_line?("") do
+    true
+  end
+
+  defp header_or_warning_probe_line?(line) do
+    String.contains?(line, ["WARNING:", "Path", "over quota", "!!!"]) or
+      String.starts_with?(line, "ssh:") or
+      String.starts_with?(line, "Connection")
   end
 end

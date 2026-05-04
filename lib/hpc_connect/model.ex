@@ -79,12 +79,25 @@ defmodule HpcConnect.Model do
   def parse_remote_listing(output) when is_binary(output) do
     output
     |> String.split("\n", trim: true)
-    |> Enum.reject(&String.starts_with?(&1, "Warning:"))
+    |> Enum.map(&strip_ansi/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.filter(&valid_remote_listing_line?/1)
     |> Enum.map(fn name ->
       %{
         name: name,
         repo_hint: String.replace(name, "--", "/")
       }
     end)
+  end
+
+  defp valid_remote_listing_line?(""), do: false
+
+  defp valid_remote_listing_line?(line) do
+    not String.contains?(line, ["WARNING", "Warning", "Path", "!!!", "quota"]) and
+      String.match?(line, ~r/^[A-Za-z0-9._-]+$/)
+  end
+
+  defp strip_ansi(value) do
+    Regex.replace(~r/\e\[[0-9;]*m/, value, "")
   end
 end

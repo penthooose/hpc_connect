@@ -86,7 +86,69 @@ defmodule HpcConnect do
         session
       end
 
-    Map.merge(result, %{session: session, startup: startup_summary(session, opts)})
+    setup_session =
+      if Keyword.get(opts, :install_scripts, true) do
+        install_remote_scripts!(session)
+        session
+      else
+        session
+      end
+
+    setup_session =
+      if Keyword.get(opts, :install_def_files, true) do
+        def_dir = Path.join(setup_session.work_dir, "singularity_def_files")
+        img_dir = Path.join(setup_session.work_dir, "singularity_images")
+
+        SSH.ssh_command(
+          setup_session,
+          "mkdir -p #{HpcConnect.Shell.escape(def_dir)} #{HpcConnect.Shell.escape(img_dir)}",
+          "Ensure singularity directories"
+        )
+        |> run_command_with_retry!()
+
+        upload_def_file(setup_session)
+        setup_session
+      else
+        setup_session
+      end
+
+    startup = collect_startup_summary(setup_session, opts)
+
+    Map.merge(result, %{
+      session: setup_session,
+      startup: startup,
+      gpus: startup_value(startup.available_gpus),
+      models: startup_value(startup.downloaded_models),
+      quota: startup_value(startup.quota),
+      jobs: startup_value(startup.jobs)
+    })
+  end
+
+  defp startup_value(%{ok?: true, value: value}), do: value
+  defp startup_value(%{ok?: false}), do: []
+  defp startup_value(_), do: []
+
+  defp collect_startup_summary(%Session{ssh_conn: conn} = session, opts) when not is_nil(conn) do
+    startup_summary(session, opts)
+  end
+
+  defp collect_startup_summary(%Session{} = session, opts) do
+    if Keyword.get(opts, :startup_via_connection, true) do
+      try do
+        {startup_session, _tunnel} = open_connection!(session)
+
+        try do
+          startup_summary(startup_session, opts)
+        after
+          _ = close_connection(startup_session)
+        end
+      rescue
+        _ ->
+          startup_summary(session, opts)
+      end
+    else
+      startup_summary(session, opts)
+    end
   end
 
   @doc """
@@ -243,6 +305,36 @@ defmodule HpcConnect do
     end
   end
 
+  @transient_errors ["Connection refused", "Connection closed", "connect to host"]
+
+  @doc """
+  Like `run_command!/2` but retries up to `retries` times (default 3) with a
+  delay between attempts when a transient SSH/SCP connection error is detected.
+  Useful for commands that go through a jump host that occasionally drops connections.
+  """
+  @spec run_command_with_retry!(Command.t(), keyword()) :: binary()
+  def run_command_with_retry!(%Command{} = command, opts \\ []) do
+    retries = Keyword.get(opts, :retries, 3)
+    delay_ms = Keyword.get(opts, :retry_delay_ms, 3_000)
+    opts_clean = Keyword.drop(opts, [:retries, :retry_delay_ms])
+    do_run_with_retry!(command, opts_clean, retries, delay_ms)
+  end
+
+  defp do_run_with_retry!(command, opts, retries_left, delay_ms) do
+    run_command!(command, opts)
+  rescue
+    e in RuntimeError ->
+      msg = Exception.message(e)
+      transient? = Enum.any?(@transient_errors, &String.contains?(msg, &1))
+
+      if transient? and retries_left > 0 do
+        Process.sleep(delay_ms)
+        do_run_with_retry!(command, opts, retries_left - 1, delay_ms)
+      else
+        reraise e, __STACKTRACE__
+      end
+  end
+
   # ---------------------------------------------------------------------------
   # SLURM / GPU node helpers
   # ---------------------------------------------------------------------------
@@ -272,7 +364,9 @@ defmodule HpcConnect do
   Returns the output of `shownicerquota.pl` for the session user.
   """
   @spec quota(Session.t(), keyword()) :: binary()
-  def quota(%Session{} = session, opts \\ []), do: Slurm.query_quota(session, opts)
+  def quota(%Session{} = session, opts \\ []) do
+    with_retry(fn -> Slurm.query_quota(session, opts) end, opts)
+  end
 
   @doc """
   Returns parsed quota information from `shownicerquota.pl`.
@@ -300,7 +394,9 @@ defmodule HpcConnect do
   Returns free/mixed GPU availability summaries by partition.
   """
   @spec available_gpus(Session.t(), keyword()) :: {[map()], binary()}
-  def available_gpus(%Session{} = session, opts \\ []), do: Slurm.available_gpus(session, opts)
+  def available_gpus(%Session{} = session, opts \\ []) do
+    with_retry(fn -> Slurm.available_gpus(session, opts) end, opts)
+  end
 
   @doc """
   Returns only the parsed GPU availability summary by partition.
@@ -322,16 +418,21 @@ defmodule HpcConnect do
   """
   @spec list_downloaded_models(Session.t(), keyword()) :: [map()]
   def list_downloaded_models(%Session{} = session, opts \\ []) do
-    {output, status} =
-      session
-      |> Model.list_remote_command()
-      |> run_command(Keyword.get(opts, :connect_opts, []))
+    with_retry(
+      fn ->
+        {output, status} =
+          session
+          |> Model.list_remote_command()
+          |> run_command(Keyword.get(opts, :connect_opts, []))
 
-    if status != 0 do
-      raise RuntimeError, "listing downloaded models failed: #{output}"
-    end
+        if status != 0 do
+          raise RuntimeError, "listing downloaded models failed: #{output}"
+        end
 
-    Model.parse_remote_listing(output)
+        Model.parse_remote_listing(output)
+      end,
+      opts
+    )
   end
 
   @doc """
@@ -353,8 +454,8 @@ defmodule HpcConnect do
 
     command =
       Scripts.download_model_command(session, model,
-        modules: Keyword.get(opts, :modules, []),
-        conda_env: Keyword.get(opts, :conda_env),
+        modules: Keyword.get(opts, :modules, ["python/3.12-conda"]),
+        conda_env: Keyword.get(opts, :conda_env, "hpc_connect"),
         source_bash_profile: Keyword.get(opts, :source_bash_profile, false)
       )
 
@@ -393,7 +494,9 @@ defmodule HpcConnect do
   Returns the output of `squeue -u <username>` for the current session user.
   """
   @spec list_jobs(Session.t(), keyword()) :: binary()
-  def list_jobs(%Session{} = session, opts \\ []), do: Slurm.query_jobs(session, opts)
+  def list_jobs(%Session{} = session, opts \\ []) do
+    with_retry(fn -> Slurm.query_jobs(session, opts) end, opts)
+  end
 
   @doc """
   Returns parsed job table entries for the current session user.
@@ -431,33 +534,11 @@ defmodule HpcConnect do
   """
   @spec install_remote_scripts!(Session.t()) :: :ok
   def install_remote_scripts!(%Session{ssh_conn: nil} = session) do
-    scripts_dir = Path.join([:code.priv_dir(:hpc_connect), "scripts"])
-    remote_dir = session.work_dir <> "/scripts"
+    session
+    |> Scripts.install_commands()
+    |> Enum.each(&run_command_with_retry!/1)
 
-    try do
-      session
-      |> Scripts.install_commands()
-      |> Enum.each(&run_command!/1)
-
-      :ok
-    rescue
-      e in RuntimeError ->
-        message = Exception.message(e)
-
-        if String.contains?(message, "scp failed") or
-             String.contains?(message, "Connection refused") or
-             String.contains?(message, "Connection closed") do
-          {session2, _tunnel} = open_connection!(session)
-
-          try do
-            SSH.upload!(session2, scripts_dir, remote_dir, recursive: true)
-          after
-            SSH.close_connection(session2)
-          end
-        else
-          raise e
-        end
-    end
+    :ok
   end
 
   def install_remote_scripts!(%Session{} = session) do
@@ -503,8 +584,9 @@ defmodule HpcConnect do
   @doc """
   Uploads a local Singularity definition file to the remote cluster.
 
-  `name` is the stem (e.g. `"vllm"`). Uses the bundled `priv/scripts/<name>.def`
-  by default; pass `local_def_path` to override. Returns the remote path.
+  `name` is the stem (e.g. `"vllm"`). Uses bundled `priv/def_files/*.def`
+  by default and uploads all available def files; pass `local_def_path` to
+  override. Returns the remote path for `name`.
   """
   @spec upload_def_file(Session.t(), binary(), binary() | nil) :: binary()
   def upload_def_file(%Session{} = session, name \\ "vllm", local_def_path \\ nil),
@@ -772,10 +854,39 @@ defmodule HpcConnect do
     String.contains?(output, [script_name, "No such file or directory", "cannot execute"])
   end
 
-  defp safe_call(fun) do
+  defp with_retry(fun, opts, retries \\ nil, delay_ms \\ 3_000)
+
+  defp with_retry(fun, opts, nil, delay_ms),
+    do: with_retry(fun, opts, Keyword.get(opts, :retries, 3), delay_ms)
+
+  defp with_retry(fun, opts, retries, delay_ms) do
+    fun.()
+  rescue
+    e in RuntimeError ->
+      msg = Exception.message(e)
+      transient? = Enum.any?(@transient_errors, &String.contains?(msg, &1))
+
+      if transient? and retries > 0 do
+        Process.sleep(delay_ms)
+        with_retry(fun, opts, retries - 1, delay_ms)
+      else
+        reraise e, __STACKTRACE__
+      end
+  end
+
+  defp safe_call(fun, retries \\ 3, delay_ms \\ 3_000) do
     %{ok?: true, value: fun.()}
   rescue
-    e -> %{ok?: false, error: Exception.message(e)}
+    e ->
+      msg = Exception.message(e)
+      transient? = Enum.any?(@transient_errors, &String.contains?(msg, &1))
+
+      if transient? and retries > 0 do
+        Process.sleep(delay_ms)
+        safe_call(fun, retries - 1, delay_ms)
+      else
+        %{ok?: false, error: msg}
+      end
   end
 
   # Returns true when STEADY_SSH_CONNECTION is enabled via opt, session env, or OS env.

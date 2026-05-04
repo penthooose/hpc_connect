@@ -49,7 +49,9 @@ defmodule HpcConnect.Scripts do
   def download_model_command(%Session{} = session, %Model{} = model, opts \\ []) do
     script = Path.join(remote_script_dir(session), "download_model.sh")
     target_dir = Model.remote_dir(session, model)
-    preamble = Slurm.module_load_preamble(opts)
+    conda_env = Keyword.get(opts, :conda_env)
+    preamble = Slurm.module_load_preamble(Keyword.delete(opts, :conda_env))
+    conda_preamble = if conda_env, do: conda_bootstrap_preamble(conda_env), else: ""
 
     revision_arg =
       case model.revision do
@@ -67,13 +69,30 @@ defmodule HpcConnect.Scripts do
       "bash #{Shell.escape(script)} --repo #{Shell.escape(model.repo_id)} --target #{Shell.escape(target_dir)}#{revision_arg}#{token_arg}"
 
     remote_command =
-      if preamble == "" do
-        script_command
-      else
-        preamble <> " && " <> script_command
-      end
+      [preamble, conda_preamble, script_command]
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join(" && ")
 
     SSH.ssh_command(session, remote_command, "Download model snapshot to remote vault")
+  end
+
+  defp conda_bootstrap_preamble(env_name) do
+    pkgs_dir = "$HOME/.cache/conda/pkgs"
+    envs_dir = "$HOME/.cache/conda/envs"
+    env = Shell.escape(env_name)
+
+    [
+      "mkdir -p #{pkgs_dir} #{envs_dir}",
+      "export CONDA_PKGS_DIRS=#{pkgs_dir}",
+      "export CONDA_ENVS_PATH=#{envs_dir}",
+      "conda config --append pkgs_dirs #{pkgs_dir} >/dev/null 2>&1 || true",
+      "conda config --append envs_dirs #{envs_dir} >/dev/null 2>&1 || true",
+      "eval \"$(conda shell.bash hook)\"",
+      "if ! conda env list | awk '{print $1}' | grep -qx #{env}; then conda create -n #{env} python=3.12 -y; fi",
+      "conda activate #{env}",
+      "python -m pip install --user --upgrade huggingface_hub"
+    ]
+    |> Enum.join(" && ")
   end
 
   @spec export_env_command(Session.t(), Model.t()) :: Command.t()

@@ -91,9 +91,10 @@ defmodule HpcConnect.Slurm do
 
     cmd = "sinfo#{partition_filter}"
 
-    {output, _exit} =
+    {output, status} =
       session |> SSH.ssh_command(cmd, "sinfo") |> SSH.run(Keyword.get(opts, :connect_opts, []))
 
+    if status != 0, do: raise(RuntimeError, "sinfo failed (exit #{status}): #{output}")
     output
   end
 
@@ -111,27 +112,47 @@ defmodule HpcConnect.Slurm do
   def parse_sinfo(raw) when is_binary(raw) do
     raw
     |> String.split("\n", trim: true)
-    |> Enum.drop(1)
+    |> Enum.map(&strip_ansi/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.drop_while(&header_or_warning_sinfo_line?/1)
     |> Enum.flat_map(&parse_sinfo_line/1)
   end
 
   defp parse_sinfo_line(line) do
     case String.split(line) do
       [partition, avail, timelimit, nodes_str, state | nodelist_parts] ->
-        [
-          %{
-            partition: String.trim_trailing(partition, "*"),
-            avail: avail,
-            timelimit: timelimit,
-            nodes: parse_int(nodes_str),
-            state: normalize_state(state),
-            nodelist: Enum.join(nodelist_parts, " ")
-          }
-        ]
+        if valid_sinfo_row?(partition, avail, timelimit, nodes_str) do
+          [
+            %{
+              partition: String.trim_trailing(partition, "*"),
+              avail: avail,
+              timelimit: timelimit,
+              nodes: parse_int(nodes_str),
+              state: normalize_state(state),
+              nodelist: Enum.join(nodelist_parts, " ")
+            }
+          ]
+        else
+          []
+        end
 
       _ ->
         []
     end
+  end
+
+  defp valid_sinfo_row?(_partition, _avail, _timelimit, nodes_str) do
+    nodes_str =~ ~r/^\d+$/ and not String.contains?(nodes_str, "WARNING")
+  end
+
+  defp header_or_warning_sinfo_line?(line) do
+    line == "" or
+      String.starts_with?(line, "PARTITION") or
+      String.starts_with?(line, "WARNING") or
+      String.starts_with?(line, "You are over quota") or
+      String.starts_with?(line, "!!!") or
+      String.starts_with?(line, "Path")
   end
 
   defp parse_int(s) do
@@ -236,10 +257,13 @@ defmodule HpcConnect.Slurm do
   """
   @spec query_quota(Session.t(), keyword()) :: binary()
   def query_quota(%Session{} = session, opts \\ []) do
-    {output, _} =
+    {output, status} =
       session
       |> SSH.ssh_command("shownicerquota.pl", "quota")
       |> SSH.run(Keyword.get(opts, :connect_opts, []))
+
+    if status != 0,
+      do: raise(RuntimeError, "shownicerquota.pl failed (exit #{status}): #{output}")
 
     output
   end
@@ -310,11 +334,12 @@ defmodule HpcConnect.Slurm do
   def query_jobs(%Session{} = session, opts \\ []) do
     user = session.username || raise ArgumentError, "session has no username"
 
-    {output, _} =
+    {output, status} =
       session
-      |> SSH.ssh_command("squeue -u #{user}", "squeue")
+      |> SSH.ssh_command("squeue -u #{user} -o '%i %P %j %u %t %M %l %D %C %R'", "squeue")
       |> SSH.run(Keyword.get(opts, :connect_opts, []))
 
+    if status != 0, do: raise(RuntimeError, "squeue failed (exit #{status}): #{output}")
     output
   end
 
@@ -338,7 +363,10 @@ defmodule HpcConnect.Slurm do
   def parse_quota(output) when is_binary(output) do
     output
     |> String.split("\n", trim: true)
-    |> Enum.drop(1)
+    |> Enum.map(&strip_ansi/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.reject(&header_or_warning_line?/1)
     |> Enum.map(&parse_quota_line/1)
     |> Enum.reject(&is_nil/1)
   end
@@ -362,23 +390,39 @@ defmodule HpcConnect.Slurm do
 
     case Regex.split(~r/\s+/, cleaned, trim: true) do
       [path, used, soft_q, hard_q, grace_time, file_count, file_q, file_hard_q, file_grace] ->
-        %{
-          path: path,
-          used: used,
-          soft_quota: soft_q,
-          hard_quota: hard_q,
-          grace_time: grace_time,
-          file_count: file_count,
-          file_quota: file_q,
-          file_hard_quota: file_hard_q,
-          file_grace: file_grace,
-          warning?: warning?,
-          note: note
-        }
+        if path == "Path" or used == "Used" or not String.starts_with?(path, "/") do
+          nil
+        else
+          %{
+            path: path,
+            used: used,
+            soft_quota: soft_q,
+            hard_quota: hard_q,
+            grace_time: grace_time,
+            file_count: file_count,
+            file_quota: file_q,
+            file_hard_quota: file_hard_q,
+            file_grace: file_grace,
+            warning?: warning?,
+            note: note
+          }
+        end
 
       _ ->
         nil
     end
+  end
+
+  defp header_or_warning_line?(line) do
+    line == "" or
+      String.starts_with?(line, "Path") or
+      String.starts_with?(line, "WARNING") or
+      String.starts_with?(line, "You are over quota") or
+      String.starts_with?(line, "!!!")
+  end
+
+  defp strip_ansi(value) do
+    Regex.replace(~r/\e\[[0-9;]*m/, value, "")
   end
 
   @doc """
@@ -388,9 +432,19 @@ defmodule HpcConnect.Slurm do
   def parse_jobs(output) when is_binary(output) do
     output
     |> String.split("\n", trim: true)
-    |> Enum.drop(1)
+    |> Enum.map(&strip_ansi/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.filter(&valid_squeue_line?/1)
     |> Enum.map(&parse_job_line/1)
     |> Enum.reject(&is_nil/1)
+  end
+
+  defp valid_squeue_line?(line) do
+    case String.split(line, ~r/\s+/, parts: 2, trim: true) do
+      [job_id, _rest] -> String.match?(job_id, ~r/^\d+$/)
+      _ -> false
+    end
   end
 
   defp parse_job_line(line) do
@@ -406,6 +460,20 @@ defmodule HpcConnect.Slurm do
           time_limit: time_limit,
           nodes: nodes,
           cpus: cpus,
+          node_list: node_list
+        }
+
+      [job_id, partition, name, user, state, time, nodes, node_list] ->
+        %{
+          job_id: job_id,
+          partition: partition,
+          name: name,
+          user: user,
+          state: state,
+          time: time,
+          time_limit: "",
+          nodes: nodes,
+          cpus: "",
           node_list: node_list
         }
 
@@ -438,9 +506,11 @@ defmodule HpcConnect.Slurm do
 
     log_dir = Path.join(session.work_dir, "sbatch_logs")
 
+    gres_option = gres_cmd_option(session, opts, partition, gpus)
+
     sbatch_cmd =
       "mkdir -p #{Shell.escape(log_dir)}" <>
-        " && sbatch --parsable --partition=#{partition} --gres=gpu:#{gpus}" <>
+        " && sbatch --parsable --partition=#{partition} #{gres_option}" <>
         " --ntasks=#{ntasks} --time=#{walltime} --job-name=hpc_connect_hold" <>
         " --output=#{Shell.escape(log_dir)}/hpc_connect_hold_%j.out" <>
         " --error=#{Shell.escape(log_dir)}/hpc_connect_hold_%j.err" <>
@@ -453,11 +523,7 @@ defmodule HpcConnect.Slurm do
 
     if status != 0, do: raise(RuntimeError, "sbatch failed: #{output}")
 
-    job_id = output |> String.trim() |> String.split(";") |> List.first()
-
-    unless job_id =~ ~r/^\d+$/ do
-      raise RuntimeError, "sbatch returned unexpected output: #{inspect(output)}"
-    end
+    job_id = extract_job_id!(output)
 
     node =
       wait_for_job_node(session, job_id,
@@ -563,11 +629,13 @@ defmodule HpcConnect.Slurm do
         ""
       end
 
+    gres_option = gres_option(session, opts, partition, gpus)
+
     job_script = """
     #!/bin/bash -l
     #SBATCH --job-name=hpc_connect_vllm
     #SBATCH --partition=#{partition}
-    #SBATCH --gres=gpu:#{gpus}
+    #{gres_option}
     #SBATCH --ntasks=#{ntasks}
     #SBATCH --cpus-per-task=#{cpus}
     #SBATCH --time=#{walltime}
@@ -595,13 +663,66 @@ defmodule HpcConnect.Slurm do
     if status != 0, do: raise(RuntimeError, "sbatch failed: #{output}")
 
     %{
-      job_id: String.trim(output),
+      job_id: extract_job_id!(output),
       partition: partition,
       gpus: gpus,
       walltime: walltime,
       port: port,
       logs_dir: logs_dir
     }
+  end
+
+  defp extract_job_id!(output) do
+    case output
+         |> String.split("\n", trim: true)
+         |> Enum.map(&strip_ansi/1)
+         |> Enum.map(&String.trim/1)
+         |> Enum.map(fn line ->
+           line
+           |> String.split(";", parts: 2)
+           |> List.first()
+           |> String.trim()
+         end)
+         |> Enum.find(&String.match?(&1, ~r/^\d+$/)) do
+      nil -> raise RuntimeError, "sbatch returned no valid job ID: #{inspect(output)}"
+      id -> id
+    end
+  end
+
+  defp gres_cmd_option(%Session{} = session, opts, partition, gpus) do
+    gpu_type =
+      Keyword.get(opts, :gpu_type) ||
+        session.cluster.gpu_type ||
+        infer_gpu_type_from_partition(partition)
+
+    if gpu_type do
+      "--gres=gpu:#{gpu_type}:#{gpus}"
+    else
+      "--gres=gpu:#{gpus}"
+    end
+  end
+
+  defp gres_option(%Session{} = session, opts, partition, gpus) do
+    gpu_type =
+      Keyword.get(opts, :gpu_type) ||
+        session.cluster.gpu_type ||
+        infer_gpu_type_from_partition(partition)
+
+    if gpu_type do
+      "#SBATCH --gres=gpu:#{gpu_type}:#{gpus}"
+    else
+      "#SBATCH --gres=gpu:#{gpus}"
+    end
+  end
+
+  defp infer_gpu_type_from_partition(partition) do
+    type = String.downcase(partition)
+
+    cond do
+      type in ["a100", "rtx3080", "v100", "h100", "p100", "t4"] -> type
+      String.starts_with?(type, "gpu") -> type
+      true -> nil
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -623,13 +744,14 @@ defmodule HpcConnect.Slurm do
       )
       |> SSH.run(Keyword.get(opts, :connect_opts, []))
 
-    node = String.trim(output)
-
-    if node in ["", "(null)", "None"] do
-      nil
-    else
-      node
-    end
+    output
+    |> String.split("\n", trim: true)
+    |> Enum.map(&strip_ansi/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&header_or_warning_line?/1)
+    |> Enum.reject(fn value -> value in ["", "(null)", "None"] end)
+    |> Enum.reject(&String.starts_with?(&1, "("))
+    |> List.first()
   end
 
   @doc """
@@ -690,33 +812,62 @@ defmodule HpcConnect.Slurm do
   @doc """
   Uploads a local Singularity definition file to the remote cluster.
 
-  `local_def_path` defaults to the bundled `priv/scripts/<name>.def` when `nil`.
+  `local_def_path` defaults to the bundled `priv/def_files/*.def` when `nil`.
   Creates the remote `singularity_def_files/` directory if missing.
 
   Returns the remote path the file was written to.
   """
   @spec upload_def_file(Session.t(), binary(), binary() | nil) :: binary()
   def upload_def_file(%Session{} = session, name \\ "vllm", local_def_path \\ nil) do
-    local_path =
-      local_def_path ||
-        Path.join([
-          to_string(:code.priv_dir(:hpc_connect)),
-          "scripts",
-          "#{name}.def"
-        ])
-
     remote_dir = Path.join(session.work_dir, "singularity_def_files")
-    remote_path = remote_def_path(session, name)
 
     {_, 0} =
       session
       |> SSH.ssh_command("mkdir -p #{Shell.escape(remote_dir)}", "Create def files dir")
       |> SSH.run()
 
-    SSH.scp_to_command(session, local_path, remote_path, "Upload #{name}.def")
-    |> SSH.run()
+    if is_binary(local_def_path) do
+      remote_path = remote_def_path(session, name)
+      upload_with_retry!(session, local_def_path, remote_path, [])
+      remote_path
+    else
+      local_dir = Path.join([to_string(:code.priv_dir(:hpc_connect)), "def_files"])
 
-    remote_path
+      local_dir
+      |> File.ls!()
+      |> Enum.filter(&String.ends_with?(&1, ".def"))
+      |> Enum.each(fn file ->
+        local_path = Path.join(local_dir, file)
+        def_name = Path.basename(file, ".def")
+        remote_path = remote_def_path(session, def_name)
+
+        upload_with_retry!(session, local_path, remote_path, [])
+      end)
+
+      remote_def_path(session, name)
+    end
+  end
+
+  @transient_upload_errors [
+    "Connection refused",
+    "Connection closed",
+    "connect to host",
+    "status 255"
+  ]
+
+  defp upload_with_retry!(session, local, remote, opts, retries \\ 3, delay_ms \\ 3_000) do
+    SSH.upload!(session, local, remote, opts)
+  rescue
+    e in RuntimeError ->
+      msg = Exception.message(e)
+      transient? = Enum.any?(@transient_upload_errors, &String.contains?(msg, &1))
+
+      if transient? and retries > 0 do
+        Process.sleep(delay_ms)
+        upload_with_retry!(session, local, remote, opts, retries - 1, delay_ms)
+      else
+        reraise e, __STACKTRACE__
+      end
   end
 
   @doc """
@@ -764,8 +915,6 @@ defmodule HpcConnect.Slurm do
       end
 
     sif_path = remote_sif_path(session, name)
-    tmp_dir = Path.join(session.work_dir, "apptainer_tmp")
-    logs_dir = Path.join(session.work_dir, "logs")
     force_rebuild = Keyword.get(opts, :force_rebuild, false)
 
     if not force_rebuild and remote_file_exists?(session, sif_path) do
@@ -776,25 +925,57 @@ defmodule HpcConnect.Slurm do
         name: name
       }
     else
-      build_cmd =
-        "mkdir -p #{Shell.escape(tmp_dir)} #{Shell.escape(logs_dir)} && " <>
-          "export APPTAINER_TMPDIR=#{Shell.escape(tmp_dir)} && " <>
-          "apptainer build #{if force_rebuild, do: "--force ", else: ""}#{Shell.escape(sif_path)} #{Shell.escape(def_path)} " <>
-          ">> #{Shell.escape(logs_dir)}/build_sif_#{name}.log 2>&1 && " <>
-          "echo #{Shell.escape(sif_path)}"
+      # Submit as an sbatch job so it runs on a compute node and returns immediately.
+      # Running apptainer build directly on the login node via SSH blocks the SSH
+      # channel for potentially 15-30+ minutes while pulling the Docker image.
+      partition = to_string(Keyword.get(opts, :partition, "standard"))
+      walltime = Keyword.get(opts, :walltime, "02:00:00")
+      cpus = Keyword.get(opts, :cpus, 4)
+
+      logs_dir = Path.join(session.work_dir, "sbatch_logs")
+      tmp_dir = Path.join(session.work_dir, "apptainer_tmp")
+      job_script_path = Path.join(session.work_dir, "build_sif_submit.sh")
+
+      force_env = if force_rebuild, do: "export FORCE_REBUILD=1", else: ""
+
+      job_script = """
+      #!/bin/bash -l
+      #SBATCH --job-name=hpc_connect_build_sif
+      #SBATCH --partition=#{partition}
+      #SBATCH --ntasks=1
+      #SBATCH --cpus-per-task=#{cpus}
+      #SBATCH --time=#{walltime}
+      #SBATCH --output=#{logs_dir}/build_sif_#{name}_%j.out
+      #SBATCH --error=#{logs_dir}/build_sif_#{name}_%j.err
+
+      export HPC_WORK_DIR=#{session.work_dir}
+      export DEF_NAME=#{name}
+      export APPTAINER_TMPDIR=#{Shell.escape(tmp_dir)}
+      #{force_env}
+
+      bash #{Path.join(Scripts.remote_script_dir(session), "build_sif.sh")}
+      """
+
+      b64 = job_script |> Base.encode64() |> String.replace("\n", "")
+
+      remote =
+        "mkdir -p #{Shell.escape(logs_dir)} #{Shell.escape(tmp_dir)} && " <>
+          "echo #{b64} | base64 -d > #{Shell.escape(job_script_path)} && " <>
+          "sbatch --parsable #{Shell.escape(job_script_path)}"
 
       {output, status} =
         session
-        |> SSH.ssh_command(build_cmd, "Build Apptainer image for #{name}.sif")
+        |> SSH.ssh_command(remote, "Submit Apptainer build job for #{name}.sif")
         |> SSH.run(Keyword.get(opts, :connect_opts, []))
 
-      if status != 0, do: raise(RuntimeError, "apptainer build failed: #{output}")
+      if status != 0, do: raise(RuntimeError, "sbatch build_sif failed: #{output}")
 
       %{
-        job_id: nil,
-        sif_path: String.trim(output),
+        job_id: extract_job_id!(output),
+        sif_path: sif_path,
         def_path: def_path,
-        name: name
+        name: name,
+        logs_dir: logs_dir
       }
     end
   end
@@ -840,8 +1021,50 @@ defmodule HpcConnect.Slurm do
   end
 
   def build_sif_blocking(%Session{} = session, opts) do
-    %{sif_path: sif_path} = build_sif_job(session, opts)
-    sif_path
+    timeout = Keyword.get(opts, :timeout, 3_600_000)
+    interval = Keyword.get(opts, :interval, 15_000)
+
+    %{job_id: job_id, sif_path: sif_path} = build_sif_job(session, opts)
+
+    # If already existed (job_id: nil), return immediately
+    if is_nil(job_id) do
+      sif_path
+    else
+      wait_for_sif!(session, job_id, sif_path, timeout, interval)
+    end
+  end
+
+  defp wait_for_sif!(_session, _job_id, _sif_path, timeout, _interval) when timeout <= 0 do
+    raise RuntimeError, "Timed out waiting for Apptainer build to complete"
+  end
+
+  defp wait_for_sif!(session, job_id, sif_path, timeout, interval) do
+    Process.sleep(interval)
+
+    cond do
+      remote_file_exists?(session, sif_path) ->
+        sif_path
+
+      job_failed?(session, job_id) ->
+        raise RuntimeError,
+              "Apptainer build job #{job_id} failed. Check logs with: squeue -j #{job_id}"
+
+      true ->
+        wait_for_sif!(session, job_id, sif_path, timeout - interval, interval)
+    end
+  end
+
+  defp job_failed?(session, job_id) do
+    {output, _} =
+      session
+      |> SSH.ssh_command(
+        "sacct -j #{job_id} --noheader --format=State --parsable2 2>/dev/null | head -1 || true",
+        "Check job state"
+      )
+      |> SSH.run()
+
+    state = String.trim(output)
+    state in ~w(FAILED CANCELLED TIMEOUT NODE_FAIL OUT_OF_MEMORY)
   end
 
   @doc """
@@ -901,7 +1124,7 @@ defmodule HpcConnect.Slurm do
         " && sbatch --parsable" <>
         " --job-name=hpc_connect_#{app}" <>
         " --partition=#{partition}" <>
-        " --gres=gpu:#{gpus}" <>
+        " #{gres_cmd_option(session, opts, partition, gpus)}" <>
         " --ntasks=1" <>
         " --cpus-per-task=#{cpus}" <>
         " --time=#{walltime}" <>
@@ -917,7 +1140,7 @@ defmodule HpcConnect.Slurm do
 
     if status != 0, do: raise(RuntimeError, "sbatch failed: #{output}")
 
-    job_id = output |> String.trim() |> String.split(";") |> List.first()
+    job_id = extract_job_id!(output)
 
     node =
       case get_job_node_quick(session, job_id, timeout_ms: 10_000) do

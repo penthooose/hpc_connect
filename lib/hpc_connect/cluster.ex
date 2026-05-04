@@ -77,6 +77,8 @@ defmodule HpcConnect.Cluster do
         proxy_jump: "csnhr.nhr.fau.de",
         vault_dir: "$HOME/vault/hpc_connect",
         default_work_dir: "$HOME/.cache/hpc_connect",
+        gpu_type: "a100",
+        default_partition: "a100",
         notes: "Tier3-Grundversorgung"
       },
       %__MODULE__{

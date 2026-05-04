@@ -237,7 +237,12 @@ defmodule HpcConnect.SSH do
   @spec open_connection!(Session.t(), keyword()) :: {Session.t(), port() | nil}
   def open_connection!(%Session{} = session, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 20_000)
+    attempts = Keyword.get(opts, :attempts, 3)
 
+    do_open_connection!(session, timeout, attempts)
+  end
+
+  defp do_open_connection!(session, timeout, attempts_left) do
     proxy_jump =
       session.proxy_jump || session.cluster.proxy_jump
 
@@ -272,7 +277,13 @@ defmodule HpcConnect.SSH do
 
         {:error, reason} ->
           safe_port_close(tunnel_os_port)
-          raise RuntimeError, "SSH connect failed: #{inspect(reason)}"
+
+          if attempts_left > 1 and retryable_connect_error?(reason) do
+            Process.sleep(1_000)
+            do_open_connection!(session, timeout, attempts_left - 1)
+          else
+            raise RuntimeError, "SSH connect failed: #{inspect(reason)}"
+          end
       end
 
     updated =
@@ -299,6 +310,11 @@ defmodule HpcConnect.SSH do
   defp safe_port_close(port) when is_port(port) do
     if Port.info(port) != nil, do: Port.close(port)
     :ok
+  end
+
+  defp retryable_connect_error?(reason) do
+    reason in [:econnrefused, :timeout, :closed, :ehostunreach, :enetunreach] or
+      String.contains?(inspect(reason), ["econnrefused", "timeout", "closed"])
   end
 
   @doc """
@@ -354,11 +370,11 @@ defmodule HpcConnect.SSH do
 
     {output, status} = run(cmd)
 
-    if status != 0 do
+    if status == 0 do
+      :ok
+    else
       raise RuntimeError, "scp failed (status #{status}): #{String.trim(output)}"
     end
-
-    :ok
   end
 
   def upload!(%Session{ssh_conn: conn}, local_path, remote_path, opts) do
