@@ -101,7 +101,7 @@ defmodule HpcConnect do
 
         SSH.ssh_command(
           setup_session,
-          "mkdir -p #{HpcConnect.Shell.escape(def_dir)} #{HpcConnect.Shell.escape(img_dir)}",
+          "mkdir -p #{HpcConnect.Shell.escape(def_dir)} #{HpcConnect.Shell.escape(img_dir)} && chmod 755 #{HpcConnect.Shell.escape(def_dir)} #{HpcConnect.Shell.escape(img_dir)}",
           "Ensure singularity directories"
         )
         |> run_command_with_retry!()
@@ -133,7 +133,7 @@ defmodule HpcConnect do
   end
 
   defp collect_startup_summary(%Session{} = session, opts) do
-    if Keyword.get(opts, :startup_via_connection, true) do
+    if Keyword.get(opts, :startup_via_connection, false) do
       try do
         {startup_session, _tunnel} = open_connection!(session)
 
@@ -545,6 +545,12 @@ defmodule HpcConnect do
     scripts_dir = Path.join([:code.priv_dir(:hpc_connect), "scripts"])
     remote_dir = session.work_dir <> "/scripts"
     SSH.upload!(session, scripts_dir, remote_dir, recursive: true)
+
+    SSH.exec!(
+      session,
+      "chmod 755 #{HpcConnect.Shell.escape(session.work_dir)} #{HpcConnect.Shell.escape(remote_dir)}",
+      []
+    )
   end
 
   @doc """
@@ -600,7 +606,15 @@ defmodule HpcConnect do
   `build_sif_blocking/2` to wait for completion.
 
   Options: `:name`, `:local_def_path`, `:partition`, `:walltime`, `:cpus`,
-  `:force_rebuild`, `:timeout`, `:interval`.
+  `:force_rebuild`, `:timeout`, `:interval`,
+  `:build_cluster` – route the build through a different cluster that supports
+  user namespaces (default: `:woody`; AlmaLinux login nodes support apptainer
+  builds, Ubuntu-based systems like TinyX do not). Pass `build_cluster: nil`
+  to build on the session's own cluster.
+  `:apptainer_tmpdir` – override apptainer's tmp/cache directory. Unset by default;
+  apptainer manages its own cache under `~/.apptainer` on the remote node, which
+  means `apptainer cache clean` works naturally. Set only if you need to redirect
+  the cache to a specific path.
   """
   @spec build_sif_job(Session.t(), keyword() | binary()) :: map()
   def build_sif_job(session, opts \\ [])
@@ -696,6 +710,60 @@ defmodule HpcConnect do
   @spec submit_apptainer(Session.t(), keyword()) :: map()
   def submit_apptainer(%Session{} = session, opts \\ []),
     do: Slurm.submit_apptainer(session, opts)
+
+  @doc """
+  High-level app launcher. Submits a `start_<app>.sh` script via sbatch with
+  SLURM and config arguments separated into two distinct keyword lists.
+
+  Config keys are translated to `<APP_UPPER>_<KEY_UPPER>` environment variables
+  (e.g. `app: "vllm", config: [model: "meta-llama/...", port: 50200]` becomes
+  `VLLM_MODEL` and `VLLM_PORT`). The port value is also passed as `APP_PORT` for
+  the generic fallback in scripts.
+
+  Returns `%{job_id, node, partition, gpus, walltime, port, sif_path, logs_dir}`.
+
+  Options in `slurm:`:
+  - `:partition` – GPU partition
+  - `:gpus`      – number of GPUs (default: `1`)
+  - `:walltime`  – time limit (default: `"02:00:00"`)
+  - `:cpus`      – cpus-per-task (default: `8`)
+  - `:sif_name`  – stem name of the .sif (default: app name)
+  - `:sif_path`  – override full remote sif path
+
+  Example:
+      HpcConnect.start_app(session,
+        app: "vllm",
+        slurm: [partition: "a100", gpus: 1, walltime: "02:00:00"],
+        config: [model: "meta-llama/Llama-3.2-1B-Instruct", port: 50200]
+      )
+  """
+  @spec start_app(Session.t(), keyword()) :: map()
+  def start_app(%Session{} = session, opts) do
+    app = Keyword.fetch!(opts, :app)
+    slurm = Keyword.get(opts, :slurm, [])
+    config = Keyword.get(opts, :config, [])
+
+    app_upper = app |> to_string() |> String.upcase()
+
+    app_env =
+      Map.new(config, fn {k, v} ->
+        {"#{app_upper}_#{k |> to_string() |> String.upcase()}", v}
+      end)
+
+    port = Keyword.get(config, :port, Keyword.get(slurm, :port, 8000))
+
+    submit_apptainer(session,
+      app: app,
+      partition: Keyword.get(slurm, :partition),
+      gpus: Keyword.get(slurm, :gpus),
+      walltime: Keyword.get(slurm, :walltime),
+      cpus: Keyword.get(slurm, :cpus),
+      sif_name: Keyword.get(slurm, :sif_name),
+      sif_path: Keyword.get(slurm, :sif_path),
+      port: port,
+      app_env: app_env
+    )
+  end
 
   @doc """
   Returns the compute node for a SLURM job, or `nil` if not yet running.

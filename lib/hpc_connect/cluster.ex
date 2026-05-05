@@ -13,6 +13,8 @@ defmodule HpcConnect.Cluster do
     :default_work_dir,
     :default_partition,
     :gpu_type,
+    :require_gres,
+    :http_proxy,
     :notes,
     aliases: []
   ]
@@ -27,6 +29,8 @@ defmodule HpcConnect.Cluster do
           default_work_dir: binary() | nil,
           default_partition: binary() | nil,
           gpu_type: binary() | nil,
+          require_gres: binary() | nil,
+          http_proxy: binary() | nil,
           notes: binary() | nil
         }
 
@@ -49,7 +53,8 @@ defmodule HpcConnect.Cluster do
         ssh_alias: "fritz",
         proxy_jump: "csnhr.nhr.fau.de",
         vault_dir: "$HOME/vault/hpc_connect",
-        default_work_dir: "$HOME/.cache/hpc_connect"
+        default_work_dir: "$HOME/.cache/hpc_connect",
+        http_proxy: "http://proxy.nhr.fau.de:80"
       },
       %__MODULE__{
         name: :alex,
@@ -58,7 +63,8 @@ defmodule HpcConnect.Cluster do
         ssh_alias: "alex",
         proxy_jump: "csnhr.nhr.fau.de",
         vault_dir: "$HOME/vault/hpc_connect",
-        default_work_dir: "$HOME/.cache/hpc_connect"
+        default_work_dir: "$HOME/.cache/hpc_connect",
+        http_proxy: "http://proxy.nhr.fau.de:80"
       },
       %__MODULE__{
         name: :helma,
@@ -67,7 +73,8 @@ defmodule HpcConnect.Cluster do
         ssh_alias: "helma",
         proxy_jump: "csnhr.nhr.fau.de",
         vault_dir: "$HOME/vault/hpc_connect",
-        default_work_dir: "$HOME/.cache/hpc_connect"
+        default_work_dir: "$HOME/.cache/hpc_connect",
+        http_proxy: "http://proxy.nhr.fau.de:80"
       },
       %__MODULE__{
         name: :tinyx,
@@ -79,6 +86,8 @@ defmodule HpcConnect.Cluster do
         default_work_dir: "$HOME/.cache/hpc_connect",
         gpu_type: "a100",
         default_partition: "a100",
+        require_gres: "gpu:1",
+        http_proxy: "http://proxy.nhr.fau.de:80",
         notes: "Tier3-Grundversorgung"
       },
       %__MODULE__{
@@ -89,6 +98,7 @@ defmodule HpcConnect.Cluster do
         proxy_jump: "csnhr.nhr.fau.de",
         vault_dir: "$HOME/vault/hpc_connect",
         default_work_dir: "$HOME/.cache/hpc_connect",
+        http_proxy: "http://proxy.nhr.fau.de:80",
         notes: "Tier3-Grundversorgung"
       },
       %__MODULE__{

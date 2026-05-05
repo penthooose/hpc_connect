@@ -11,8 +11,9 @@
 #                   Writes to:  $HPC_WORK_DIR/singularity_images/<DEF_NAME>.sif
 #
 # Optional:
-#   APPTAINER_TMPDIR – scratch dir for build temp files (defaults to $HPC_WORK_DIR/apptainer_tmp)
 #   FORCE_REBUILD    – set to "1" to rebuild even if .sif already exists
+#   APPTAINER_TMPDIR – override apptainer's default tmp/cache dir (normally ~/.apptainer)
+#                      Unset = let apptainer manage its own cache; use `apptainer cache clean`
 #
 # SBATCH directives are injected by the Elixir caller as needed; comments only:
 #SBATCH --job-name=hpc_connect_build_sif
@@ -26,10 +27,9 @@ set -Eeuo pipefail
 
 DEF_FILES_DIR="${HPC_WORK_DIR}/singularity_def_files"
 IMAGES_DIR="${HPC_WORK_DIR}/singularity_images"
-APPTAINER_TMPDIR="${APPTAINER_TMPDIR:-${HPC_WORK_DIR}/apptainer_tmp}"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
 
-mkdir -p "$IMAGES_DIR" "$APPTAINER_TMPDIR"
+mkdir -p "$IMAGES_DIR"
 
 DEF_FILE="${DEF_FILES_DIR}/${DEF_NAME}.def"
 SIF_FILE="${IMAGES_DIR}/${DEF_NAME}.sif"
@@ -55,11 +55,11 @@ log "=== Apptainer build ==="
 log "Hostname : $(hostname)"
 log "Def file : $DEF_FILE"
 log "SIF out  : $SIF_FILE"
-log "Tmp dir  : $APPTAINER_TMPDIR"
+[[ -n "${APPTAINER_TMPDIR:-}" ]] && log "Tmp dir  : $APPTAINER_TMPDIR (override)" || log "Tmp dir  : apptainer default (~/.apptainer)"
 
-export APPTAINER_TMPDIR
-
-apptainer build --force "$SIF_FILE" "$DEF_FILE"
+# --ignore-fakeroot-command avoids the user-namespace setgroups issue on
+# login nodes where /proc/self/setgroups writes are blocked by kernel policy.
+apptainer build --force --ignore-fakeroot-command "$SIF_FILE" "$DEF_FILE"
 
 log "Build complete: $SIF_FILE"
 log "Size: $(du -sh "$SIF_FILE" | cut -f1)"

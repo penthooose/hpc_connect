@@ -34,11 +34,7 @@ defmodule HpcConnect.Model do
 
   @spec models_root(Session.t()) :: binary()
   def models_root(%Session{} = session) do
-    if Path.basename(session.vault_dir) == "models" do
-      session.vault_dir
-    else
-      Path.join(session.vault_dir, "models")
-    end
+    Path.join([session.vault_dir, ".cache", "hpc_connect", "models"])
   end
 
   @spec env_map(Session.t(), t()) :: map()

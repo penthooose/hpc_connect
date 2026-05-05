@@ -10,8 +10,7 @@ defmodule HpcConnect.Scripts do
     "download_model.sh",
     "export_model_env.sh",
     "find_free_port.sh",
-    "start_vllm.sh",
-    "vllm_run.sh"
+    "start_vllm.sh"
   ]
 
   @spec local_script_dir() :: binary()
@@ -42,6 +41,11 @@ defmodule HpcConnect.Scripts do
         remote_root,
         "Upload helper scripts to remote host",
         recursive: true
+      ),
+      SSH.ssh_command(
+        session,
+        "chmod 755 #{Shell.escape(remote_root)} #{Shell.escape(remote_scripts)}",
+        "Ensure read/write/execute permissions on hpc_connect dirs"
       )
     ]
   end

@@ -110,6 +110,8 @@ defmodule HpcConnect.SSH do
       |> maybe_append_option("-J", session.proxy_jump)
       |> maybe_append_option("-i", session.identity_file)
 
+    base = base ++ ["-o", "ConnectTimeout=30"]
+
     case session.master_socket do
       nil -> base
       socket -> base ++ ["-o", "ControlPath=#{socket}"]
@@ -122,6 +124,8 @@ defmodule HpcConnect.SSH do
       |> maybe_append_option("-F", session.ssh_config_file)
       |> maybe_append_option("-J", session.proxy_jump)
       |> maybe_append_option("-i", session.identity_file)
+
+    base = base ++ ["-o", "ConnectTimeout=30"]
 
     case session.master_socket do
       nil -> base
@@ -239,8 +243,26 @@ defmodule HpcConnect.SSH do
     timeout = Keyword.get(opts, :timeout, 20_000)
     attempts = Keyword.get(opts, :attempts, 3)
 
-    do_open_connection!(session, timeout, attempts)
+    # Suppress :ssh application logger output during connection attempts.
+    # Erlang :ssh emits [notice]/[debug] messages on auth failures which are
+    # confusing when a retry immediately succeeds. We restore the original
+    # level (or remove the filter) after the final attempt, whether it
+    # succeeds or raises.
+    filter_id = :hpc_connect_ssh_silence
+    :logger.add_primary_filter(filter_id, {&suppress_ssh_logs/2, []})
+
+    try do
+      do_open_connection!(session, timeout, attempts)
+    after
+      :logger.remove_primary_filter(filter_id)
+    end
   end
+
+  # Logger primary filter: drops all log events from the :ssh OTP application.
+  # Matches on application: :ssh (covers all domains and log levels emitted by
+  # Erlang SSH, including the disconnect notice and KEX debug messages).
+  defp suppress_ssh_logs(%{meta: %{application: :ssh}} = _event, _extra), do: :stop
+  defp suppress_ssh_logs(_event, _extra), do: :ignore
 
   defp do_open_connection!(session, timeout, attempts_left) do
     proxy_jump =

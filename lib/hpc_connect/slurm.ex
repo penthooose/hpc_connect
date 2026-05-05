@@ -4,6 +4,7 @@ defmodule HpcConnect.Slurm do
   check/submit jobs, and build module-load preambles for sbatch scripts.
   """
 
+  require Logger
   alias HpcConnect.{Model, Scripts, Session, Shell, SSH}
 
   # Node states considered usable (idle = fully free, mix = partially free)
@@ -648,17 +649,14 @@ defmodule HpcConnect.Slurm do
     exec bash #{script} --model #{model_dir} --port #{port}
     """
 
-    b64 = job_script |> Base.encode64() |> String.replace("\n", "")
+    b64 = job_script |> String.replace("\r", "") |> Base.encode64() |> String.replace("\n", "")
 
     remote =
       "mkdir -p #{Shell.escape(logs_dir)} && " <>
         "echo #{b64} | base64 -d > #{Shell.escape(job_script_path)} && " <>
         "sbatch --parsable #{Shell.escape(job_script_path)}"
 
-    {output, status} =
-      session
-      |> SSH.ssh_command(remote, "Submit vLLM batch job")
-      |> SSH.run(Keyword.get(opts, :connect_opts, []))
+    {output, status} = SSH.exec(session, remote, [])
 
     if status != 0, do: raise(RuntimeError, "sbatch failed: #{output}")
 
@@ -821,10 +819,11 @@ defmodule HpcConnect.Slurm do
   def upload_def_file(%Session{} = session, name \\ "vllm", local_def_path \\ nil) do
     remote_dir = Path.join(session.work_dir, "singularity_def_files")
 
-    {_, 0} =
-      session
-      |> SSH.ssh_command("mkdir -p #{Shell.escape(remote_dir)}", "Create def files dir")
-      |> SSH.run()
+    ssh_with_retry!(
+      session,
+      "mkdir -p #{Shell.escape(remote_dir)}",
+      "Create def files dir"
+    )
 
     if is_binary(local_def_path) do
       remote_path = remote_def_path(session, name)
@@ -854,6 +853,44 @@ defmodule HpcConnect.Slurm do
     "connect to host",
     "status 255"
   ]
+
+  # Runs an SSH command, retrying on transient errors. Raises on non-zero exit.
+  # Uses the persistent Erlang :ssh connection when available (no new OS process).
+  defp ssh_with_retry!(session, cmd, summary, retries \\ 3, delay_ms \\ 3_000) do
+    case SSH.exec(session, cmd, []) do
+      {_, 0} ->
+        :ok
+
+      {output, status} ->
+        transient? = Enum.any?(@transient_upload_errors, &String.contains?(output, &1))
+
+        if transient? and retries > 0 do
+          Process.sleep(delay_ms)
+          ssh_with_retry!(session, cmd, summary, retries - 1, delay_ms)
+        else
+          raise RuntimeError, "#{summary} failed (exit #{status}): #{output}"
+        end
+    end
+  end
+
+  # Like ssh_with_retry! but also returns output on success (for commands with stdout).
+  # Uses the persistent Erlang :ssh connection when available (no new OS process).
+  defp ssh_run_with_retry!(session, cmd, summary, retries \\ 3, delay_ms \\ 3_000) do
+    case SSH.exec(session, cmd, []) do
+      {output, 0} ->
+        output
+
+      {output, status} ->
+        transient? = Enum.any?(@transient_upload_errors, &String.contains?(output, &1))
+
+        if transient? and retries > 0 do
+          Process.sleep(delay_ms)
+          ssh_run_with_retry!(session, cmd, summary, retries - 1, delay_ms)
+        else
+          raise RuntimeError, "#{summary} failed (exit #{status}): #{output}"
+        end
+    end
+  end
 
   defp upload_with_retry!(session, local, remote, opts, retries \\ 3, delay_ms \\ 3_000) do
     SSH.upload!(session, local, remote, opts)
@@ -916,90 +953,171 @@ defmodule HpcConnect.Slurm do
 
     sif_path = remote_sif_path(session, name)
     force_rebuild = Keyword.get(opts, :force_rebuild, false)
+    use_slurm = Keyword.get(opts, :use_slurm, false)
+    # Default to :woody — AlmaLinux login nodes support user namespaces for apptainer build.
+    # Ubuntu-based systems (TinyX, Testcluster) do not. Pass `build_cluster: nil` to
+    # disable the redirect and build on the session's own cluster.
+    build_cluster = Keyword.get(opts, :build_cluster, :woody)
 
     if not force_rebuild and remote_file_exists?(session, sif_path) do
-      %{
-        job_id: nil,
-        sif_path: sif_path,
-        def_path: def_path,
-        name: name
-      }
+      Logger.info("[HpcConnect] SIF already exists: #{sif_path}")
+      %{job_id: nil, sif_path: sif_path, def_path: def_path, name: name}
     else
-      # Submit as an sbatch job so it runs on a compute node and returns immediately.
-      # Running apptainer build directly on the login node via SSH blocks the SSH
-      # channel for potentially 15-30+ minutes while pulling the Docker image.
-      partition = to_string(Keyword.get(opts, :partition, "standard"))
-      walltime = Keyword.get(opts, :walltime, "02:00:00")
-      cpus = Keyword.get(opts, :cpus, 4)
+      force_env = if force_rebuild, do: "export FORCE_REBUILD=1 && ", else: ""
 
-      logs_dir = Path.join(session.work_dir, "sbatch_logs")
-      tmp_dir = Path.join(session.work_dir, "apptainer_tmp")
-      job_script_path = Path.join(session.work_dir, "build_sif_submit.sh")
+      build_session =
+        if build_cluster do
+          clone_session_for_cluster(session, build_cluster)
+        else
+          session
+        end
 
-      force_env = if force_rebuild, do: "export FORCE_REBUILD=1", else: ""
-
-      job_script = """
-      #!/bin/bash -l
-      #SBATCH --job-name=hpc_connect_build_sif
-      #SBATCH --partition=#{partition}
-      #SBATCH --ntasks=1
-      #SBATCH --cpus-per-task=#{cpus}
-      #SBATCH --time=#{walltime}
-      #SBATCH --output=#{logs_dir}/build_sif_#{name}_%j.out
-      #SBATCH --error=#{logs_dir}/build_sif_#{name}_%j.err
-
-      export HPC_WORK_DIR=#{session.work_dir}
-      export DEF_NAME=#{name}
-      export APPTAINER_TMPDIR=#{Shell.escape(tmp_dir)}
-      #{force_env}
-
-      bash #{Path.join(Scripts.remote_script_dir(session), "build_sif.sh")}
-      """
-
-      b64 = job_script |> Base.encode64() |> String.replace("\n", "")
-
-      remote =
-        "mkdir -p #{Shell.escape(logs_dir)} #{Shell.escape(tmp_dir)} && " <>
-          "echo #{b64} | base64 -d > #{Shell.escape(job_script_path)} && " <>
-          "sbatch --parsable #{Shell.escape(job_script_path)}"
-
-      {output, status} =
-        session
-        |> SSH.ssh_command(remote, "Submit Apptainer build job for #{name}.sif")
-        |> SSH.run(Keyword.get(opts, :connect_opts, []))
-
-      if status != 0, do: raise(RuntimeError, "sbatch build_sif failed: #{output}")
-
-      %{
-        job_id: extract_job_id!(output),
-        sif_path: sif_path,
-        def_path: def_path,
-        name: name,
-        logs_dir: logs_dir
-      }
+      if use_slurm do
+        build_sif_via_slurm(build_session, name, def_path, sif_path, force_env, opts)
+      else
+        build_sif_direct(build_session, name, def_path, sif_path, force_env)
+      end
     end
   end
 
-  defp remote_def_exists?(session, remote_path) do
-    {output, _} =
+  # Clones a session's credentials onto a different cluster.
+  # Used to run apptainer builds on a cluster that supports user namespaces
+  # (e.g. woody) while the primary session targets another cluster (e.g. tinyx).
+  # Because all NHR FAU clusters share the same home/vault filesystem, the resulting
+  # SIF will be visible from the original session without any extra copying.
+  defp clone_session_for_cluster(%Session{} = session, cluster_name) do
+    target_cluster = HpcConnect.Cluster.fetch!(cluster_name)
+
+    Logger.info(
+      "[HpcConnect] Routing apptainer build via #{target_cluster.name} " <>
+        "(shared FS — SIF will be visible from #{session.cluster.name})"
+    )
+
+    %Session{
       session
-      |> SSH.ssh_command(
+      | cluster: target_cluster,
+        ssh_alias: target_cluster.ssh_alias,
+        proxy_jump: target_cluster.proxy_jump
+    }
+  end
+
+  # Runs `apptainer build` directly on the login node via a background nohup process.
+  # Returns immediately with a log_file path. No SLURM job — no internet issues.
+  # build_sif_blocking polls remote_file_exists? to detect completion.
+  defp build_sif_direct(session, name, def_path, sif_path, force_env) do
+    script_dir = Scripts.remote_script_dir(session)
+    logs_dir = Path.join(session.work_dir, "sbatch_logs")
+    log_file = Path.join(logs_dir, "build_sif_#{name}_direct.log")
+
+    proxy_exports = proxy_env_exports(session)
+
+    remote =
+      "mkdir -p #{Shell.escape(logs_dir)} && " <>
+        "chmod 755 #{Shell.escape(logs_dir)} && " <>
+        proxy_exports <>
+        force_env <>
+        "export HPC_WORK_DIR=#{Shell.escape(session.work_dir)} && " <>
+        "export DEF_NAME=#{Shell.escape(name)} && " <>
+        "nohup bash #{Shell.escape(Path.join(script_dir, "build_sif.sh"))} " <>
+        "</dev/null > #{Shell.escape(log_file)} 2>&1 & disown && echo launched"
+
+    ssh_run_with_retry!(session, remote, "Start direct apptainer build for #{name}.sif")
+
+    Logger.info("[HpcConnect] Apptainer build started in background on login node.")
+    Logger.info("[HpcConnect] Log: #{log_file}")
+    Logger.info("[HpcConnect] Tail with: ssh #{session.cluster.ssh_alias} 'tail -f #{log_file}'")
+
+    Logger.info(
+      "[HpcConnect] Check process: ssh #{session.cluster.ssh_alias} 'ps aux | grep apptainer'"
+    )
+
+    %{job_id: nil, sif_path: sif_path, def_path: def_path, name: name, log_file: log_file}
+  end
+
+  # Returns proxy export statements if the cluster has an http_proxy configured.
+  defp proxy_env_exports(%{cluster: %{http_proxy: nil}}), do: ""
+
+  defp proxy_env_exports(%{cluster: %{http_proxy: proxy}}) do
+    "export http_proxy=#{proxy} && export https_proxy=#{proxy} && "
+  end
+
+  # Submits `build_sif.sh` as an sbatch job and returns the job ID immediately.
+  # Requires internet access from the compute node (not available on all clusters).
+  # Use `use_slurm: true` to opt in.
+  defp build_sif_via_slurm(session, name, def_path, sif_path, force_env, opts) do
+    partition = Keyword.get(opts, :partition)
+    walltime = Keyword.get(opts, :walltime, "02:00:00")
+    cpus = Keyword.get(opts, :cpus, 4)
+
+    logs_dir = Path.join(session.work_dir, "sbatch_logs")
+    script_dir = Scripts.remote_script_dir(session)
+    job_script_path = Path.join(script_dir, "build_sif_submit.sh")
+
+    partition_line = if partition, do: "#SBATCH --partition=#{partition}", else: ""
+    gres = Keyword.get(opts, :gres, session.cluster.require_gres)
+    gres_line = if gres, do: "#SBATCH --gres=#{gres}", else: ""
+
+    job_script = """
+    #!/bin/bash -l
+    #SBATCH --job-name=hpc_connect_build_sif
+    #{partition_line}
+    #{gres_line}
+    #SBATCH --ntasks=1
+    #SBATCH --cpus-per-task=#{cpus}
+    #SBATCH --time=#{walltime}
+    #SBATCH --output=#{logs_dir}/build_sif_#{name}_%j.out
+    #SBATCH --error=#{logs_dir}/build_sif_#{name}_%j.err
+
+    #{proxy_script_exports(session)}
+    #{force_env}export HPC_WORK_DIR=#{session.work_dir}
+    export DEF_NAME=#{name}
+
+    bash #{Path.join(Scripts.remote_script_dir(session), "build_sif.sh")}
+    """
+
+    b64 = job_script |> String.replace("\r", "") |> Base.encode64() |> String.replace("\n", "")
+
+    remote =
+      "mkdir -p #{Shell.escape(logs_dir)} #{Shell.escape(script_dir)} && " <>
+        "echo #{b64} | base64 -d > #{Shell.escape(job_script_path)} && " <>
+        "sbatch --parsable #{Shell.escape(job_script_path)}"
+
+    output = ssh_run_with_retry!(session, remote, "Submit Apptainer build job for #{name}.sif")
+
+    %{
+      job_id: extract_job_id!(output),
+      sif_path: sif_path,
+      def_path: def_path,
+      name: name,
+      logs_dir: logs_dir
+    }
+  end
+
+  # Returns proxy export shell lines for use inside sbatch job scripts.
+  defp proxy_script_exports(%{cluster: %{http_proxy: nil}}), do: ""
+
+  defp proxy_script_exports(%{cluster: %{http_proxy: proxy}}) do
+    "export http_proxy=#{proxy}\nexport https_proxy=#{proxy}"
+  end
+
+  defp remote_def_exists?(session, remote_path) do
+    output =
+      ssh_run_with_retry!(
+        session,
         "test -f #{Shell.escape(remote_path)} && echo ok || true",
         "Check remote def exists"
       )
-      |> SSH.run()
 
     String.trim(output) == "ok"
   end
 
   defp remote_file_exists?(session, remote_path) do
-    {output, _} =
-      session
-      |> SSH.ssh_command(
+    output =
+      ssh_run_with_retry!(
+        session,
         "test -f #{Shell.escape(remote_path)} && echo ok || true",
         "Check remote file exists"
       )
-      |> SSH.run()
 
     String.trim(output) == "ok"
   end
@@ -1024,13 +1142,69 @@ defmodule HpcConnect.Slurm do
     timeout = Keyword.get(opts, :timeout, 3_600_000)
     interval = Keyword.get(opts, :interval, 15_000)
 
-    %{job_id: job_id, sif_path: sif_path} = build_sif_job(session, opts)
+    result = build_sif_job(session, opts)
+    %{job_id: job_id, sif_path: sif_path} = result
 
-    # If already existed (job_id: nil), return immediately
-    if is_nil(job_id) do
+    cond do
+      # SIF already existed before we started
+      is_nil(job_id) and remote_file_exists?(session, sif_path) ->
+        Logger.info("[HpcConnect] SIF already exists: #{sif_path}")
+        sif_path
+
+      # Direct background build started — poll by file existence
+      is_nil(job_id) ->
+        log_hint = Map.get(result, :log_file)
+
+        Logger.info("[HpcConnect] Waiting for direct build to complete. SIF: #{sif_path}")
+
+        if log_hint do
+          Logger.info(
+            "[HpcConnect] Tail the build log: ssh #{session.cluster.ssh_alias} 'tail -f #{log_hint}'"
+          )
+        end
+
+        wait_for_sif_direct!(session, sif_path, timeout, interval)
+
+      # SLURM job submitted — poll via sacct + file existence
+      true ->
+        Logger.info("[HpcConnect] Build job #{job_id} submitted. Waiting for SIF at #{sif_path}")
+
+        Logger.info(
+          "[HpcConnect] Monitor: squeue -j #{job_id} | Logs: tail -f #{Map.get(result, :logs_dir, "")}/build_sif_#{Map.get(result, :name, "")}_#{job_id}.out"
+        )
+
+        wait_for_sif!(session, job_id, sif_path, timeout, interval)
+    end
+  end
+
+  defp wait_for_sif_direct!(_session, _sif_path, timeout, _interval) when timeout <= 0 do
+    raise RuntimeError, "Timed out waiting for direct apptainer build to complete"
+  end
+
+  defp wait_for_sif_direct!(session, sif_path, timeout, interval) do
+    Logger.debug("[HpcConnect] Waiting for direct build (#{div(timeout, 1000)}s remaining)...")
+    Process.sleep(interval)
+
+    if remote_file_exists?(session, sif_path) do
+      Logger.info("[HpcConnect] SIF ready: #{sif_path}")
       sif_path
     else
-      wait_for_sif!(session, job_id, sif_path, timeout, interval)
+      # Tail recent build log lines so errors surface in IEx
+      log_dir = Path.join(session.work_dir, "sbatch_logs")
+      log_glob = Path.join(log_dir, "build_sif_*_direct.log")
+
+      {tail_out, _} =
+        session
+        |> SSH.ssh_command(
+          "ls -t #{Shell.escape(log_glob)} 2>/dev/null | head -1 | xargs -I{} tail -n 10 {}",
+          "Tail build log"
+        )
+        |> SSH.run([])
+
+      trimmed = String.trim(tail_out)
+      if trimmed != "", do: Logger.info("[HpcConnect] Build log tail:\n#{trimmed}")
+
+      wait_for_sif_direct!(session, sif_path, timeout - interval, interval)
     end
   end
 
@@ -1039,32 +1213,47 @@ defmodule HpcConnect.Slurm do
   end
 
   defp wait_for_sif!(session, job_id, sif_path, timeout, interval) do
+    Logger.debug(
+      "[HpcConnect] Waiting for build job #{job_id} (#{div(timeout, 1000)}s remaining)..."
+    )
+
     Process.sleep(interval)
+
+    state = job_state(session, job_id)
+    Logger.debug("[HpcConnect] Job #{job_id} state: #{inspect(state)}")
 
     cond do
       remote_file_exists?(session, sif_path) ->
+        Logger.info("[HpcConnect] SIF ready: #{sif_path}")
         sif_path
 
-      job_failed?(session, job_id) ->
+      state in ~w(FAILED CANCELLED TIMEOUT NODE_FAIL OUT_OF_MEMORY) ->
         raise RuntimeError,
-              "Apptainer build job #{job_id} failed. Check logs with: squeue -j #{job_id}"
+              "Apptainer build job #{job_id} failed (state: #{state}). " <>
+                "Check logs with: sacct -j #{job_id} --format=JobID,State,ExitCode,Reason"
+
+      state == "COMPLETED" ->
+        raise RuntimeError,
+              "Apptainer build job #{job_id} COMPLETED but SIF not found at #{sif_path}. " <>
+                "Check job output: sacct -j #{job_id} --format=JobID,State,ExitCode,Reason"
 
       true ->
         wait_for_sif!(session, job_id, sif_path, timeout - interval, interval)
     end
   end
 
-  defp job_failed?(session, job_id) do
+  defp job_state(session, job_id) do
     {output, _} =
-      session
-      |> SSH.ssh_command(
-        "sacct -j #{job_id} --noheader --format=State --parsable2 2>/dev/null | head -1 || true",
-        "Check job state"
+      SSH.exec(
+        session,
+        # Strip ANSI escape codes, skip quota warning lines, take the first real state line
+        "sacct -j #{job_id} --noheader --format=State --parsable2 2>/dev/null " <>
+          "| sed 's/\\x1b\\[[0-9;]*m//g' | grep -v '^$' | grep -v 'WARNING' | grep -v 'Path' | grep -v '!!!' " <>
+          "| head -1 || true",
+        []
       )
-      |> SSH.run()
 
-    state = String.trim(output)
-    state in ~w(FAILED CANCELLED TIMEOUT NODE_FAIL OUT_OF_MEMORY)
+    String.trim(output)
   end
 
   @doc """
@@ -1110,7 +1299,7 @@ defmodule HpcConnect.Slurm do
 
     export_vars =
       [
-        "HPC_MODELS_DIR=#{Shell.escape(session.vault_dir)}",
+        "HPC_MODELS_DIR=#{Shell.escape(Model.models_root(session))}",
         "HPC_WORK_DIR=#{Shell.escape(session.work_dir)}",
         "HPC_SIF_PATH=#{Shell.escape(sif_path)}",
         "APP_PORT=#{port}"
