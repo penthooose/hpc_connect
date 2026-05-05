@@ -223,6 +223,11 @@ defmodule HpcConnect.Livebook do
         }
       end
 
+    unless File.exists?(uploaded_key_path) do
+      raise RuntimeError,
+            "SSH private key not found: #{uploaded_key_path}. Aborting before opening any SSH/proxy connection."
+    end
+
     result =
       connect(cluster, username, uploaded_key_path,
         remote_command: Keyword.get(opts, :remote_command, "hostname && whoami"),
@@ -253,6 +258,13 @@ defmodule HpcConnect.Livebook do
         _ -> raise ArgumentError, "local mode requires :key_path (or :uploaded_key_path)"
       end
 
+    key_path = Path.expand(key_path)
+
+    unless File.exists?(key_path) do
+      raise RuntimeError,
+            "SSH private key not found: #{key_path}. Aborting before opening any SSH/proxy connection."
+    end
+
     # In local mode we do NOT copy the key to a temp dir.
     # The user's ~/.ssh/config already handles ProxyJump etc. We just reference
     # the key directly, avoiding stale-temp-file failures across IEx restarts.
@@ -269,13 +281,42 @@ defmodule HpcConnect.Livebook do
 
     remote_command = Keyword.get(opts, :remote_command, "hostname && whoami")
 
-    connect_fun =
-      Keyword.get(opts, :connect_fun) ||
-        fn s, cmd, copts -> HpcConnect.connect!(s, cmd, copts) end
+    connect_opts = Keyword.get(opts, :connect_opts, [])
+    native_ssh? = Keyword.get(opts, :native_ssh, true)
+    native_ssh_fallback_to_os? = Keyword.get(opts, :native_ssh_fallback_to_os, false)
+    open_connection_opts = Keyword.get(opts, :open_connection_opts, [])
 
-    probe =
-      connect_fun.(session, remote_command, Keyword.get(opts, :connect_opts, []))
-      |> sanitize_probe()
+    {session, probe} =
+      case Keyword.get(opts, :connect_fun) do
+        fun when is_function(fun, 3) ->
+          probe = fun.(session, remote_command, connect_opts) |> sanitize_probe()
+          {session, probe}
+
+        _ when native_ssh? ->
+          try do
+            {native_session, _tunnel} = HpcConnect.open_connection!(session, open_connection_opts)
+
+            probe =
+              HpcConnect.connect!(native_session, remote_command, connect_opts)
+              |> sanitize_probe()
+
+            {native_session, probe}
+          rescue
+            error ->
+              if native_ssh_fallback_to_os? do
+                probe =
+                  HpcConnect.connect!(session, remote_command, connect_opts) |> sanitize_probe()
+
+                {session, probe}
+              else
+                reraise error, __STACKTRACE__
+              end
+          end
+
+        _ ->
+          probe = HpcConnect.connect!(session, remote_command, connect_opts) |> sanitize_probe()
+          {session, probe}
+      end
 
     command_preview =
       session |> HpcConnect.connect_command(remote_command) |> HpcConnect.command_preview()

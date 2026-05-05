@@ -3,7 +3,8 @@ defmodule HpcConnect.SSH do
   Helpers for building and executing portable SSH / SCP commands.
   """
 
-  alias HpcConnect.{Command, Session, Shell}
+  require Logger
+  alias HpcConnect.{Command, Session, Shell, TunnelManager}
 
   @spec ssh_command(Session.t(), binary(), binary()) :: Command.t()
   def ssh_command(%Session{} = session, remote_command, summary) do
@@ -60,26 +61,129 @@ defmodule HpcConnect.SSH do
   def scp_binary, do: System.find_executable("scp") || "scp"
 
   @doc """
+  Returns an equivalent OpenSSH command preview for the native login connection.
+
+  This is intended for diagnostics only.
+  """
+  @spec native_login_connect_preview(Session.t()) :: binary()
+  def native_login_connect_preview(%Session{} = session) do
+    # Native Erlang :ssh connects DIRECTLY to the login node (no -J / no proxy).
+    # The ~/.ssh/config ProxyJump is an OS-level convenience that :ssh does not use.
+    direct_target =
+      case session.username do
+        u when is_binary(u) and u != "" -> "#{u}@#{session.cluster.host}"
+        _ -> session.cluster.host
+      end
+
+    args =
+      []
+      |> maybe_append_option("-F", session.ssh_config_file)
+      |> maybe_append_option("-i", session.identity_file)
+      |> Kernel.++([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        "NumberOfPasswordPrompts=0",
+        "-o",
+        "ConnectTimeout=30",
+        direct_target
+      ])
+
+    preview_command(ssh_binary(), args)
+  end
+
+  @doc """
+  Returns an equivalent OpenSSH command preview for compute-node port forwarding.
+
+  `local_port` may be `nil` to indicate auto-port selection.
+  """
+  @spec native_compute_tunnel_preview(Session.t(), binary(), pos_integer(), pos_integer() | nil) ::
+          binary()
+  def native_compute_tunnel_preview(%Session{} = session, node, remote_port, local_port \\ nil) do
+    # Use the explicit user@hostname for the jump to show the direct-to-login-node path.
+    login_jump_target =
+      case session.username do
+        u when is_binary(u) and u != "" -> "#{u}@#{session.cluster.host}"
+        _ -> session.cluster.host
+      end
+
+    compute_target =
+      case session.username do
+        username when is_binary(username) and username != "" -> "#{username}@#{node}"
+        _ -> node
+      end
+
+    local_port_arg =
+      if is_integer(local_port) and local_port > 0, do: to_string(local_port), else: "<auto>"
+
+    args =
+      []
+      |> maybe_append_option("-F", session.ssh_config_file)
+      |> maybe_append_option("-i", session.identity_file)
+      |> maybe_append_option("-J", login_jump_target)
+      |> Kernel.++([
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        "NumberOfPasswordPrompts=0",
+        "-o",
+        "ConnectTimeout=30",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-N",
+        "-L",
+        "#{local_port_arg}:localhost:#{remote_port}",
+        compute_target
+      ])
+
+    preview_command(ssh_binary(), args)
+  end
+
+  @doc """
   Builds an SSH local port-forwarding command.
 
-  The tunnel connects `local_port` on localhost to `remote_port` on the compute node,
-  **through the cluster login host as a TCP gateway**.
+  The tunnel connects `local_port` on localhost to `remote_port` on the **compute node**
+  by opening an SSH session to that node and hopping through the login node via `-J`.
+  This matches the common OpenSSH pattern:
 
-  This avoids opening an SSH session to the compute node itself (which is blocked on
-  some clusters or may require password auth even when login-node key auth works).
+      ssh -N -L <local_port>:localhost:<remote_port> -J <login> <user>@<compute_node>
 
   The returned `%Command{}` can be inspected with `command_preview/1` or run as a
   background Port via `open_proxy!/1`.
   """
   @spec port_forward_command(Session.t(), binary(), pos_integer(), pos_integer()) :: Command.t()
   def port_forward_command(%Session{} = session, node, local_port, remote_port) do
-    proxy_jump_target = proxy_jump_target(session)
+    # Use the explicit user@hostname (not the ssh_alias) so the OS tunnel connects
+    # directly to the login node without going through ~/.ssh/config ProxyJump entries.
+    login_jump_target =
+      case session.username do
+        u when is_binary(u) and u != "" -> "#{u}@#{session.cluster.host}"
+        _ -> session.cluster.host
+      end
+
+    compute_target =
+      case session.username do
+        username when is_binary(username) and username != "" -> "#{username}@#{node}"
+        _ -> node
+      end
 
     args =
       []
       |> maybe_append_option("-F", session.ssh_config_file)
       |> maybe_append_option("-i", session.identity_file)
-      |> maybe_append_option("-J", proxy_jump_target)
+      |> maybe_append_option("-J", login_jump_target)
       |> Kernel.++([
         ["-o", "BatchMode=yes"],
         ["-o", "IdentitiesOnly=yes"],
@@ -91,9 +195,10 @@ defmodule HpcConnect.SSH do
         ["-o", "StrictHostKeyChecking=accept-new"],
         ["-o", "ServerAliveInterval=30"],
         ["-o", "ServerAliveCountMax=3"],
+        ["-o", "LogLevel=ERROR"],
         ["-N"],
-        ["-L", "#{local_port}:#{node}:#{remote_port}"],
-        [Session.target(session)]
+        ["-L", "#{local_port}:localhost:#{remote_port}"],
+        [compute_target]
       ])
       |> List.flatten()
 
@@ -101,7 +206,7 @@ defmodule HpcConnect.SSH do
       binary: ssh_binary(),
       args: args,
       summary:
-        "Tunnel localhost:#{local_port} -> #{node}:#{remote_port} via login #{session.cluster.host}",
+        "Tunnel localhost:#{local_port} -> #{node}:#{remote_port} via jump #{login_jump_target}",
       remote_command: nil
     }
   end
@@ -219,12 +324,13 @@ defmodule HpcConnect.SSH do
       ])
 
     port =
-      Port.open({:spawn_executable, ssh_binary()}, [
-        :binary,
-        :exit_status,
-        :stderr_to_stdout,
-        args: args
-      ])
+      case TunnelManager.open_port(ssh_binary(), args, [:binary, :exit_status, :stderr_to_stdout]) do
+        {:ok, managed_port} ->
+          managed_port
+
+        {:error, reason} ->
+          raise RuntimeError, "failed to open SSH master process: #{inspect(reason)}"
+      end
 
     :ok = wait_for_socket(socket_path, timeout)
     {%{session | master_socket: socket_path}, port}
@@ -235,7 +341,7 @@ defmodule HpcConnect.SSH do
   """
   @spec close_master(port()) :: :ok
   def close_master(master_port) when is_port(master_port) do
-    Port.close(master_port)
+    _ = TunnelManager.close_port(master_port)
     :ok
   end
 
@@ -255,6 +361,12 @@ defmodule HpcConnect.SSH do
   defp maybe_append_option(args, _flag, nil), do: args
   defp maybe_append_option(args, _flag, ""), do: args
   defp maybe_append_option(args, flag, value), do: args ++ [flag, value]
+
+  defp preview_command(binary, args) do
+    ([binary] ++ args)
+    |> Enum.map(&preview_arg(to_string(&1)))
+    |> Enum.join(" ")
+  end
 
   defp proxy_jump_target(%Session{} = session) do
     cond do
@@ -293,19 +405,23 @@ defmodule HpcConnect.SSH do
 
   ## ProxyJump handling
 
-  If the session has a `proxy_jump` host, one background OS process is opened:
-  `ssh -N -L <free_port>:<target>:22 <proxy>`. This is a plain TCP tunnel —
-  no interactive shell, no output, no visible window. Erlang `:ssh` then
-  connects to `localhost:<free_port>`.
+  By default, native mode does **not** open any OS OpenSSH process for proxying.
+  If direct native connect fails and a proxy jump is required, set
+  `proxy_jump_via_os: true` explicitly to allow the managed OpenSSH tunnel.
 
   Close with `close_connection/1`.
 
-  Options: `:timeout` (ms, default 20_000).
+  Options:
+  - `:timeout` (ms, default 20_000)
+  - `:proxy_jump_via_native` (default `true`)
+  - `:proxy_jump_via_os` (default `false`)
   """
   @spec open_connection!(Session.t(), keyword()) :: {Session.t(), port() | nil}
   def open_connection!(%Session{} = session, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 20_000)
     attempts = Keyword.get(opts, :attempts, 3)
+    proxy_jump_via_native = Keyword.get(opts, :proxy_jump_via_native, true)
+    proxy_jump_via_os = Keyword.get(opts, :proxy_jump_via_os, false)
 
     # Suppress :ssh application logger output during connection attempts.
     # Erlang :ssh emits [notice]/[debug] messages on auth failures which are
@@ -316,7 +432,7 @@ defmodule HpcConnect.SSH do
     :logger.add_primary_filter(filter_id, {&suppress_ssh_logs/2, []})
 
     try do
-      do_open_connection!(session, timeout, attempts)
+      do_open_connection!(session, timeout, attempts, proxy_jump_via_native, proxy_jump_via_os)
     after
       :logger.remove_primary_filter(filter_id)
     end
@@ -328,9 +444,17 @@ defmodule HpcConnect.SSH do
   defp suppress_ssh_logs(%{meta: %{application: :ssh}} = _event, _extra), do: :stop
   defp suppress_ssh_logs(_event, _extra), do: :ignore
 
-  defp do_open_connection!(session, timeout, attempts_left) do
+  defp do_open_connection!(
+         session,
+         timeout,
+         attempts_left,
+         proxy_jump_via_native,
+         proxy_jump_via_os
+       ) do
     proxy_jump =
       session.proxy_jump || session.cluster.proxy_jump
+
+    has_proxy_jump = is_binary(proxy_jump) and proxy_jump != ""
 
     ssh_opts = build_erlang_ssh_opts(session, timeout)
 
@@ -338,57 +462,345 @@ defmodule HpcConnect.SSH do
 
     direct_result = :ssh.connect(direct_host, 22, ssh_opts, timeout)
 
-    {conn, tunnel_os_port} =
+    {conn, tunnel_os_port, jump_conn, jump_tunnel_port} =
       case direct_result do
         {:ok, conn} ->
-          {conn, nil}
+          {conn, nil, nil, nil}
 
         {:error, direct_reason} ->
-          if proxy_jump do
-            local_port = find_free_local_port()
-            target_host = session.cluster.host
-            tunnel_args = build_proxy_tunnel_args(session, proxy_jump, target_host, local_port)
+          cond do
+            has_proxy_jump and proxy_jump_via_native ->
+              case connect_via_native_proxy_jump(session, ssh_opts, timeout) do
+                {:ok, proxy_conn, proxy_jump_conn, proxy_tunnel_port} ->
+                  {proxy_conn, nil, proxy_jump_conn, proxy_tunnel_port}
 
-            os_port =
-              Port.open({:spawn_executable, ssh_binary()}, [
-                :binary,
-                :exit_status,
-                :stderr_to_stdout,
-                args: tunnel_args
-              ])
+                {:error, native_reason} ->
+                  if has_proxy_jump and proxy_jump_via_os do
+                    case connect_via_os_proxy_jump(session, ssh_opts, timeout) do
+                      {:ok, proxy_conn, os_port} ->
+                        {proxy_conn, os_port, nil, nil}
 
-            # Poll until the tunnel's local port is accepting connections.
-            wait_for_local_port(local_port, 8_000)
+                      {:error, os_reason} ->
+                        maybe_retry_or_raise!(
+                          session,
+                          timeout,
+                          attempts_left,
+                          proxy_jump_via_native,
+                          proxy_jump_via_os,
+                          direct_reason,
+                          native_reason,
+                          os_reason
+                        )
+                    end
+                  else
+                    maybe_retry_or_raise!(
+                      session,
+                      timeout,
+                      attempts_left,
+                      proxy_jump_via_native,
+                      proxy_jump_via_os,
+                      direct_reason,
+                      native_reason,
+                      nil
+                    )
+                  end
+              end
 
-            case :ssh.connect(~c"127.0.0.1", local_port, ssh_opts, timeout) do
-              {:ok, conn} ->
-                {conn, os_port}
+            has_proxy_jump and proxy_jump_via_os ->
+              case connect_via_os_proxy_jump(session, ssh_opts, timeout) do
+                {:ok, proxy_conn, os_port} ->
+                  {proxy_conn, os_port, nil, nil}
 
-              {:error, reason} ->
-                safe_port_close(os_port)
+                {:error, os_reason} ->
+                  maybe_retry_or_raise!(
+                    session,
+                    timeout,
+                    attempts_left,
+                    proxy_jump_via_native,
+                    proxy_jump_via_os,
+                    direct_reason,
+                    nil,
+                    os_reason
+                  )
+              end
 
-                if attempts_left > 1 and retryable_connect_error?(reason) do
-                  Process.sleep(1_000)
-                  do_open_connection!(session, timeout, attempts_left - 1)
-                else
-                  raise RuntimeError,
-                        "SSH connect failed (direct: #{inspect(direct_reason)}, proxy: #{inspect(reason)})"
-                end
-            end
-          else
-            if attempts_left > 1 and retryable_connect_error?(direct_reason) do
-              Process.sleep(1_000)
-              do_open_connection!(session, timeout, attempts_left - 1)
-            else
-              raise RuntimeError, "SSH connect failed: #{inspect(direct_reason)}"
-            end
+            has_proxy_jump ->
+              maybe_retry_or_raise!(
+                session,
+                timeout,
+                attempts_left,
+                proxy_jump_via_native,
+                proxy_jump_via_os,
+                direct_reason,
+                nil,
+                nil
+              )
+
+            true ->
+              if attempts_left > 1 and retryable_connect_error?(direct_reason) do
+                Process.sleep(1_000)
+
+                do_open_connection!(
+                  session,
+                  timeout,
+                  attempts_left - 1,
+                  proxy_jump_via_native,
+                  proxy_jump_via_os
+                )
+              else
+                raise RuntimeError, "SSH connect failed: #{inspect(direct_reason)}"
+              end
           end
       end
 
     updated =
-      %{session | ssh_conn: conn, tunnel_port: tunnel_os_port}
+      %{
+        session
+        | ssh_conn: conn,
+          tunnel_port: tunnel_os_port,
+          jump_ssh_conn: jump_conn,
+          jump_tunnel_port: jump_tunnel_port
+      }
 
     {updated, tunnel_os_port}
+  end
+
+  defp connect_via_native_proxy_jump(%Session{} = session, ssh_opts, timeout) do
+    {jump_user, jump_host} = proxy_jump_identity(session)
+
+    jump_opts = build_erlang_ssh_opts(session, timeout, jump_user)
+
+    Logger.debug(
+      "[HpcConnect] native proxy-jump equivalent OpenSSH: #{native_login_connect_preview(session)}"
+    )
+
+    target_candidates =
+      [tunnel_target(session), session.cluster.host]
+      |> Enum.filter(&(is_binary(&1) and &1 != ""))
+      |> Enum.uniq()
+
+    Logger.debug(
+      "[HpcConnect] native proxy-jump: connecting to jump host #{jump_host} as #{jump_user}"
+    )
+
+    case :ssh.connect(String.to_charlist(jump_host), 22, jump_opts, timeout) do
+      {:ok, jump_conn} ->
+        Logger.debug(
+          "[HpcConnect] native proxy-jump: jump host connected, trying targets: #{inspect(target_candidates)}"
+        )
+
+        case try_native_proxy_targets(jump_conn, target_candidates, ssh_opts, timeout) do
+          {:ok, conn, local_tunnel_port} ->
+            Logger.debug(
+              "[HpcConnect] native proxy-jump: tunnel established on local port #{local_tunnel_port}"
+            )
+
+            {:ok, conn, jump_conn, local_tunnel_port}
+
+          {:error, reason} ->
+            Logger.debug("[HpcConnect] native proxy-jump: all targets failed: #{inspect(reason)}")
+            :ssh.close(jump_conn)
+            {:error, {:native_proxy_jump_failed, reason}}
+        end
+
+      {:error, reason} ->
+        Logger.debug(
+          "[HpcConnect] native proxy-jump: jump host connect failed: #{inspect(reason)}"
+        )
+
+        {:error, {:native_proxy_jump_failed, reason}}
+    end
+  end
+
+  defp try_native_proxy_targets(jump_conn, targets, ssh_opts, timeout) do
+    do_try_native_proxy_targets(jump_conn, targets, ssh_opts, timeout, [])
+  end
+
+  defp do_try_native_proxy_targets(_jump_conn, [], _ssh_opts, _timeout, reasons) do
+    {:error, {:native_proxy_connect_failed, Enum.reverse(reasons)}}
+  end
+
+  defp do_try_native_proxy_targets(jump_conn, [target | rest], ssh_opts, timeout, reasons) do
+    Logger.debug("[HpcConnect] native proxy-jump: tcpip_tunnel_to_server -> #{target}:22")
+
+    case :ssh.tcpip_tunnel_to_server(
+           jump_conn,
+           ~c"127.0.0.1",
+           0,
+           String.to_charlist(target),
+           22,
+           timeout
+         ) do
+      {:ok, local_tunnel_port} ->
+        Logger.debug(
+          "[HpcConnect] native proxy-jump: tunnel port #{local_tunnel_port} open, " <>
+            "using :gen_tcp then :ssh.connect/3 to avoid Erlang SSH self-connect deadlock"
+        )
+
+        # Use :gen_tcp for the TCP hop — avoids a deadlock where the Erlang :ssh
+        # application would be on both sides of the loopback tunnel simultaneously.
+        # Then use :ssh.connect/3 (socket form) to do SSH over the raw TCP socket.
+        case :gen_tcp.connect(~c"127.0.0.1", local_tunnel_port, [:binary, active: false], timeout) do
+          {:ok, tcp_sock} ->
+            Logger.debug(
+              "[HpcConnect] native proxy-jump: TCP connected to tunnel, starting SSH handshake to #{target}..."
+            )
+
+            # The socket form :ssh.connect/3 does NOT accept connect_timeout — only
+            # the host/port form :ssh.connect/4 does. Including it causes the SSH FSM
+            # to stall or crash. Strip it before handing opts to the socket form.
+            handshake_opts = Keyword.delete(ssh_opts, :connect_timeout)
+
+            Logger.debug("[HpcConnect] ssh_opts for handshake: #{inspect(handshake_opts)}")
+
+            # Put the socket into the exact mode Erlang's SSH FSM expects.
+            :inet.setopts(tcp_sock, active: false, packet: :raw, mode: :binary)
+
+            case :ssh.connect(tcp_sock, handshake_opts, timeout) do
+              {:ok, conn} ->
+                Logger.debug(
+                  "[HpcConnect] native proxy-jump: SSH handshake to #{target} succeeded!"
+                )
+
+                {:ok, conn, local_tunnel_port}
+
+              {:error, reason} ->
+                Logger.debug(
+                  "[HpcConnect] native proxy-jump: SSH handshake to #{target} failed: #{inspect(reason)}"
+                )
+
+                :gen_tcp.close(tcp_sock)
+
+                do_try_native_proxy_targets(
+                  jump_conn,
+                  rest,
+                  ssh_opts,
+                  timeout,
+                  [{target, {:ssh_handshake_failed, reason}} | reasons]
+                )
+            end
+
+          {:error, reason} ->
+            Logger.debug(
+              "[HpcConnect] native proxy-jump: :gen_tcp.connect to tunnel port #{local_tunnel_port} failed: #{inspect(reason)}"
+            )
+
+            do_try_native_proxy_targets(
+              jump_conn,
+              rest,
+              ssh_opts,
+              timeout,
+              [{target, {:tcp_connect_failed, reason}} | reasons]
+            )
+        end
+
+      {:error, reason} ->
+        Logger.debug(
+          "[HpcConnect] native proxy-jump: tcpip_tunnel_to_server to #{target} failed: #{inspect(reason)}"
+        )
+
+        do_try_native_proxy_targets(
+          jump_conn,
+          rest,
+          ssh_opts,
+          timeout,
+          [{target, {:tunnel_setup_failed, reason}} | reasons]
+        )
+    end
+  end
+
+  defp connect_via_os_proxy_jump(%Session{} = session, ssh_opts, timeout) do
+    local_port = find_free_local_port()
+    tunnel_args = build_proxy_tunnel_args(session, local_port)
+
+    os_port =
+      case TunnelManager.open_port(ssh_binary(), tunnel_args, [
+             :binary,
+             :exit_status,
+             :stderr_to_stdout
+           ]) do
+        {:ok, managed_port} ->
+          managed_port
+
+        {:error, reason} ->
+          {:error, {:os_proxy_tunnel_spawn_failed, reason}}
+      end
+
+    with port when is_port(port) <- os_port do
+      try do
+        # Poll until the tunnel's local port is accepting connections.
+        wait_for_local_port(local_port, port, 15_000)
+
+        case :ssh.connect(~c"127.0.0.1", local_port, ssh_opts, timeout) do
+          {:ok, conn} ->
+            {:ok, conn, port}
+
+          {:error, reason} ->
+            safe_port_close(port)
+            {:error, {:os_proxy_connect_failed, reason}}
+        end
+      rescue
+        e ->
+          safe_port_close(port)
+          {:error, {:os_proxy_tunnel_failed, Exception.message(e)}}
+      end
+    else
+      {:error, _reason} = err -> err
+    end
+  end
+
+  defp maybe_retry_or_raise!(
+         session,
+         timeout,
+         attempts_left,
+         proxy_jump_via_native,
+         proxy_jump_via_os,
+         direct_reason,
+         native_reason,
+         os_reason
+       ) do
+    retryable? =
+      Enum.any?([direct_reason, native_reason, os_reason], fn
+        nil -> false
+        reason -> retryable_connect_error?(reason)
+      end)
+
+    if attempts_left > 1 and retryable? do
+      Process.sleep(1_000)
+
+      do_open_connection!(
+        session,
+        timeout,
+        attempts_left - 1,
+        proxy_jump_via_native,
+        proxy_jump_via_os
+      )
+    else
+      cond do
+        not is_nil(native_reason) and not is_nil(os_reason) ->
+          raise RuntimeError,
+                "SSH connect failed (direct: #{inspect(direct_reason)}, " <>
+                  "native_proxy_jump: #{inspect(native_reason)}, " <>
+                  "os_proxy_jump: #{inspect(os_reason)})."
+
+        not is_nil(native_reason) ->
+          raise RuntimeError,
+                "SSH connect failed (direct: #{inspect(direct_reason)}, " <>
+                  "native_proxy_jump: #{inspect(native_reason)}). " <>
+                  "If you want OS proxy fallback, pass proxy_jump_via_os: true explicitly."
+
+        not is_nil(os_reason) ->
+          raise RuntimeError,
+                "SSH connect failed (direct: #{inspect(direct_reason)}, " <>
+                  "os_proxy_jump: #{inspect(os_reason)})."
+
+        true ->
+          raise RuntimeError,
+                "SSH connect failed: #{inspect(direct_reason)}. " <>
+                  "This cluster may require ProxyJump; native proxy-jump tunneling is enabled by default, " <>
+                  "and OS proxy fallback is disabled unless proxy_jump_via_os: true is set."
+      end
+    end
   end
 
   @doc """
@@ -398,17 +810,209 @@ defmodule HpcConnect.SSH do
   Returns the session with `ssh_conn` and `tunnel_port` cleared.
   """
   @spec close_connection(Session.t()) :: Session.t()
-  def close_connection(%Session{ssh_conn: conn, tunnel_port: tunnel} = session) do
+  def close_connection(
+        %Session{
+          ssh_conn: conn,
+          tunnel_port: tunnel,
+          jump_ssh_conn: jump_conn,
+          compute_ssh_conn: compute_conn
+        } = session
+      ) do
     if conn, do: :ssh.close(conn)
+    if jump_conn, do: :ssh.close(jump_conn)
+    if compute_conn, do: :ssh.close(compute_conn)
     safe_port_close(tunnel)
-    %{session | ssh_conn: nil, tunnel_port: nil}
+
+    %{
+      session
+      | ssh_conn: nil,
+        tunnel_port: nil,
+        jump_ssh_conn: nil,
+        jump_tunnel_port: nil,
+        compute_ssh_conn: nil
+    }
   end
 
   defp safe_port_close(nil), do: :ok
 
   defp safe_port_close(port) when is_port(port) do
-    if Port.info(port) != nil, do: Port.close(port)
+    _ = TunnelManager.close_port(port)
     :ok
+  end
+
+  @doc """
+  Opens a native Erlang SSH TCP port-forward tunnel on an existing connection.
+
+  Asks the SSH server (`conn`) to forward TCP connections from `local_port` on
+  `127.0.0.1` to `target_host:target_port` through the established SSH channel.
+  When `local_port` is `0` the OS picks a free port and the actual port is returned.
+
+  This is the native equivalent of the OS `ssh -N -L local_port:target_host:target_port`
+  command. The tunnel stays alive as long as `conn` is alive — no background
+  process or OS port is required.
+
+  Returns `{:ok, actual_local_port}` or `{:error, reason}`.
+  """
+  @spec open_native_tunnel(term(), binary(), pos_integer(), non_neg_integer(), non_neg_integer()) ::
+          {:ok, pos_integer()} | {:error, term()}
+  def open_native_tunnel(conn, target_host, target_port, local_port \\ 0, timeout \\ 10_000) do
+    Logger.debug(
+      "[HpcConnect] native tunnel: tcpip_tunnel_to_server conn=#{inspect(conn)} -> #{target_host}:#{target_port}"
+    )
+
+    case :ssh.tcpip_tunnel_to_server(
+           conn,
+           ~c"127.0.0.1",
+           local_port,
+           String.to_charlist(target_host),
+           target_port,
+           timeout
+         ) do
+      {:ok, actual_port} ->
+        Logger.debug("[HpcConnect] native tunnel: listening on localhost:#{actual_port}")
+        {:ok, actual_port}
+
+      {:error, reason} = err ->
+        Logger.debug("[HpcConnect] native tunnel: failed: #{inspect(reason)}")
+        err
+    end
+  end
+
+  @doc """
+  Like `open_native_tunnel/5` but raises on failure.
+  """
+  @spec open_native_tunnel!(term(), binary(), pos_integer(), non_neg_integer(), non_neg_integer()) ::
+          pos_integer()
+  def open_native_tunnel!(conn, target_host, target_port, local_port \\ 0, timeout \\ 10_000) do
+    case open_native_tunnel(conn, target_host, target_port, local_port, timeout) do
+      {:ok, actual_port} -> actual_port
+      {:error, reason} -> raise RuntimeError, "native SSH tunnel failed: #{inspect(reason)}"
+    end
+  end
+
+  @doc """
+  Opens a **two-hop** native SSH port-forward tunnel for accessing a vLLM service
+  running on a compute node.
+
+  This implements the native equivalent of:
+      ssh -J user@login_node user@compute_node -N -L local_port:localhost:remote_port
+
+  The flow is:
+  1. Ask `login_conn` (an existing SSH session to the login node) to open a TCP
+     channel to `compute_node:22`.
+  2. TCP-connect locally to the tunnel endpoint and perform an SSH handshake to
+     the compute node.
+  3. On the compute-node SSH connection, open `tcpip_tunnel_to_server` forwarding
+     `localhost:local_port` → `localhost:remote_port` on the compute node.
+
+  Returns `{compute_conn, actual_local_port}`. **`compute_conn` must be kept alive**
+  (e.g. stored in the session or result map) — closing it will tear down the tunnel.
+  """
+  @spec open_native_compute_tunnel!(
+          Session.t(),
+          term(),
+          binary(),
+          pos_integer(),
+          non_neg_integer(),
+          non_neg_integer()
+        ) ::
+          {term(), pos_integer()}
+  def open_native_compute_tunnel!(
+        session,
+        login_conn,
+        compute_node,
+        remote_port,
+        local_port \\ 0,
+        timeout \\ 20_000
+      ) do
+    Logger.debug(
+      "[HpcConnect] native compute tunnel: opening TCP channel via login_conn to #{compute_node}:22"
+    )
+
+    # Step 1: tunnel local TCP port → compute_node:22, through the login-node SSH connection
+    ssh_tunnel_port =
+      case :ssh.tcpip_tunnel_to_server(
+             login_conn,
+             ~c"127.0.0.1",
+             0,
+             String.to_charlist(compute_node),
+             22,
+             timeout
+           ) do
+        {:ok, p} ->
+          Logger.debug(
+            "[HpcConnect] native compute tunnel: TCP channel to #{compute_node}:22 on local port #{p}"
+          )
+
+          p
+
+        {:error, reason} ->
+          raise RuntimeError,
+                "native compute tunnel: failed to open TCP channel to #{compute_node}:22 via login node: #{inspect(reason)}"
+      end
+
+    # Step 2: TCP-connect locally to that tunnel port
+    tcp_sock =
+      case :gen_tcp.connect(~c"127.0.0.1", ssh_tunnel_port, [:binary, active: false], timeout) do
+        {:ok, s} ->
+          s
+
+        {:error, r} ->
+          raise RuntimeError,
+                "native compute tunnel: TCP connect to tunnel port #{ssh_tunnel_port} failed: #{inspect(r)}"
+      end
+
+    # Step 3: SSH handshake to the compute node through the TCP tunnel
+    # Strip connect_timeout — the socket form :ssh.connect/3 does not accept it
+    # and it causes the SSH FSM to stall.
+    ssh_opts = session |> build_erlang_ssh_opts(timeout) |> Keyword.delete(:connect_timeout)
+
+    Logger.debug("[HpcConnect] compute tunnel ssh_opts for handshake: #{inspect(ssh_opts)}")
+
+    # Ensure socket is in the correct mode for Erlang's SSH FSM.
+    :inet.setopts(tcp_sock, active: false, packet: :raw, mode: :binary)
+
+    compute_conn =
+      case :ssh.connect(tcp_sock, ssh_opts, timeout) do
+        {:ok, c} ->
+          Logger.debug(
+            "[HpcConnect] native compute tunnel: SSH handshake to #{compute_node} succeeded"
+          )
+
+          c
+
+        {:error, reason} ->
+          :gen_tcp.close(tcp_sock)
+
+          raise RuntimeError,
+                "native compute tunnel: SSH handshake to #{compute_node} failed: #{inspect(reason)}"
+      end
+
+    # Step 4: port-forward on the compute-node connection: localhost:local_port → localhost:remote_port
+    actual_port =
+      case :ssh.tcpip_tunnel_to_server(
+             compute_conn,
+             ~c"127.0.0.1",
+             local_port,
+             ~c"127.0.0.1",
+             remote_port,
+             timeout
+           ) do
+        {:ok, p} ->
+          Logger.debug(
+            "[HpcConnect] native compute tunnel: port forward localhost:#{p} → #{compute_node}:localhost:#{remote_port}"
+          )
+
+          p
+
+        {:error, reason} ->
+          :ssh.close(compute_conn)
+
+          raise RuntimeError,
+                "native compute tunnel: port forward on compute node failed: #{inspect(reason)}"
+      end
+
+    {compute_conn, actual_port}
   end
 
   defp retryable_connect_error?(reason) do
@@ -425,18 +1029,73 @@ defmodule HpcConnect.SSH do
   end
 
   # Polls until localhost:port is accepting TCP connections (tunnel is ready).
-  defp wait_for_local_port(port, timeout_ms, waited \\ 0) do
-    case :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 500) do
+  defp wait_for_local_port(local_port, os_port, timeout_ms, waited \\ 0)
+
+  defp wait_for_local_port(local_port, os_port, timeout_ms, waited)
+       when waited >= timeout_ms do
+    {output, exit_status} = collect_port_messages(os_port)
+
+    raise RuntimeError,
+          "proxy tunnel on port #{local_port} did not open within #{timeout_ms}ms" <>
+            port_failure_details(exit_status, output)
+  end
+
+  defp wait_for_local_port(local_port, os_port, timeout_ms, waited) do
+    case :gen_tcp.connect(~c"127.0.0.1", local_port, [:binary, active: false], 500) do
       {:ok, sock} ->
         :gen_tcp.close(sock)
         :ok
 
-      {:error, _} when waited < timeout_ms ->
-        Process.sleep(200)
-        wait_for_local_port(port, timeout_ms, waited + 200)
+      {:error, _reason} ->
+        if Port.info(os_port) == nil do
+          {output, exit_status} = collect_port_messages(os_port)
 
-      {:error, reason} ->
-        raise RuntimeError, "proxy tunnel on port #{port} did not open: #{inspect(reason)}"
+          raise RuntimeError,
+                "proxy tunnel process exited before port #{local_port} became reachable" <>
+                  port_failure_details(exit_status, output)
+        else
+          Process.sleep(200)
+          wait_for_local_port(local_port, os_port, timeout_ms, waited + 200)
+        end
+    end
+  end
+
+  defp collect_port_messages(port, acc \\ "", exit_status \\ nil)
+
+  defp collect_port_messages(port, acc, exit_status) do
+    case TunnelManager.port_info(port) do
+      {:ok, %{output: output, exit_status: manager_exit_status}} ->
+        merged_output = IO.iodata_to_binary([acc, output || ""])
+        {merged_output, manager_exit_status || exit_status}
+
+      _ ->
+        collect_port_messages_from_mailbox(port, acc, exit_status)
+    end
+  end
+
+  defp collect_port_messages_from_mailbox(port, acc, exit_status) do
+    receive do
+      {^port, {:data, data}} ->
+        collect_port_messages_from_mailbox(port, [acc, data], exit_status)
+
+      {^port, {:exit_status, status}} ->
+        collect_port_messages_from_mailbox(port, acc, status)
+    after
+      0 ->
+        {IO.iodata_to_binary(acc), exit_status}
+    end
+  end
+
+  defp port_failure_details(exit_status, output) do
+    status_part = if is_integer(exit_status), do: " (exit #{exit_status})", else: ""
+    output_part = output |> to_string() |> String.trim()
+
+    case output_part do
+      "" ->
+        status_part
+
+      text ->
+        "#{status_part}: #{text}"
     end
   end
 
@@ -587,15 +1246,20 @@ defmodule HpcConnect.SSH do
     end
   end
 
-  # Build the proxy tunnel args: ssh -N -L local_port:target:22 proxy_host
-  defp build_proxy_tunnel_args(session, proxy_jump, target_host, local_port) do
+  # Build the proxy tunnel args by reusing the same style as the regular
+  # start_proxy/open_proxy flow:
+  #   ssh -N -L <local_port>:127.0.0.1:22 <target> [-J <proxy>]
+  defp build_proxy_tunnel_args(session, local_port) do
     []
-    |> maybe_append_option("-i", session.identity_file)
     |> maybe_append_option("-F", session.ssh_config_file)
+    |> maybe_append_option("-i", session.identity_file)
+    |> maybe_append_option("-J", proxy_jump_for_tunnel(session))
     |> Kernel.++([
       "-N",
       "-L",
-      "#{local_port}:#{target_host}:22",
+      "#{local_port}:127.0.0.1:22",
+      "-o",
+      "BatchMode=yes",
       "-o",
       "IdentitiesOnly=yes",
       "-o",
@@ -605,19 +1269,72 @@ defmodule HpcConnect.SSH do
       "-o",
       "NumberOfPasswordPrompts=0",
       "-o",
-      "StrictHostKeyChecking=no",
+      "ConnectTimeout=30",
       "-o",
-      "UserKnownHostsFile=/dev/null"
+      "ExitOnForwardFailure=yes",
+      "-o",
+      "StrictHostKeyChecking=accept-new",
+      "-o",
+      "ServerAliveInterval=30",
+      "-o",
+      "ServerAliveCountMax=3",
+      "-o",
+      "LogLevel=ERROR"
     ])
-    |> Kernel.++([
-      if(session.username, do: "#{session.username}@#{proxy_jump}", else: proxy_jump)
-    ])
+    |> Kernel.++([tunnel_target(session)])
+  end
+
+  # For tunnel setup we intentionally prefer host aliases without forcing
+  # `username@...`, so local ~/.ssh/config defaults can be applied.
+  defp tunnel_target(%Session{} = session) do
+    cond do
+      is_binary(session.ssh_alias) and session.ssh_alias != "" ->
+        session.ssh_alias
+
+      is_binary(session.cluster.ssh_alias) and session.cluster.ssh_alias != "" ->
+        session.cluster.ssh_alias
+
+      true ->
+        session.cluster.host
+    end
+  end
+
+  defp proxy_jump_for_tunnel(%Session{} = session) do
+    case session.proxy_jump || session.cluster.proxy_jump do
+      value when is_binary(value) and value != "" -> value
+      _ -> nil
+    end
+  end
+
+  defp proxy_jump_identity(%Session{} = session) do
+    jump_raw =
+      session.proxy_jump || session.cluster.proxy_jump ||
+        raise RuntimeError, "missing proxy_jump host for native jump tunnel"
+
+    jump_primary =
+      jump_raw
+      |> String.split(",", parts: 2)
+      |> hd()
+      |> String.trim()
+
+    case String.split(jump_primary, "@", parts: 2) do
+      [user, host] when user != "" and host != "" ->
+        {user, host}
+
+      [host] when host != "" ->
+        {session.username || "", host}
+
+      _ ->
+        {session.username || "", jump_primary}
+    end
   end
 
   # Build Erlang :ssh option list from a session.
-  defp build_erlang_ssh_opts(session, timeout) do
+  defp build_erlang_ssh_opts(session, timeout, username_override \\ nil) do
+    username = username_override || session.username || ""
+
     base = [
-      user: String.to_charlist(session.username || ""),
+      user: String.to_charlist(username),
       silently_accept_hosts: true,
       connect_timeout: timeout,
       # Don't write to ~/.ssh/known_hosts during tests/IEx sessions

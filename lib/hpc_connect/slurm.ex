@@ -916,7 +916,9 @@ defmodule HpcConnect.Slurm do
     "Connection refused",
     "Connection closed",
     "connect to host",
-    "status 255"
+    "status 255",
+    "timed out during banner exchange",
+    "Connection timed out"
   ]
 
   # Runs an SSH command, retrying on transient errors. Raises on non-zero exit.
@@ -1001,46 +1003,56 @@ defmodule HpcConnect.Slurm do
         opts when is_list(opts) -> {Keyword.get(opts, :name, "vllm"), opts}
       end
 
-    local_def = Keyword.get(opts, :local_def_path)
-
-    def_path =
-      if is_binary(local_def) do
-        upload_def_file(session, name, local_def)
-      else
-        remote_path = remote_def_path(session, name)
-
-        if remote_def_exists?(session, remote_path) do
-          remote_path
-        else
-          upload_def_file(session, name, nil)
-        end
-      end
-
-    sif_path = remote_sif_path(session, name)
-    force_rebuild = Keyword.get(opts, :force_rebuild, false)
-    use_slurm = Keyword.get(opts, :use_slurm, false)
     # Default to :woody — AlmaLinux login nodes support user namespaces for apptainer build.
     # Ubuntu-based systems (TinyX, Testcluster) do not. Pass `build_cluster: nil` to
     # disable the redirect and build on the session's own cluster.
     build_cluster = Keyword.get(opts, :build_cluster, :woody)
 
-    if not force_rebuild and remote_file_exists?(session, sif_path) do
+    build_session =
+      if build_cluster do
+        clone_session_for_cluster(session, build_cluster)
+      else
+        session
+      end
+
+    local_def = Keyword.get(opts, :local_def_path)
+
+    def_path =
+      if is_binary(local_def) do
+        upload_def_file(build_session, name, local_def)
+      else
+        remote_path = remote_def_path(build_session, name)
+
+        if remote_def_exists?(build_session, remote_path) do
+          remote_path
+        else
+          upload_def_file(build_session, name, nil)
+        end
+      end
+
+    sif_path = remote_sif_path(build_session, name)
+    force_rebuild = Keyword.get(opts, :force_rebuild, false)
+    use_slurm = Keyword.get(opts, :use_slurm, false)
+
+    if not force_rebuild and remote_file_exists?(build_session, sif_path) do
       Logger.info("[HpcConnect] SIF already exists: #{sif_path}")
-      %{job_id: nil, sif_path: sif_path, def_path: def_path, name: name}
+
+      %{
+        job_id: nil,
+        sif_path: sif_path,
+        def_path: def_path,
+        name: name,
+        build_session: build_session
+      }
     else
       force_env = if force_rebuild, do: "export FORCE_REBUILD=1 && ", else: ""
 
-      build_session =
-        if build_cluster do
-          clone_session_for_cluster(session, build_cluster)
-        else
-          session
-        end
-
       if use_slurm do
         build_sif_via_slurm(build_session, name, def_path, sif_path, force_env, opts)
+        |> Map.put(:build_session, build_session)
       else
         build_sif_direct(build_session, name, def_path, sif_path, force_env)
+        |> Map.put(:build_session, build_session)
       end
     end
   end
@@ -1204,15 +1216,24 @@ defmodule HpcConnect.Slurm do
   end
 
   def build_sif_blocking(%Session{} = session, opts) do
+    if use_default_build_cluster_fallbacks?(opts) do
+      build_sif_blocking_with_fallbacks(session, opts, [:woody, :alex, :helma], [])
+    else
+      do_build_sif_blocking(session, opts)
+    end
+  end
+
+  defp do_build_sif_blocking(%Session{} = session, opts) do
     timeout = Keyword.get(opts, :timeout, 3_600_000)
     interval = Keyword.get(opts, :interval, 15_000)
 
     result = build_sif_job(session, opts)
     %{job_id: job_id, sif_path: sif_path} = result
+    wait_session = Map.get(result, :build_session, session)
 
     cond do
       # SIF already existed before we started
-      is_nil(job_id) and remote_file_exists?(session, sif_path) ->
+      is_nil(job_id) and remote_file_exists?(wait_session, sif_path) ->
         Logger.info("[HpcConnect] SIF already exists: #{sif_path}")
         sif_path
 
@@ -1224,11 +1245,11 @@ defmodule HpcConnect.Slurm do
 
         if log_hint do
           Logger.info(
-            "[HpcConnect] Tail the build log: ssh #{session.cluster.ssh_alias} 'tail -f #{log_hint}'"
+            "[HpcConnect] Tail the build log: ssh #{wait_session.cluster.ssh_alias} 'tail -f #{log_hint}'"
           )
         end
 
-        wait_for_sif_direct!(session, sif_path, timeout, interval)
+        wait_for_sif_direct!(wait_session, sif_path, timeout, interval)
 
       # SLURM job submitted — poll via sacct + file existence
       true ->
@@ -1238,9 +1259,87 @@ defmodule HpcConnect.Slurm do
           "[HpcConnect] Monitor: squeue -j #{job_id} | Logs: tail -f #{Map.get(result, :logs_dir, "")}/build_sif_#{Map.get(result, :name, "")}_#{job_id}.out"
         )
 
-        wait_for_sif!(session, job_id, sif_path, timeout, interval)
+        wait_for_sif!(wait_session, job_id, sif_path, timeout, interval)
     end
   end
+
+  # Automatic fallback for the default build cluster path:
+  # woody -> alex -> helma.
+  # Only enabled when caller did not explicitly set :build_cluster.
+  defp build_sif_blocking_with_fallbacks(session, _opts, [], errors) do
+    attempted =
+      errors
+      |> Enum.reverse()
+      |> Enum.map_join(" -> ", fn {cluster, _msg} -> inspect(cluster) end)
+
+    upload_dir = Path.join(session.work_dir, "singularity_images")
+
+    last_error =
+      case errors do
+        [{_cluster, msg} | _] -> msg
+        _ -> "unknown build error"
+      end
+
+    raise RuntimeError,
+          "SIF build failed on all fallback clusters (#{attempted}).\n" <>
+            "Try building the .sif on your own system and upload it to: #{upload_dir}\n" <>
+            "(this is typically ~/.cache/hpc_connect/singularity_images on the cluster)\n" <>
+            "Last error: #{last_error}"
+  end
+
+  defp build_sif_blocking_with_fallbacks(%Session{} = session, opts, [cluster | rest], errors) do
+    attempt_opts = Keyword.put(opts, :build_cluster, cluster)
+    Logger.info("[HpcConnect] Trying SIF build on fallback cluster #{cluster} ...")
+
+    try do
+      do_build_sif_blocking(session, attempt_opts)
+    rescue
+      e in RuntimeError ->
+        msg = Exception.message(e)
+
+        if build_cluster_connectivity_error?(msg) do
+          Logger.warning(
+            "[HpcConnect] SIF build attempt on #{cluster} failed with connectivity/access error. " <>
+              if(rest != [],
+                do: "Trying next fallback cluster ...",
+                else: "No fallback clusters left."
+              )
+          )
+
+          build_sif_blocking_with_fallbacks(session, opts, rest, [{cluster, msg} | errors])
+        else
+          reraise e, __STACKTRACE__
+        end
+    end
+  end
+
+  defp use_default_build_cluster_fallbacks?(opts) do
+    not Keyword.has_key?(opts, :build_cluster)
+  end
+
+  defp build_cluster_connectivity_error?(message) when is_binary(message) do
+    down = String.downcase(message)
+
+    Enum.any?(
+      [
+        "ssh: connect to host",
+        "connection refused",
+        "connection closed by unknown port",
+        "permission denied",
+        "could not resolve hostname",
+        "no route to host",
+        "network is unreachable",
+        "operation timed out",
+        "timed out during banner exchange",
+        "connection to unknown port 65535 timed out",
+        "exit 255",
+        "status 255"
+      ],
+      &String.contains?(down, &1)
+    )
+  end
+
+  defp build_cluster_connectivity_error?(_), do: false
 
   defp wait_for_sif_direct!(_session, _sif_path, timeout, _interval) when timeout <= 0 do
     raise RuntimeError, "Timed out waiting for direct apptainer build to complete"
@@ -1268,6 +1367,11 @@ defmodule HpcConnect.Slurm do
 
       trimmed = String.trim(tail_out)
       if trimmed != "", do: Logger.info("[HpcConnect] Build log tail:\n#{trimmed}")
+
+      if build_cluster_connectivity_error?(trimmed) do
+        raise RuntimeError,
+              "Apptainer build failed with remote SSH connectivity/access error while tailing direct build log: #{trimmed}"
+      end
 
       wait_for_sif_direct!(session, sif_path, timeout - interval, interval)
     end

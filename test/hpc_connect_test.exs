@@ -345,4 +345,178 @@ defmodule HpcConnectTest do
     assert session.work_dir == "/home/hpc/barz/barz123h/.cache/hpc_connect"
     assert session.vault_dir == "/home/vault/barz/barz123h"
   end
+
+  test "start_app defers vllm access setup until after submission and falls back to managed proxy" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test",
+        # Simulate a cluster that is directly TCP-reachable (no ProxyJump required).
+        # For clusters with proxy_jump set, native SSH is skipped entirely because
+        # Erlang :ssh cannot replicate the OS SSH transparent-proxy topology.
+        proxy_jump: nil
+      )
+
+    submit_fun = fn _session, _slurm_opts ->
+      send(parent, :submitted)
+
+      %{
+        job_id: "12345",
+        node: "a0128",
+        partition: "a40",
+        gpus: 1,
+        walltime: "02:00:00",
+        port: 50_200,
+        sif_path: "/remote/vllm.sif",
+        logs_dir: "/remote/logs"
+      }
+    end
+
+    open_connection_fun = fn _session, _opts ->
+      send(parent, :native_connect_attempted)
+      raise RuntimeError, "native bridge timeout"
+    end
+
+    open_proxy_fun = fn _session, node, proxy_opts ->
+      send(parent, {:proxy_opened, node, proxy_opts[:remote_port], proxy_opts[:local_port]})
+
+      {
+        %{
+          base_url: "http://localhost:50500",
+          local_port: 50_500,
+          remote_port: proxy_opts[:remote_port],
+          node: node
+        },
+        make_ref()
+      }
+    end
+
+    result =
+      HpcConnect.start_app(session,
+        app: "vllm",
+        native_ssh: true,
+        args: [partition: "a40", gpus: 1, walltime: "02:00:00", port: 50_200],
+        local_port: 50_500,
+        submit_fun: submit_fun,
+        open_connection_fun: open_connection_fun,
+        open_proxy_fun: open_proxy_fun,
+        wait_for_node: false,
+        wait_for_app: false
+      )
+
+    assert_receive :submitted
+    assert_receive :native_connect_attempted
+    assert_receive {:proxy_opened, "a0128", 50_200, 50_500}
+
+    assert result.node == "a0128"
+    assert result.access_mode == :openssh_proxy
+    assert result.base_url == "http://localhost:50500"
+    assert result.native_error =~ "native bridge timeout"
+  end
+
+  test "start_app uses managed OS proxy by default when native_ssh is not enabled" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    submit_fun = fn _session, _slurm_opts ->
+      %{
+        job_id: "12346",
+        node: "a0999",
+        partition: "a40",
+        gpus: 1,
+        walltime: "02:00:00",
+        port: 50_200,
+        sif_path: "/remote/vllm.sif",
+        logs_dir: "/remote/logs"
+      }
+    end
+
+    open_connection_fun = fn _session, _opts ->
+      send(parent, :native_connect_attempted)
+      raise RuntimeError, "should-not-run"
+    end
+
+    open_proxy_fun = fn _session, node, proxy_opts ->
+      send(parent, {:proxy_opened_default, node, proxy_opts[:remote_port]})
+
+      {
+        %{
+          base_url: "http://localhost:50501",
+          local_port: 50_501,
+          remote_port: proxy_opts[:remote_port],
+          node: node,
+          os_pid: 42,
+          pid: 42
+        },
+        make_ref()
+      }
+    end
+
+    result =
+      HpcConnect.start_app(session,
+        app: "vllm",
+        args: [partition: "a40", gpus: 1, walltime: "02:00:00", port: 50_200],
+        submit_fun: submit_fun,
+        open_connection_fun: open_connection_fun,
+        open_proxy_fun: open_proxy_fun,
+        wait_for_node: false,
+        wait_for_app: false
+      )
+
+    refute_receive :native_connect_attempted
+    assert_receive {:proxy_opened_default, "a0999", 50_200}
+
+    assert result.access_mode == :openssh_proxy
+    assert result.base_url == "http://localhost:50501"
+    assert result.proxy.os_pid == 42
+  end
+
+  test "kill_proxy closes tracked proxy by session and node" do
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    {bin, args} =
+      case :os.type() do
+        {:win32, _} ->
+          {System.find_executable("cmd") || "cmd", ["/c", "ping", "-n", "20", "127.0.0.1"]}
+
+        _ ->
+          {System.find_executable("sh") || "sh", ["-c", "sleep 20"]}
+      end
+
+    port =
+      HpcConnect.open_proxy!(%{
+        session: session,
+        node: "a0128",
+        command: %HpcConnect.Command{
+          binary: bin,
+          args: args,
+          summary: "test proxy",
+          remote_command: nil
+        }
+      })
+
+    assert Port.info(port) != nil
+
+    info = HpcConnect.proxy_info(session, "a0128")
+    assert is_list(info)
+    assert length(info) >= 1
+
+    assert :ok == HpcConnect.kill_proxy(session, "a0128")
+    assert Port.info(port) == nil
+    assert HpcConnect.proxy_info(session, "a0128") == []
+  end
 end

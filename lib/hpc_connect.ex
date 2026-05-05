@@ -17,7 +17,8 @@ defmodule HpcConnect do
     Session,
     Shell,
     Slurm,
-    SSH
+    SSH,
+    TunnelManager
   }
 
   @doc """
@@ -64,9 +65,18 @@ defmodule HpcConnect do
   Modes:
   - `mode: :livebook` builds Kino inputs automatically when required
   - `mode: :local` uses explicit `username` + `key_path` without Kino
+
+  Option precedence is:
+  1) explicit opts passed to `connection_setup/1`
+  2) values loaded from `:env_file` (if provided)
+  3) built-in defaults
   """
   @spec connection_setup(keyword()) :: map()
-  def connection_setup(opts \\ []), do: Livebook.connection_setup(opts)
+  def connection_setup(opts \\ []) do
+    opts
+    |> resolve_setup_opts()
+    |> Livebook.connection_setup()
+  end
 
   @doc """
   High-level bootstrap helper for both local and Livebook modes.
@@ -81,30 +91,51 @@ defmodule HpcConnect do
   """
   @spec bootstrap(keyword()) :: map()
   def bootstrap(opts \\ []) do
-    result = connection_setup(opts)
-    reset_permission? = Keyword.get(opts, :reset_permission, false)
+    resolved_opts = resolve_setup_opts(opts)
+
+    if Keyword.get(resolved_opts, :key_just_created) do
+      IO.puts("")
+
+      IO.puts(
+        "Bootstrap paused: new SSH key was created. Re-run bootstrap after uploading the key."
+      )
+
+      return_bootstrap_key_created(resolved_opts)
+    else
+      bootstrap_continue(resolved_opts)
+    end
+  end
+
+  defp return_bootstrap_key_created(opts) do
+    key = Keyword.get(opts, :key_path) || Keyword.get(opts, :uploaded_key_path)
+
+    %{
+      ok?: false,
+      key_just_created: true,
+      key_path: key,
+      session: nil,
+      startup: nil,
+      gpus: [],
+      models: [],
+      quota: [],
+      jobs: []
+    }
+  end
+
+  defp bootstrap_continue(resolved_opts) do
+    setup_opts = Keyword.put_new(resolved_opts, :native_ssh, false)
+    result = Livebook.connection_setup(setup_opts)
+    reset_permission? = Keyword.get(resolved_opts, :reset_permission, false)
 
     session =
-      case Keyword.get(opts, :env_file) do
-        value when is_binary(value) and value != "" ->
-          Session.merge_env_file(result.session, value)
-
-        _ ->
-          result.session
-      end
-
-    # Auto-open a persistent Erlang :ssh connection when STEADY_SSH_CONNECTION=true
-    # (set in .env, as an OS env var, or via :steady_ssh_connection opt).
-    session =
-      if steady_ssh_connection?(session, opts) do
-        {sess, _tunnel} = open_connection!(session)
-        sess
-      else
-        session
-      end
+      result.session
+      |> maybe_prepare_bootstrap_native_key(resolved_opts)
+      |> merge_bootstrap_runtime_env(resolved_opts)
+      |> maybe_apply_hf_token(resolved_opts)
+      |> maybe_open_bootstrap_native_connection(resolved_opts)
 
     setup_session =
-      if Keyword.get(opts, :install_scripts, true) do
+      if Keyword.get(resolved_opts, :install_scripts, true) do
         install_remote_scripts!(session, reset_permission: reset_permission?)
         session
       else
@@ -112,7 +143,7 @@ defmodule HpcConnect do
       end
 
     setup_session =
-      if Keyword.get(opts, :install_def_files, true) do
+      if Keyword.get(resolved_opts, :install_def_files, true) do
         def_dir = Path.join(setup_session.work_dir, "singularity_def_files")
         img_dir = Path.join(setup_session.work_dir, "singularity_images")
 
@@ -134,7 +165,7 @@ defmodule HpcConnect do
         setup_session
       end
 
-    startup = collect_startup_summary(setup_session, opts)
+    startup = collect_startup_summary(setup_session, resolved_opts)
 
     Map.merge(result, %{
       session: setup_session,
@@ -144,6 +175,323 @@ defmodule HpcConnect do
       quota: startup_value(startup.quota),
       jobs: startup_value(startup.jobs)
     })
+  end
+
+  defp resolve_setup_opts(opts) do
+    env_map = bootstrap_env_map(opts)
+
+    opts
+    |> put_default_opt(:mode, parse_setup_mode(Map.get(env_map, "HPC_CONNECT_MODE")))
+    |> put_default_opt(:username, Map.get(env_map, "HPC_CONNECT_USERNAME"))
+    |> put_default_opt(:cluster, env_cluster(env_map))
+    |> put_default_opt(:ssh_alias, Map.get(env_map, "HPC_CONNECT_SSH_ALIAS"))
+    |> put_default_opt(:key_path, env_key_path(env_map))
+    |> put_default_opt(:uploaded_key_path, Map.get(env_map, "HPC_CONNECT_UPLOADED_KEY_PATH"))
+    |> put_default_opt(:work_dir, Map.get(env_map, "HPC_CONNECT_WORK_DIR"))
+    |> put_default_opt(:vault_dir, Map.get(env_map, "HPC_CONNECT_VAULT_DIR"))
+    |> put_default_opt(:proxy_jump, Map.get(env_map, "HPC_CONNECT_PROXY_JUMP"))
+    |> put_default_opt(:port_range, parse_port_range(Map.get(env_map, "HPC_CONNECT_PORT_RANGE")))
+    |> put_default_opt(:remote_command, Map.get(env_map, "HPC_CONNECT_REMOTE_COMMAND"))
+    |> put_default_opt(:hf_token, env_hf_token(env_map))
+    |> maybe_prepare_local_native_key()
+  end
+
+  defp maybe_prepare_local_native_key(opts) do
+    mode = Keyword.get(opts, :mode, :livebook)
+
+    if mode == :local do
+      key = Keyword.get(opts, :key_path) || Keyword.get(opts, :uploaded_key_path)
+
+      case normalize_key_path(key) do
+        nil ->
+          opts
+
+        key_path ->
+          {resolved_key_path, status} = ensure_native_key_ready!(key_path, :local)
+
+          case status do
+            :existing_fallback ->
+              IO.puts("Using existing native-SSH PEM fallback key: #{resolved_key_path}")
+              opts
+
+            :created_fallback ->
+              IO.puts(native_key_created_message(resolved_key_path))
+              Keyword.put(opts, :key_just_created, true)
+
+            _ ->
+              opts
+          end
+          |> Keyword.put(:key_path, resolved_key_path)
+      end
+    else
+      opts
+    end
+  end
+
+  defp maybe_prepare_bootstrap_native_key(%Session{} = session, opts) do
+    if Keyword.get(opts, :native_ssh, true) do
+      mode = Keyword.get(opts, :mode, :livebook)
+
+      case session.identity_file do
+        path when is_binary(path) and path != "" ->
+          {resolved_key_path, status} = ensure_native_key_ready!(normalize_key_path(path), mode)
+
+          case status do
+            :existing_fallback ->
+              IO.puts("Using existing native-SSH PEM fallback key: #{resolved_key_path}")
+
+            :created_fallback ->
+              IO.puts(native_key_created_message(resolved_key_path))
+
+            _ ->
+              :ok
+          end
+
+          %{session | identity_file: resolved_key_path}
+
+        _ ->
+          session
+      end
+    else
+      session
+    end
+  end
+
+  defp ensure_native_key_ready!(nil, mode) do
+    raise ArgumentError,
+          "No SSH private key path available for #{mode} mode. Provide :key_path (or :uploaded_key_path)."
+  end
+
+  defp ensure_native_key_ready!(key_path, mode) do
+    unless File.exists?(key_path) do
+      raise RuntimeError,
+            "SSH private key not found: #{key_path}. Aborting before opening any SSH/proxy connection."
+    end
+
+    case native_ssh_key_format_path(key_path) do
+      :openssh ->
+        candidate = pem_fallback_key_path(key_path)
+
+        cond do
+          File.exists?(candidate) ->
+            {candidate, :existing_fallback}
+
+          true ->
+            case create_local_pem_fallback_key(candidate) do
+              :ok ->
+                {candidate, :created_fallback}
+
+              {:error, reason} ->
+                manual_cmd = ssh_keygen_manual_cmd(candidate)
+
+                raise RuntimeError,
+                      "Could not auto-create native PEM key fallback for #{mode} mode: #{reason}\n" <>
+                        "Run manually:\n#{manual_cmd}\n" <>
+                        "Then upload #{candidate}.pub to https://portal.hpc.fau.de/ui/user and wait 10–30 minutes for propagation."
+            end
+        end
+
+      _ ->
+        {key_path, :original}
+    end
+  end
+
+  defp ssh_keygen_manual_cmd(candidate) do
+    case :os.type() do
+      {:win32, _} ->
+        "ssh-keygen -t rsa -b 4096 -m PEM -f \"#{candidate}\" -N \"\""
+
+      _ ->
+        "ssh-keygen -t rsa -b 4096 -m PEM -f #{Shell.escape(candidate)} -N ''"
+    end
+  end
+
+  defp normalize_key_path(nil), do: nil
+  defp normalize_key_path(path) when is_binary(path), do: Path.expand(path)
+
+  defp pem_fallback_key_path(path) do
+    if String.ends_with?(path, "_hpc_connect_pem") do
+      path
+    else
+      path <> "_hpc_connect_pem"
+    end
+  end
+
+  defp create_local_pem_fallback_key(path) do
+    keygen = System.find_executable("ssh-keygen") || "ssh-keygen"
+
+    case :os.type() do
+      {:win32, _} ->
+        # Windows ssh-keygen.exe drops empty string argv values, so -N "" never
+        # reaches the process correctly via System.cmd/Port. Write a temp .bat
+        # file that embeds the full command verbatim and execute it via cmd /c.
+        bat_path =
+          Path.join(System.tmp_dir!(), "hpc_keygen_#{:erlang.unique_integer([:positive])}.bat")
+
+        bat_content =
+          "@echo off\r\n\"#{keygen}\" -t rsa -b 4096 -m PEM -f \"#{path}\" -N \"\"\r\n"
+
+        File.write!(bat_path, bat_content)
+
+        result = System.cmd("cmd", ["/c", bat_path], stderr_to_stdout: true)
+        File.rm(bat_path)
+
+        case result do
+          {_output, 0} ->
+            :ok
+
+          {output, status} ->
+            {:error, "ssh-keygen failed (exit #{status}): #{String.trim(output)}"}
+        end
+
+      _ ->
+        args = ["-t", "rsa", "-b", "4096", "-m", "PEM", "-f", path, "-N", ""]
+
+        case System.cmd(keygen, args, stderr_to_stdout: true) do
+          {_output, 0} ->
+            :ok
+
+          {output, status} ->
+            {:error, "ssh-keygen failed (exit #{status}): #{String.trim(output)}"}
+        end
+    end
+  rescue
+    e -> {:error, Exception.message(e)}
+  end
+
+  defp native_key_created_message(candidate_path) do
+    pub_path = candidate_path <> ".pub"
+
+    pub_line =
+      case File.read(pub_path) do
+        {:ok, pub} ->
+          "\nPublic key to upload (single line):\n#{String.trim(pub)}\n"
+
+        {:error, _} ->
+          "\nUpload public key file: #{pub_path}\n"
+      end
+
+    "New native-SSH PEM key created: #{candidate_path}\n" <>
+      pub_line <>
+      "Portal: https://portal.hpc.fau.de/ui/user\n" <>
+      "Upload the public key there, then wait 10–30 minutes for propagation.\n" <>
+      "Re-run bootstrap once the key is active on the cluster."
+  end
+
+  defp bootstrap_env_map(opts) do
+    case Keyword.get(opts, :env_file) do
+      value when is_binary(value) and value != "" -> EnvFile.load(value)
+      _ -> %{}
+    end
+  end
+
+  defp env_key_path(env_map) do
+    Map.get(env_map, "HPC_CONNECT_KEY_PATH") || Map.get(env_map, "HPC_CONNECT_IDENTITY_FILE")
+  end
+
+  defp env_cluster(env_map) do
+    Map.get(env_map, "HPC_CONNECT_CLUSTER") || Map.get(env_map, "HPC_CONNECT_SSH_ALIAS")
+  end
+
+  defp env_hf_token(env_map) do
+    Map.get(env_map, "HUGGINGFACE_HUB_TOKEN") || Map.get(env_map, "HF_TOKEN")
+  end
+
+  defp merge_bootstrap_runtime_env(%Session{} = session, opts) do
+    env_map =
+      opts
+      |> bootstrap_env_map()
+      |> Enum.reject(fn {key, _value} ->
+        String.starts_with?(key, "HPC_CONNECT_") or key == "STEADY_SSH_CONNECTION"
+      end)
+      |> Map.new()
+
+    Session.merge_env(session, env_map)
+  end
+
+  defp maybe_open_bootstrap_native_connection(%Session{} = session, opts) do
+    native_ssh? = Keyword.get(opts, :native_ssh, true)
+    bootstrap_open_connection? = Keyword.get(opts, :bootstrap_open_connection, false)
+    fallback_to_os? = Keyword.get(opts, :native_ssh_fallback_to_os, false)
+    open_opts = Keyword.get(opts, :open_connection_opts, [])
+    custom_connect_fun? = match?(fun when is_function(fun, 3), Keyword.get(opts, :connect_fun))
+
+    cond do
+      not bootstrap_open_connection? ->
+        session
+
+      custom_connect_fun? ->
+        session
+
+      not native_ssh? ->
+        session
+
+      not is_nil(session.ssh_conn) ->
+        session
+
+      true ->
+        try do
+          {connected, _tunnel} = open_connection!(session, open_opts)
+          connected
+        rescue
+          e ->
+            if fallback_to_os? do
+              IO.puts(
+                "Native SSH bootstrap connection failed; continuing with OS SSH fallback: #{Exception.message(e)}"
+              )
+
+              session
+            else
+              reraise e, __STACKTRACE__
+            end
+        end
+    end
+  end
+
+  defp maybe_apply_hf_token(%Session{} = session, opts) do
+    token =
+      Keyword.get(opts, :hf_token) ||
+        Keyword.get(opts, :"hf:token") ||
+        Session.fetch_env(session, "HUGGINGFACE_HUB_TOKEN")
+
+    case token do
+      value when is_binary(value) and value != "" -> put_hf_token(session, value)
+      _ -> session
+    end
+  end
+
+  defp put_default_opt(opts, _key, nil), do: opts
+
+  defp put_default_opt(opts, key, value) do
+    if Keyword.has_key?(opts, key) do
+      opts
+    else
+      Keyword.put(opts, key, value)
+    end
+  end
+
+  defp parse_setup_mode(nil), do: nil
+
+  defp parse_setup_mode(value) when is_binary(value) do
+    case String.downcase(String.trim(value)) do
+      "local" -> :local
+      "livebook" -> :livebook
+      _ -> nil
+    end
+  end
+
+  defp parse_setup_mode(value) when value in [:local, :livebook], do: value
+  defp parse_setup_mode(_), do: nil
+
+  defp parse_port_range(nil), do: nil
+
+  defp parse_port_range(value) when is_binary(value) do
+    case String.split(value, ":", parts: 2) do
+      [min_port, max_port] -> {String.to_integer(min_port), String.to_integer(max_port)}
+      _ -> nil
+    end
+  rescue
+    ArgumentError -> nil
   end
 
   defp startup_value(%{ok?: true, value: value}), do: value
@@ -770,13 +1118,19 @@ defmodule HpcConnect do
   - `:cancel_on_interrupt` (default: `true`)
 
   vLLM convenience controls (`app: "vllm"` only):
-  - `:native_ssh` (default: `true`) ensures a persistent native `:ssh` session
+  - `:native_ssh` (default: `false`) enables a persistent native `:ssh` session
   - `:native_ssh_fallback_to_os` (default: `false`) — when `true`, falls back
     to managed OpenSSH commands/tunnel if native `:ssh` cannot connect
-  - `:auto_proxy` (default: `:auto`) where:
-      - `:auto` opens an OpenSSH tunnel only when native `:ssh` is unavailable
-      - `true` always opens an OpenSSH tunnel
+  - `:proxy_jump_via_native` (default: `true`) enables native ProxyJump tunnel
+    (`:ssh.tcpip_tunnel_to_server`) when direct connect is blocked
+  - `:proxy_jump_via_os` (default: `false`) —
+    enables managed OpenSSH ProxyJump tunnel fallback if native jump tunneling
+    cannot be established; set `false` for strict native-only behavior
+    - `:auto_proxy` (default depends on `:native_ssh`) where:
+      - with `native_ssh: false` (default), managed OpenSSH proxy is enabled
+      - with `native_ssh: true`, managed OpenSSH proxy is disabled unless enabled/fallback
       - `false` keeps native-only access (no localhost proxy)
+      - `true` opens an OpenSSH localhost tunnel explicitly
     Local port is selected automatically unless `:local_port` is set.
   - `:local_port` optional fixed local tunnel port
   - `:wait_for_app` (default: `true`) waits for `/v1/models` to become reachable
@@ -792,11 +1146,11 @@ defmodule HpcConnect do
   """
   @slurm_keys [:partition, :gpus, :walltime, :cpus, :sif_name, :sif_path]
   @pending_wait_table :hpc_connect_pending_waits
+  @proxy_table :hpc_connect_open_proxies
 
   @spec start_app(Session.t(), keyword()) :: map()
   def start_app(%Session{} = session, opts) do
     app = Keyword.fetch!(opts, :app)
-    session = maybe_prepare_session_for_app(session, app, opts)
     app_upper = app |> to_string() |> String.upcase()
 
     {slurm_kw, config_kw} = split_start_app_args(opts)
@@ -811,7 +1165,7 @@ defmodule HpcConnect do
       [app: app, port: port, app_env: app_env] ++
         Enum.flat_map(@slurm_keys, &maybe_opt(slurm_kw, &1))
 
-    submitted = with_retry(fn -> submit_apptainer(session, slurm_opts) end, opts)
+    submitted = submit_app_job(session, slurm_opts, opts)
 
     submitted
     |> maybe_wait_for_allocation(session, opts)
@@ -837,7 +1191,6 @@ defmodule HpcConnect do
   @spec reconnect(Session.t(), binary() | pos_integer(), keyword()) :: map()
   def reconnect(%Session{} = session, job_id, opts) do
     app = Keyword.fetch!(opts, :app)
-    session = maybe_prepare_session_for_app(session, app, opts)
 
     {slurm_kw, config_kw} = split_start_app_args(opts)
     job_id = to_string(job_id)
@@ -857,52 +1210,103 @@ defmodule HpcConnect do
   defp maybe_prepare_session_for_app(%Session{} = session, app, opts) do
     app_name = app |> to_string() |> String.downcase()
 
-    if app_name == "vllm" and Keyword.get(opts, :native_ssh, true) and is_nil(session.ssh_conn) do
-      ensure_native_ssh_key_supported!(session, opts)
+    # Native Erlang :ssh requires a direct TCP connection to each SSH hop.
+    # For FAU NHR clusters (alex, fritz, etc.) alex.nhr.fau.de is NOT directly
+    # TCP-reachable — it requires the csnhr.nhr.fau.de ProxyJump. Worse: alex
+    # actively rejects SSH connections originating from csnhr (only external
+    # clients are allowed in), so a 2-hop Erlang SSH chain is also impossible.
+    #
+    # OS SSH handles this transparently via ProxyJump in ~/.ssh/config: it uses
+    # alex as a pure TCP forwarder without doing a full SSH handshake to it.
+    # Erlang :ssh always does a full handshake at each hop, so it cannot replicate
+    # this topology at all.
+    #
+    # Therefore: skip native SSH whenever the cluster has a proxy_jump configured.
+    # The OS SSH proxy (openssh_proxy access_mode) is always used instead.
+    proxy_jump_required? = is_binary(session.proxy_jump) and session.proxy_jump != ""
 
-      try do
-        {updated, _tunnel} =
-          open_connection!(session,
+    if app_name == "vllm" and Keyword.get(opts, :native_ssh, false) and
+         is_nil(session.ssh_conn) and not proxy_jump_required? do
+      IO.puts(
+        "[HpcConnect] Native stage 1/2: establish login-node SSH session to #{session.cluster.host} " <>
+          "(alias: #{Session.target(session)})."
+      )
+
+      IO.puts(
+        "[HpcConnect] Native stage 2/2 (after stage 1 succeeds): open compute-node tunnel to vLLM port."
+      )
+
+      IO.puts(
+        "[HpcConnect] Native SSH equivalent (diagnostic): #{SSH.native_login_connect_preview(session)}"
+      )
+
+      native_ssh_fallback_to_os? = Keyword.get(opts, :native_ssh_fallback_to_os, false)
+      open_connection_fun = Keyword.get(opts, :open_connection_fun, &open_connection!/2)
+
+      # Only attempt native SSH if the key format is supported; otherwise fall back immediately.
+      native_key_ok? =
+        native_ssh_fallback_to_os? or
+          native_ssh_key_format(session) != :openssh
+
+      if native_key_ok? do
+        try do
+          # Connect DIRECTLY to the login node — only reached when proxy_jump is nil,
+          # meaning the cluster host is TCP-reachable without an intermediate hop.
+          login_session = %{session | proxy_jump: nil}
+
+          open_opts = [
             timeout: Keyword.get(opts, :ssh_timeout_ms, 20_000),
-            attempts: Keyword.get(opts, :ssh_attempts, 3)
-          )
+            attempts: Keyword.get(opts, :ssh_attempts, 3),
+            proxy_jump_via_native: false,
+            proxy_jump_via_os: false
+          ]
 
-        updated
-      rescue
-        e in RuntimeError ->
-          if Keyword.get(opts, :native_ssh_fallback_to_os, false) do
+          {updated, _tunnel} = open_connection_fun.(login_session, open_opts)
+
+          # Preserve the original proxy_jump on the returned session so that the
+          # rest of the pipeline (OS proxy commands, diagnostics) still sees the
+          # full cluster topology.
+          %{updated | proxy_jump: session.proxy_jump}
+        rescue
+          e in RuntimeError ->
             key_hint = native_ssh_key_hint(session)
 
-            IO.puts(
-              "Native Erlang SSH unavailable (#{Exception.message(e)}). " <>
-                "Falling back to managed OpenSSH commands/tunnel ..." <> key_hint
-            )
+            if native_ssh_fallback_to_os? do
+              IO.puts(
+                "[HpcConnect] Native Erlang SSH unavailable (#{Exception.message(e)}). " <>
+                  "Falling back to OS SSH commands/tunnel for vLLM access." <> key_hint
+              )
 
-            session
-          else
-            reraise e, __STACKTRACE__
-          end
-      end
-    else
-      session
-    end
-  end
+              session
+            else
+              raise RuntimeError,
+                    "Native Erlang SSH unavailable for vLLM access (#{Exception.message(e)})." <>
+                      key_hint
+            end
+        end
+      else
+        key_hint = native_ssh_key_hint(session)
 
-  defp ensure_native_ssh_key_supported!(session, opts) do
-    # If the caller explicitly allows fallback, we can still attempt native first.
-    if Keyword.get(opts, :native_ssh_fallback_to_os, false) do
-      :ok
-    else
-      case native_ssh_key_format(session) do
-        :openssh ->
+        if native_ssh_fallback_to_os? do
+          session
+        else
           raise RuntimeError,
-                "native_ssh requires a PEM private key on this OTP build; " <>
-                  "the configured key is OPENSSH format. " <>
-                  "Use a PEM RSA/ECDSA key (or set native_ssh_fallback_to_os: true)."
-
-        _ ->
-          :ok
+                "Native Erlang SSH key format unsupported for vLLM access. " <>
+                  "Use a PEM key or set native_ssh_fallback_to_os: true." <> key_hint
+        end
       end
+    else
+      if proxy_jump_required? and Keyword.get(opts, :native_ssh, false) and
+           is_nil(session.ssh_conn) do
+        IO.puts(
+          "[HpcConnect] Skipping native Erlang SSH for #{session.cluster.host}: " <>
+            "cluster requires ProxyJump via #{session.proxy_jump}. " <>
+            "Erlang :ssh cannot replicate the OS SSH transparent-proxy topology " <>
+            "(alex blocks SSH from #{session.proxy_jump}). Using OS SSH proxy instead."
+        )
+      end
+
+      session
     end
   end
 
@@ -992,10 +1396,23 @@ defmodule HpcConnect do
       else
         node =
           submitted.node ||
-            wait_for_job_node(session, submitted.job_id,
-              timeout: Keyword.get(opts, :proxy_wait_timeout_ms, 600_000),
-              interval: Keyword.get(opts, :node_poll_interval_ms, 10_000)
+            wait_for_access_node(session, submitted.job_id, opts)
+
+        IO.puts("[HpcConnect] vLLM compute node resolved: #{node}")
+
+        IO.puts(
+          "[HpcConnect] vLLM tunnel equivalent (diagnostic): " <>
+            SSH.native_compute_tunnel_preview(
+              session,
+              node,
+              submitted.port,
+              Keyword.get(opts, :local_port)
             )
+        )
+
+        # Important: prepare native SSH only after we know the compute node.
+        # This avoids early proxy-jump attempts during start/reconnect pre-phase.
+        {session, native_error} = maybe_prepare_session_for_app_after_node(session, app, opts)
 
         native_enriched =
           submitted
@@ -1005,30 +1422,139 @@ defmodule HpcConnect do
           |> Map.put(:base_url, "http://#{node}:#{submitted.port}")
           |> Map.put(:access_mode, :native_ssh)
 
-        use_proxy? = auto_proxy_enabled?(session, opts)
+        # When we have a native SSH connection to the login node, open a
+        # tcpip_tunnel_to_server channel from it to the compute node's app port.
+        # This is fully native — no OS process, no background port — the tunnel
+        # lives inside the existing :ssh connection and stays open as long as
+        # session.ssh_conn is alive.
+        native_conn = session.ssh_conn
 
-        if use_proxy? do
-          {proxy, tunnel_port} =
-            open_proxy_with_retry!(session, node,
-              remote_port: submitted.port,
-              local_port: opts[:local_port],
-              attempts: Keyword.get(opts, :proxy_open_attempts, 5)
-            )
+        if not is_nil(native_conn) do
+          local_port = Keyword.get(opts, :local_port, 0)
+
+          {compute_conn, actual_port} =
+            open_vllm_native_tunnel!(session, native_conn, node, submitted.port, local_port, opts)
+
+          # Store compute_conn in the session so it stays alive and can be closed via close_connection/1.
+          session_with_compute = %{session | compute_ssh_conn: compute_conn}
+
+          IO.puts(
+            "[HpcConnect] Native 2-hop tunnel active: localhost:#{actual_port} → #{node}:#{submitted.port}. " <>
+              "Keep the returned vllm.session alive to keep this tunnel open."
+          )
 
           enriched =
             native_enriched
-            |> Map.put(:proxy, proxy)
-            |> Map.put(:tunnel_port, tunnel_port)
-            |> Map.put(:base_url, proxy.base_url)
-            |> Map.put(:access_mode, :openssh_proxy)
+            |> Map.put(:session, session_with_compute)
+            |> Map.put(:tunnel_port, actual_port)
+            |> Map.put(:base_url, "http://localhost:#{actual_port}")
+            |> Map.put(:access_mode, :native_tunnel)
 
           maybe_wait_for_vllm_ready(enriched, opts)
         else
-          maybe_wait_for_vllm_ready(native_enriched, opts)
+          use_proxy? = not is_nil(native_error) or auto_proxy_enabled?(session, opts)
+
+          if use_proxy? do
+            if native_error do
+              IO.puts(
+                "[HpcConnect] Native SSH access unavailable after node allocation; " <>
+                  "falling back to managed proxy tunnel: #{native_error}"
+              )
+            end
+
+            {proxy, tunnel_port} = open_vllm_proxy!(session, node, submitted.port, opts)
+
+            enriched =
+              native_enriched
+              |> Map.put(:proxy, proxy)
+              |> Map.put(:tunnel_port, tunnel_port)
+              |> Map.put(:base_url, proxy.base_url)
+              |> Map.put(:access_mode, :openssh_proxy)
+              |> maybe_put(:native_error, native_error)
+
+            maybe_wait_for_vllm_ready(enriched, opts)
+          else
+            if native_error do
+              raise RuntimeError,
+                    "Native vLLM access failed after compute-node allocation (#{native_error}). " <>
+                      "Set auto_proxy: true to enable managed localhost forwarding."
+            else
+              maybe_wait_for_vllm_ready(native_enriched, opts)
+            end
+          end
         end
       end
     else
       submitted
+    end
+  end
+
+  defp submit_app_job(%Session{} = session, slurm_opts, opts) do
+    case Keyword.get(opts, :submit_fun) do
+      fun when is_function(fun, 2) ->
+        fun.(session, slurm_opts)
+
+      _ ->
+        with_retry(fn -> submit_apptainer(session, slurm_opts) end, opts)
+    end
+  end
+
+  defp wait_for_access_node(%Session{} = session, job_id, opts) do
+    wait_opts = [
+      timeout: Keyword.get(opts, :proxy_wait_timeout_ms, 600_000),
+      interval: Keyword.get(opts, :node_poll_interval_ms, 10_000)
+    ]
+
+    case Keyword.get(opts, :wait_for_job_node_fun) do
+      fun when is_function(fun, 3) ->
+        fun.(session, job_id, wait_opts)
+
+      _ ->
+        wait_for_job_node(session, job_id, wait_opts)
+    end
+  end
+
+  defp maybe_prepare_session_for_app_after_node(%Session{} = session, app, opts) do
+    try do
+      {maybe_prepare_session_for_app(session, app, opts), nil}
+    rescue
+      e in RuntimeError ->
+        {session, Exception.message(e)}
+    end
+  end
+
+  defp open_vllm_native_tunnel!(session, native_conn, node, remote_port, local_port, opts) do
+    timeout = Keyword.get(opts, :native_tunnel_timeout_ms, 20_000)
+
+    case Keyword.get(opts, :open_native_tunnel_fun) do
+      fun when is_function(fun, 6) ->
+        fun.(session, native_conn, node, remote_port, local_port, timeout)
+
+      _ ->
+        SSH.open_native_compute_tunnel!(
+          session,
+          native_conn,
+          node,
+          remote_port,
+          local_port,
+          timeout
+        )
+    end
+  end
+
+  defp open_vllm_proxy!(%Session{} = session, node, remote_port, opts) do
+    proxy_opts = [
+      remote_port: remote_port,
+      local_port: opts[:local_port],
+      attempts: Keyword.get(opts, :proxy_open_attempts, 5)
+    ]
+
+    case Keyword.get(opts, :open_proxy_fun) do
+      fun when is_function(fun, 3) ->
+        fun.(session, node, proxy_opts)
+
+      _ ->
+        open_proxy_with_retry!(session, node, proxy_opts)
     end
   end
 
@@ -1176,6 +1702,12 @@ defmodule HpcConnect do
   defp native_ssh_key_hint(_), do: ""
 
   defp native_ssh_key_format(%Session{identity_file: path}) when is_binary(path) do
+    native_ssh_key_format_path(path)
+  end
+
+  defp native_ssh_key_format(_), do: :unknown
+
+  defp native_ssh_key_format_path(path) when is_binary(path) do
     case File.read(path) do
       {:ok, "-----BEGIN OPENSSH PRIVATE KEY-----" <> _rest} -> :openssh
       {:ok, "-----BEGIN " <> _rest} -> :pem
@@ -1183,7 +1715,7 @@ defmodule HpcConnect do
     end
   end
 
-  defp native_ssh_key_format(_), do: :unknown
+  defp native_ssh_key_format_path(_), do: :unknown
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)
@@ -1257,7 +1789,9 @@ defmodule HpcConnect do
 
   defp unregister_pending_wait(pid) when is_pid(pid) do
     case :ets.whereis(@pending_wait_table) do
-      :undefined -> :ok
+      :undefined ->
+        :ok
+
       _ ->
         :ets.delete(@pending_wait_table, pid)
         :ok
@@ -1274,12 +1808,24 @@ defmodule HpcConnect do
   end
 
   defp auto_proxy_enabled?(%Session{} = session, opts) do
-    case Keyword.get(opts, :auto_proxy, :auto) do
+    native_requested? = Keyword.get(opts, :native_ssh, false)
+
+    # Defaults:
+    # - Native mode requested -> proxy only when fallback is explicitly allowed.
+    # - Native mode not requested -> managed OS proxy is the default path.
+    default =
+      if native_requested? do
+        Keyword.get(opts, :native_ssh_fallback_to_os, false) and is_nil(session.ssh_conn)
+      else
+        true
+      end
+
+    case Keyword.get(opts, :auto_proxy, default) do
       true -> true
       false -> false
-      :auto -> is_nil(session.ssh_conn)
-      nil -> is_nil(session.ssh_conn)
-      _other -> is_nil(session.ssh_conn)
+      :auto -> default
+      nil -> default
+      _other -> false
     end
   end
 
@@ -1403,27 +1949,179 @@ defmodule HpcConnect do
   end
 
   @doc """
-  Opens the SSH tunnel as a background OS process (supervised by the calling process).
+  Opens the SSH tunnel as a background OS process managed by `HpcConnect.TunnelManager`.
 
-  Returns an Erlang `Port`. The tunnel stays alive as long as the process lives.
-  Close it with `Port.close(port)` or kill the underlying OS process.
+  Returns an Erlang `Port`. The tunnel stays alive independently of the caller
+  (important for Livebook / short-lived eval processes).
+
+  Close with `close_proxy/1`.
   """
   @spec open_proxy!(map()) :: port()
-  def open_proxy!(%{command: %Command{binary: binary, args: args}, local_port: local_port}) do
+  def open_proxy!(
+        %{command: %Command{binary: binary, args: args}, local_port: local_port} = proxy
+      ) do
     port =
-      Port.open({:spawn_executable, binary}, [
-        :binary,
-        :exit_status,
-        :stderr_to_stdout,
-        args: args
-      ])
+      case TunnelManager.open_port(binary, args, [:binary, :exit_status, :stderr_to_stdout]) do
+        {:ok, managed_port} ->
+          managed_port
 
-    wait_for_local_proxy_port!(port, local_port, 15_000)
+        {:error, reason} ->
+          raise RuntimeError, "failed to open SSH proxy process: #{inspect(reason)}"
+      end
+
+    try do
+      wait_for_local_proxy_port!(port, local_port, 15_000)
+      maybe_register_proxy(port, proxy)
+      port
+    rescue
+      e ->
+        _ = TunnelManager.close_port(port)
+        reraise e, __STACKTRACE__
+    end
+  end
+
+  def open_proxy!(%{command: %Command{binary: binary, args: args}} = proxy) do
+    port =
+      case TunnelManager.open_port(binary, args, [:binary, :exit_status, :stderr_to_stdout]) do
+        {:ok, managed_port} ->
+          managed_port
+
+        {:error, reason} ->
+          raise RuntimeError, "failed to open SSH proxy process: #{inspect(reason)}"
+      end
+
+    maybe_register_proxy(port, proxy)
     port
   end
 
-  def open_proxy!(%{command: %Command{binary: binary, args: args}}) do
-    Port.open({:spawn_executable, binary}, [:binary, :exit_status, :stderr_to_stdout, args: args])
+  @doc """
+  Kills tracked proxy tunnel(s) for a given `session` and compute `node`.
+
+  Returns `:ok` if one or more tunnels were found and closed.
+  Returns `{:error, :not_found}` if no tracked tunnel exists.
+  """
+  @spec kill_proxy(Session.t(), binary()) :: :ok | {:error, :not_found}
+  def kill_proxy(%Session{} = session, node) when is_binary(node) and node != "" do
+    ensure_proxy_table()
+    key = proxy_key(session, node)
+
+    case :ets.lookup(@proxy_table, key) do
+      [] ->
+        {:error, :not_found}
+
+      rows ->
+        Enum.each(rows, fn {_key, info} ->
+          case info do
+            %{port: port} when is_port(port) ->
+              _ = TunnelManager.close_port(port)
+
+            _ ->
+              :ok
+          end
+        end)
+
+        :ets.delete(@proxy_table, key)
+        :ok
+    end
+  rescue
+    _ -> {:error, :not_found}
+  end
+
+  def kill_proxy(%Session{}, _), do: {:error, :not_found}
+
+  @doc """
+  Returns tracked proxy metadata for a given `session` and compute `node`.
+  """
+  @spec proxy_info(Session.t(), binary()) :: [map()]
+  def proxy_info(%Session{} = session, node) when is_binary(node) and node != "" do
+    ensure_proxy_table()
+
+    @proxy_table
+    |> :ets.lookup(proxy_key(session, node))
+    |> Enum.map(fn {_key, info} -> info end)
+  rescue
+    _ -> []
+  end
+
+  def proxy_info(%Session{}, _), do: []
+
+  @doc """
+  Closes a proxy tunnel opened by `open_proxy!/1`.
+  """
+  @spec close_proxy(port()) :: :ok
+  def close_proxy(port) when is_port(port) do
+    _ = TunnelManager.close_port(port)
+    unregister_proxy_by_port(port)
+    :ok
+  end
+
+  defp maybe_register_proxy(port, %{session: %Session{} = session, node: node} = proxy)
+       when is_port(port) and is_binary(node) and node != "" do
+    ensure_proxy_table()
+
+    info = %{
+      port: port,
+      os_pid: proxy_os_pid(port),
+      node: node,
+      local_port: Map.get(proxy, :local_port),
+      remote_port: Map.get(proxy, :remote_port),
+      base_url: Map.get(proxy, :base_url),
+      opened_at_ms: System.system_time(:millisecond)
+    }
+
+    :ets.insert(@proxy_table, {proxy_key(session, node), info})
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_register_proxy(_port, _proxy), do: :ok
+
+  defp unregister_proxy_by_port(port) when is_port(port) do
+    ensure_proxy_table()
+
+    @proxy_table
+    |> :ets.tab2list()
+    |> Enum.filter(fn {_key, info} -> Map.get(info, :port) == port end)
+    |> Enum.each(fn row -> :ets.delete_object(@proxy_table, row) end)
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp proxy_os_pid(port) when is_port(port) do
+    case Port.info(port, :os_pid) do
+      {:os_pid, os_pid} -> os_pid
+      _ -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp proxy_os_pid(_), do: nil
+
+  defp ensure_proxy_table do
+    case :ets.whereis(@proxy_table) do
+      :undefined ->
+        :ets.new(@proxy_table, [:named_table, :public, :bag])
+        :ok
+
+      _tid ->
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp proxy_key(%Session{} = session, node) do
+    {
+      session.cluster.name,
+      session.username || "",
+      session.identity_file || "",
+      session.work_dir || "",
+      node
+    }
   end
 
   defp open_proxy_with_retry!(%Session{} = session, node, opts) do
@@ -1449,7 +2147,15 @@ defmodule HpcConnect do
     proxy = start_proxy(session, node, remote_port: remote_port, local_port: local_port)
 
     try do
-      {proxy, open_proxy!(proxy)}
+      tunnel_port = open_proxy!(proxy)
+
+      runtime_proxy =
+        proxy
+        |> Map.put(:port, tunnel_port)
+        |> maybe_put(:pid, proxy_os_pid(tunnel_port))
+        |> maybe_put(:os_pid, proxy_os_pid(tunnel_port))
+
+      {runtime_proxy, tunnel_port}
     rescue
       err in RuntimeError ->
         if attempts_left > 1 do
@@ -1496,11 +2202,21 @@ defmodule HpcConnect do
   - `:model` (optional; auto-detected from `/v1/models` when omitted)
   - `:max_tokens` (default: `256`)
   - `:temperature` (default: `0.2`)
+  - `:top_p` (optional)
+  - `:top_k` or `:max_k` (optional alias; forwarded as `top_k`)
+  - `:min_p` (optional)
+  - `:presence_penalty` (optional)
+  - `:frequency_penalty` (optional)
+  - `:stop` (optional; string or list)
+  - `:seed` (optional)
+  - `:extra_body` (optional map; merged into request payload)
   - `:system` (optional system instruction)
   - `:timeout` ms for HTTP calls (default: `60_000`)
   - `:stream` (default: `false`)
+  - `:allow_os_ssh` (default: `false`) allow fallback to OS ssh only when
+    the provided session has no native `ssh_conn`
 
-  Returns a map containing at least `:content`, `:model`, and `:base_url`.
+  Returns a map containing at least `:answer`, `:content`, `:model`, and `:base_url`.
   """
   @spec vllm_chat(map() | binary(), binary(), keyword()) :: map()
   def vllm_chat(app_or_url, message, opts \\ []) when is_binary(message) do
@@ -1511,6 +2227,14 @@ defmodule HpcConnect do
     model = Keyword.get(opts, :model) || fetch_first_model!(base_url, timeout_ms, request_fun)
     max_tokens = Keyword.get(opts, :max_tokens, 256)
     temperature = Keyword.get(opts, :temperature, 0.2)
+    top_p = Keyword.get(opts, :top_p)
+    top_k = Keyword.get(opts, :top_k, Keyword.get(opts, :max_k))
+    min_p = Keyword.get(opts, :min_p)
+    presence_penalty = Keyword.get(opts, :presence_penalty)
+    frequency_penalty = Keyword.get(opts, :frequency_penalty)
+    stop = Keyword.get(opts, :stop)
+    seed = Keyword.get(opts, :seed)
+    extra_body = Keyword.get(opts, :extra_body, %{})
     system = Keyword.get(opts, :system)
 
     messages =
@@ -1525,13 +2249,22 @@ defmodule HpcConnect do
           [%{role: "user", content: message}]
       end
 
-    payload = %{
-      model: model,
-      messages: messages,
-      max_tokens: max_tokens,
-      temperature: temperature,
-      stream: stream?
-    }
+    payload =
+      %{
+        model: model,
+        messages: messages,
+        max_tokens: max_tokens,
+        temperature: temperature,
+        stream: stream?
+      }
+      |> maybe_put_payload(:top_p, top_p)
+      |> maybe_put_payload(:top_k, top_k)
+      |> maybe_put_payload(:min_p, min_p)
+      |> maybe_put_payload(:presence_penalty, presence_penalty)
+      |> maybe_put_payload(:frequency_penalty, frequency_penalty)
+      |> maybe_put_payload(:stop, stop)
+      |> maybe_put_payload(:seed, seed)
+      |> merge_chat_extra_body(extra_body)
 
     body = Jason.encode!(payload)
     url = normalize_base_url(base_url) <> "/v1/chat/completions"
@@ -1546,6 +2279,7 @@ defmodule HpcConnect do
             stream: true,
             base_url: normalize_base_url(base_url),
             model: model,
+            answer: content,
             content: content,
             raw: response_body
           }
@@ -1561,6 +2295,7 @@ defmodule HpcConnect do
             stream: false,
             base_url: normalize_base_url(base_url),
             model: model,
+            answer: content,
             content: content,
             finish_reason: get_in(decoded, ["choices", Access.at(0), "finish_reason"]),
             raw: decoded
@@ -1576,6 +2311,16 @@ defmodule HpcConnect do
     end
   end
 
+  @doc """
+  Convenience wrapper returning only the model answer text.
+  """
+  @spec vllm_answer(map() | binary(), binary(), keyword()) :: binary()
+  def vllm_answer(app_or_url, message, opts \\ []) when is_binary(message) do
+    app_or_url
+    |> vllm_chat(message, opts)
+    |> Map.get(:answer, "")
+  end
+
   defp resolve_vllm_endpoint(
          %{
            access_mode: :native_ssh,
@@ -1586,6 +2331,8 @@ defmodule HpcConnect do
          },
          opts
        ) do
+    ensure_native_session_or_allow_os!(session, opts)
+
     {
       "http://#{node}:#{port}",
       Keyword.get(opts, :request_fun, ssh_http_request_fun(session, node, port, job_id))
@@ -1596,14 +2343,24 @@ defmodule HpcConnect do
          %{access_mode: :native_ssh, session: %Session{} = session, node: node, port: port},
          opts
        ) do
+    ensure_native_session_or_allow_os!(session, opts)
+
     {
       "http://#{node}:#{port}",
       Keyword.get(opts, :request_fun, ssh_http_request_fun(session, node, port, nil))
     }
   end
 
+  # OS proxy fallback: tunnel is already open on localhost, use base_url directly.
+  defp resolve_vllm_endpoint(%{access_mode: :openssh_proxy, base_url: base_url}, opts)
+       when is_binary(base_url) do
+    {base_url, Keyword.get(opts, :request_fun, &default_http_request/5)}
+  end
+
   defp resolve_vllm_endpoint(%{session: %Session{} = session, node: node, port: port}, opts)
        when is_binary(node) do
+    ensure_native_session_or_allow_os!(session, opts)
+
     {
       "http://#{node}:#{port}",
       Keyword.get(opts, :request_fun, ssh_http_request_fun(session, node, port, nil))
@@ -1626,6 +2383,28 @@ defmodule HpcConnect do
     raise ArgumentError,
           "vllm_chat expects a vLLM app map or a base URL string, got: #{inspect(other)}"
   end
+
+  defp ensure_native_session_or_allow_os!(%Session{ssh_conn: nil}, opts) do
+    if Keyword.get(opts, :allow_os_ssh, false) do
+      :ok
+    else
+      raise RuntimeError,
+            "vllm_chat requires a native SSH session by default (session.ssh_conn is nil). " <>
+              "Use the session returned by start_app/reconnect with native_ssh enabled, " <>
+              "or explicitly opt in to OS fallback via allow_os_ssh: true."
+    end
+  end
+
+  defp ensure_native_session_or_allow_os!(%Session{}, _opts), do: :ok
+
+  defp maybe_put_payload(payload, _key, nil), do: payload
+  defp maybe_put_payload(payload, key, value), do: Map.put(payload, key, value)
+
+  defp merge_chat_extra_body(payload, extra_body) when is_map(extra_body) do
+    Map.merge(payload, extra_body)
+  end
+
+  defp merge_chat_extra_body(payload, _), do: payload
 
   defp ssh_http_request_fun(%Session{} = session, node, remote_port, job_id) do
     fn method, url, headers, body, timeout_ms ->
@@ -2002,13 +2781,15 @@ defmodule HpcConnect do
   `connect!/2`, `download_model/3`, `install_remote_scripts!/1`, etc.) run over the
   established connection — **no new OS processes, no CMD windows, works in Livebook**.
 
-  If the cluster requires a ProxyJump host (all FAU/NHR clusters do), a single
-  background OS process opens a plain TCP tunnel through the proxy and then Erlang `:ssh`
-  connects through it. After that, the OS process is idle (no shell, no output).
+  Native mode avoids OS ssh tunneling by default. If direct native connect needs
+  an explicit OpenSSH ProxyJump tunnel fallback, pass `proxy_jump_via_os: true`.
 
   Close with `close_connection/1` or let the session be garbage-collected.
 
-  Options: `:timeout` (ms, default 20_000).
+  Options:
+  - `:timeout` (ms, default 20_000)
+  - `:proxy_jump_via_native` (default `true`)
+  - `:proxy_jump_via_os` (default `false`)
   """
   @spec open_connection!(Session.t(), keyword()) :: {Session.t(), port() | nil}
   def open_connection!(%Session{} = session, opts \\ []), do: SSH.open_connection!(session, opts)
@@ -2088,7 +2869,6 @@ defmodule HpcConnect do
     receive do
       {:hpc_connect_cancel_wait, reason} ->
         throw({:hpc_connect_cancel_wait, reason})
-
     after
       step -> :ok
     end

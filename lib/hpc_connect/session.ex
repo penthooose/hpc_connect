@@ -23,8 +23,14 @@ defmodule HpcConnect.Session do
     :master_socket,
     # Erlang :ssh persistent connection reference (set by SSH.open_connection!/1)
     :ssh_conn,
-    # Background OS Port holding the proxy jump tunnel (set by SSH.open_connection!/1)
+    # Background OS Port holding the proxy jump tunnel (optional OS fallback)
     :tunnel_port,
+    # Native Erlang :ssh connection to ProxyJump host (when native jump tunnel is used)
+    :jump_ssh_conn,
+    # Local listener port opened by native jump tunnel (:ssh.tcpip_tunnel_to_server)
+    :jump_tunnel_port,
+    # Native Erlang :ssh connection to compute node (second hop of vLLM 2-hop native tunnel)
+    :compute_ssh_conn,
     env: %{}
   ]
 
@@ -42,8 +48,11 @@ defmodule HpcConnect.Session do
           vault_dir: binary(),
           port_range: {pos_integer(), pos_integer()},
           master_socket: binary() | nil,
-          ssh_conn: reference() | nil,
+          ssh_conn: pid() | reference() | nil,
           tunnel_port: port() | nil,
+          jump_ssh_conn: pid() | reference() | nil,
+          jump_tunnel_port: pos_integer() | nil,
+          compute_ssh_conn: pid() | reference() | nil,
           env: map()
         }
 
@@ -134,11 +143,14 @@ defmodule HpcConnect.Session do
   defp build(cluster, opts) do
     username = Keyword.get(opts, :username, env("HPC_CONNECT_USERNAME"))
     ssh_alias = Keyword.get(opts, :ssh_alias, cluster.ssh_alias || env("HPC_CONNECT_SSH_ALIAS"))
-    uploaded_key_path = Keyword.get(opts, :uploaded_key_path)
-    identity_file = Keyword.get(opts, :identity_file, env("HPC_CONNECT_IDENTITY_FILE"))
-    ssh_config_file = Keyword.get(opts, :ssh_config_file)
-    known_hosts_file = Keyword.get(opts, :known_hosts_file)
-    credential_dir = Keyword.get(opts, :credential_dir)
+    uploaded_key_path = normalize_local_path(Keyword.get(opts, :uploaded_key_path))
+
+    identity_file =
+      normalize_local_path(Keyword.get(opts, :identity_file, env("HPC_CONNECT_IDENTITY_FILE")))
+
+    ssh_config_file = normalize_local_path(Keyword.get(opts, :ssh_config_file))
+    known_hosts_file = normalize_local_path(Keyword.get(opts, :known_hosts_file))
+    credential_dir = normalize_local_path(Keyword.get(opts, :credential_dir))
 
     proxy_jump =
       Keyword.get(opts, :proxy_jump, cluster.proxy_jump || env("HPC_CONNECT_PROXY_JUMP"))
@@ -205,6 +217,12 @@ defmodule HpcConnect.Session do
   end
 
   defp env(name), do: System.get_env(name)
+
+  defp normalize_local_path(path) when is_binary(path) and path != "" do
+    Path.expand(path)
+  end
+
+  defp normalize_local_path(_), do: nil
 
   defp parse_port_range(nil), do: nil
 
