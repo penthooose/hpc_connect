@@ -14,8 +14,11 @@ defmodule HpcConnect.SSHKeyCallback do
 
   @impl true
   def user_key(_alg, opts) do
-    cb_opts = Keyword.get(opts, :key_cb_private, [])
-    identity_file = Keyword.get(cb_opts, :identity_file)
+    cb_opts = Keyword.get(opts, :key_cb_private, opts)
+
+    identity_file =
+      Keyword.get(cb_opts, :identity_file) ||
+        Keyword.get(opts, :identity_file)
 
     if is_nil(identity_file) or not File.exists?(identity_file) do
       {:error, "identity_file #{inspect(identity_file)} not found"}
@@ -23,26 +26,19 @@ defmodule HpcConnect.SSHKeyCallback do
       pem = File.read!(identity_file)
 
       # Try every PEM entry in the file until one decodes to a supported key type.
+      # This intentionally tries ALL entry types, including the modern
+      # "OPENSSH PRIVATE KEY" format (OTP 24+) in addition to the legacy
+      # RSAPrivateKey / ECPrivateKey / DSAPrivateKey / OKPPrivateKey formats.
       result =
         pem
         |> :public_key.pem_decode()
         |> Enum.find_value(fn entry ->
-          case entry do
-            {type, _, :not_encrypted}
-            when type in [
-                   :RSAPrivateKey,
-                   :ECPrivateKey,
-                   :DSAPrivateKey,
-                   :OKPPrivateKey
-                 ] ->
-              try do
-                {:ok, :public_key.pem_entry_decode(entry)}
-              rescue
-                _ -> nil
-              end
-
-            _ ->
-              nil
+          try do
+            {:ok, :public_key.pem_entry_decode(entry)}
+          rescue
+            _ -> nil
+          catch
+            _, _ -> nil
           end
         end)
 

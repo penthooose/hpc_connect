@@ -492,14 +492,16 @@ defmodule HpcConnect.Slurm do
   The allocation remains active as long as the port lives. Release with
   `HpcConnect.release_gpu/2`, which closes the port and cancels the SLURM job.
 
-  Options: `:partition`, `:gpus`, `:walltime`, `:ntasks`, `:timeout` (ms to wait for RUNNING, default 300_000), `:interval` (ms between squeue polls, default 10_000).
+  Options: `:partition`, `:gpus`, `:walltime`, `:ntasks` (optional),
+  `:timeout` (ms to wait for RUNNING, default 300_000),
+  `:interval` (ms between squeue polls, default 10_000).
   """
   @spec allocate_gpu(Session.t(), keyword()) :: map()
   def allocate_gpu(%Session{} = session, opts \\ []) do
     partition = to_string(Keyword.get(opts, :partition, "a100"))
     gpus = Keyword.get(opts, :gpus, 1)
     walltime = Keyword.get(opts, :walltime, "01:00:00")
-    ntasks = Keyword.get(opts, :ntasks, 1)
+    ntasks = Keyword.get(opts, :ntasks)
 
     # Submit a sleep-hold batch job.  sbatch exits immediately (no CMD window, no Port)
     # and the job keeps the allocation alive on the cluster for `walltime`.
@@ -512,7 +514,8 @@ defmodule HpcConnect.Slurm do
     sbatch_cmd =
       "mkdir -p #{Shell.escape(log_dir)}" <>
         " && sbatch --parsable --partition=#{partition} #{gres_option}" <>
-        " --ntasks=#{ntasks} --time=#{walltime} --job-name=hpc_connect_hold" <>
+        if(ntasks, do: " --ntasks=#{ntasks}", else: "") <>
+        " --time=#{walltime} --job-name=hpc_connect_hold" <>
         " --output=#{Shell.escape(log_dir)}/hpc_connect_hold_%j.out" <>
         " --error=#{Shell.escape(log_dir)}/hpc_connect_hold_%j.err" <>
         " --wrap=\"sleep #{sleep_secs}\""
@@ -594,7 +597,8 @@ defmodule HpcConnect.Slurm do
   - `:gpus` – number of GPUs (default: `1`)
   - `:walltime` – time limit (default: `"02:00:00"`)
   - `:port` – port for vLLM server (default: `8000`)
-  - `:cpus_per_task` – CPUs per task (default: `8`)
+  - `:ntasks` – number of tasks (optional)
+  - `:cpus_per_task` – CPUs per task (optional)
   - `:modules` – list of modules to load (default: `[]`)
   - `:conda_env` – conda env to activate (optional)
   """
@@ -606,8 +610,8 @@ defmodule HpcConnect.Slurm do
     gpus = Keyword.get(opts, :gpus, 1)
     walltime = Keyword.get(opts, :walltime, "02:00:00")
     port = Keyword.get(opts, :port, 8000)
-    ntasks = Keyword.get(opts, :ntasks, 1)
-    cpus = Keyword.get(opts, :cpus_per_task, 8)
+    ntasks = Keyword.get(opts, :ntasks)
+    cpus = Keyword.get(opts, :cpus_per_task)
     modules = Keyword.get(opts, :modules, [])
     conda_env = Keyword.get(opts, :conda_env)
 
@@ -631,14 +635,16 @@ defmodule HpcConnect.Slurm do
       end
 
     gres_option = gres_option(session, opts, partition, gpus)
+    ntasks_line = if ntasks, do: "#SBATCH --ntasks=#{ntasks}", else: ""
+    cpus_line = if cpus, do: "#SBATCH --cpus-per-task=#{cpus}", else: ""
 
     job_script = """
     #!/bin/bash -l
     #SBATCH --job-name=hpc_connect_vllm
     #SBATCH --partition=#{partition}
     #{gres_option}
-    #SBATCH --ntasks=#{ntasks}
-    #SBATCH --cpus-per-task=#{cpus}
+    #{ntasks_line}
+    #{cpus_line}
     #SBATCH --time=#{walltime}
     #SBATCH --output=#{logs_dir}/vllm_%j.out
     #SBATCH --error=#{logs_dir}/vllm_%j.err
@@ -690,8 +696,8 @@ defmodule HpcConnect.Slurm do
   defp gres_cmd_option(%Session{} = session, opts, partition, gpus) do
     gpu_type =
       Keyword.get(opts, :gpu_type) ||
-        session.cluster.gpu_type ||
-        infer_gpu_type_from_partition(partition)
+        infer_gpu_type_from_partition(partition) ||
+        session.cluster.gpu_type
 
     if gpu_type do
       "--gres=gpu:#{gpu_type}:#{gpus}"
@@ -703,8 +709,8 @@ defmodule HpcConnect.Slurm do
   defp gres_option(%Session{} = session, opts, partition, gpus) do
     gpu_type =
       Keyword.get(opts, :gpu_type) ||
-        session.cluster.gpu_type ||
-        infer_gpu_type_from_partition(partition)
+        infer_gpu_type_from_partition(partition) ||
+        session.cluster.gpu_type
 
     if gpu_type do
       "#SBATCH --gres=gpu:#{gpu_type}:#{gpus}"
@@ -714,12 +720,35 @@ defmodule HpcConnect.Slurm do
   end
 
   defp infer_gpu_type_from_partition(partition) do
-    type = String.downcase(partition)
+    type = partition |> to_string() |> String.trim() |> String.downcase()
 
     cond do
-      type in ["a100", "rtx3080", "v100", "h100", "p100", "t4"] -> type
-      String.starts_with?(type, "gpu") -> type
-      true -> nil
+      type == "" ->
+        nil
+
+      type in ["standard", "cpu", "login", "batch", "debug", "shared"] ->
+        nil
+
+      Regex.match?(~r/^gpu[-_]?([a-z0-9]+)$/i, type) ->
+        case Regex.run(~r/^gpu[-_]?([a-z0-9]+)$/i, type, capture: :all_but_first) do
+          [suffix] when suffix != "" -> suffix
+          _ -> "gpu"
+        end
+
+      Regex.match?(~r/^(a|h|v|p|t|l)\d+[a-z0-9-]*$/i, type) ->
+        type
+
+      Regex.match?(~r/^rtx\d+[a-z0-9-]*$/i, type) ->
+        type
+
+      Regex.match?(~r/^mi\d+[a-z0-9-]*$/i, type) ->
+        type
+
+      Regex.match?(~r/\d/, type) ->
+        type
+
+      true ->
+        nil
     end
   end
 
@@ -734,22 +763,58 @@ defmodule HpcConnect.Slurm do
   """
   @spec get_job_node(Session.t(), binary() | pos_integer(), keyword()) :: binary() | nil
   def get_job_node(%Session{} = session, job_id, opts \\ []) do
-    {output, _} =
-      session
-      |> SSH.ssh_command(
+    {output, status} =
+      SSH.exec(
+        session,
         "squeue -j #{job_id} -h -o '%N' 2>/dev/null || true",
-        "Get node for job #{job_id}"
+        timeout: Keyword.get(opts, :timeout, 30_000)
       )
-      |> SSH.run(Keyword.get(opts, :connect_opts, []))
 
-    output
-    |> String.split("\n", trim: true)
-    |> Enum.map(&strip_ansi/1)
-    |> Enum.map(&String.trim/1)
-    |> Enum.reject(&header_or_warning_line?/1)
-    |> Enum.reject(fn value -> value in ["", "(null)", "None"] end)
-    |> Enum.reject(&String.starts_with?(&1, "("))
-    |> List.first()
+    if status != 0 do
+      nil
+    else
+      output
+      |> String.split("\n", trim: true)
+      |> Enum.map(&strip_ansi/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&header_or_warning_line?/1)
+      |> Enum.map(&normalize_nodelist_value/1)
+      |> Enum.reject(&is_nil/1)
+      |> List.first()
+    end
+  end
+
+  defp normalize_nodelist_value(value) do
+    down = String.downcase(value)
+
+    cond do
+      value in ["", "(null)", "None"] ->
+        nil
+
+      String.starts_with?(value, "(") ->
+        nil
+
+      String.starts_with?(down, "ssh:") ->
+        nil
+
+      String.contains?(down, "connect to host") ->
+        nil
+
+      String.contains?(down, "connection refused") ->
+        nil
+
+      String.contains?(down, "error") ->
+        nil
+
+      String.contains?(value, " ") ->
+        nil
+
+      Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_,.-]*$/, value) ->
+        value
+
+      true ->
+        nil
+    end
   end
 
   @doc """
@@ -1286,7 +1351,7 @@ defmodule HpcConnect.Slurm do
     gpus = Keyword.get(opts, :gpus, 1)
     walltime = Keyword.get(opts, :walltime, "02:00:00")
     port = Keyword.get(opts, :port, 8000)
-    cpus = Keyword.get(opts, :cpus, 8)
+    cpus = Keyword.get(opts, :cpus)
     sif_name = Keyword.get(opts, :sif_name, app)
     sif_path = Keyword.get(opts, :sif_path) || remote_sif_path(session, sif_name)
     app_env = Keyword.get(opts, :app_env, %{})
@@ -1314,8 +1379,7 @@ defmodule HpcConnect.Slurm do
         " --job-name=hpc_connect_#{app}" <>
         " --partition=#{partition}" <>
         " #{gres_cmd_option(session, opts, partition, gpus)}" <>
-        " --ntasks=1" <>
-        " --cpus-per-task=#{cpus}" <>
+        if(cpus, do: " --cpus-per-task=#{cpus}", else: "") <>
         " --time=#{walltime}" <>
         " --output=#{Shell.escape(logs_dir)}/#{app}_%j.out" <>
         " --error=#{Shell.escape(logs_dir)}/#{app}_%j.err" <>
@@ -1323,9 +1387,7 @@ defmodule HpcConnect.Slurm do
         " #{Shell.escape(run_script)}"
 
     {output, status} =
-      session
-      |> SSH.ssh_command(sbatch_cmd, "Submit #{app} Apptainer job")
-      |> SSH.run(Keyword.get(opts, :connect_opts, []))
+      SSH.exec(session, sbatch_cmd, timeout: Keyword.get(opts, :timeout, 120_000))
 
     if status != 0, do: raise(RuntimeError, "sbatch failed: #{output}")
 

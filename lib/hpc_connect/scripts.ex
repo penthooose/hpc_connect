@@ -24,30 +24,40 @@ defmodule HpcConnect.Scripts do
   @spec remote_script_dir(Session.t()) :: binary()
   def remote_script_dir(%Session{} = session), do: Path.join(session.work_dir, "scripts")
 
-  @spec install_commands(Session.t()) :: [Command.t()]
-  def install_commands(%Session{} = session) do
+  @spec install_commands(Session.t(), keyword()) :: [Command.t()]
+  def install_commands(%Session{} = session, opts \\ []) do
+    reset_permission? = Keyword.get(opts, :reset_permission, false)
     remote_root = session.work_dir
     remote_scripts = remote_script_dir(session)
 
-    [
-      SSH.ssh_command(
-        session,
-        "mkdir -p #{Shell.escape(remote_root)} #{Shell.escape(remote_scripts)}",
-        "Create remote hpc_connect directories"
-      ),
-      SSH.scp_to_command(
-        session,
-        local_script_dir(),
-        remote_root,
-        "Upload helper scripts to remote host",
-        recursive: true
-      ),
-      SSH.ssh_command(
-        session,
-        "chmod 755 #{Shell.escape(remote_root)} #{Shell.escape(remote_scripts)}",
-        "Ensure read/write/execute permissions on hpc_connect dirs"
-      )
-    ]
+    base =
+      [
+        SSH.ssh_command(
+          session,
+          "mkdir -p #{Shell.escape(remote_root)} #{Shell.escape(remote_scripts)}",
+          "Create remote hpc_connect directories"
+        ),
+        SSH.scp_to_command(
+          session,
+          local_script_dir(),
+          remote_root,
+          "Upload helper scripts to remote host",
+          recursive: true
+        )
+      ]
+
+    if reset_permission? do
+      base ++
+        [
+          SSH.ssh_command(
+            session,
+            "chmod 755 #{Shell.escape(remote_root)} #{Shell.escape(remote_scripts)}",
+            "Ensure read/write/execute permissions on hpc_connect dirs"
+          )
+        ]
+    else
+      base
+    end
   end
 
   def download_model_command(%Session{} = session, %Model{} = model, opts \\ []) do

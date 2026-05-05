@@ -63,31 +63,54 @@ defmodule HpcConnect.SSH do
   Builds an SSH local port-forwarding command.
 
   The tunnel connects `local_port` on localhost to `remote_port` on the compute node,
-  jumping through the cluster login host as a proxy.
+  **through the cluster login host as a TCP gateway**.
+
+  This avoids opening an SSH session to the compute node itself (which is blocked on
+  some clusters or may require password auth even when login-node key auth works).
 
   The returned `%Command{}` can be inspected with `command_preview/1` or run as a
   background Port via `open_proxy!/1`.
   """
   @spec port_forward_command(Session.t(), binary(), pos_integer(), pos_integer()) :: Command.t()
   def port_forward_command(%Session{} = session, node, local_port, remote_port) do
-    login_host = session.cluster.host
-    username = session.username || raise ArgumentError, "session has no username"
+    proxy_jump_target =
+      cond do
+        is_nil(session.proxy_jump) or session.proxy_jump == "" ->
+          nil
+
+        String.contains?(session.proxy_jump, "@") ->
+          session.proxy_jump
+
+        session.username ->
+          "#{session.username}@#{session.proxy_jump}"
+
+        true ->
+          session.proxy_jump
+      end
 
     args =
       []
+      |> maybe_append_option("-F", session.ssh_config_file)
       |> maybe_append_option("-i", session.identity_file)
+      |> maybe_append_option("-J", proxy_jump_target)
       |> Kernel.++([
+        ["-o", "BatchMode=yes"],
+        ["-o", "ConnectTimeout=30"],
+        ["-o", "ExitOnForwardFailure=yes"],
+        ["-o", "StrictHostKeyChecking=accept-new"],
+        ["-o", "ServerAliveInterval=30"],
+        ["-o", "ServerAliveCountMax=3"],
         ["-N"],
-        ["-L", "#{local_port}:localhost:#{remote_port}"],
-        ["-J", "#{username}@#{login_host}"],
-        ["#{username}@#{node}"]
+        ["-L", "#{local_port}:#{node}:#{remote_port}"],
+        [Session.target(session)]
       ])
       |> List.flatten()
 
     %Command{
       binary: ssh_binary(),
       args: args,
-      summary: "Tunnel localhost:#{local_port} -> #{node}:#{remote_port} via #{login_host}",
+      summary:
+        "Tunnel localhost:#{local_port} -> #{node}:#{remote_port} via login #{session.cluster.host}",
       remote_command: nil
     }
   end
@@ -268,43 +291,56 @@ defmodule HpcConnect.SSH do
     proxy_jump =
       session.proxy_jump || session.cluster.proxy_jump
 
-    {connect_host, connect_port, tunnel_os_port} =
-      if proxy_jump do
-        local_port = find_free_local_port()
-        target_host = session.cluster.host
-        tunnel_args = build_proxy_tunnel_args(session, proxy_jump, target_host, local_port)
-
-        os_port =
-          Port.open({:spawn_executable, ssh_binary()}, [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: tunnel_args
-          ])
-
-        # Give the tunnel a moment to establish before :ssh tries to connect.
-        # We'll retry anyway so this is just a hint.
-        Process.sleep(800)
-        {~c"127.0.0.1", local_port, os_port}
-      else
-        {String.to_charlist(session.cluster.host), 22, nil}
-      end
-
     ssh_opts = build_erlang_ssh_opts(session, timeout)
 
-    conn =
-      case :ssh.connect(connect_host, connect_port, ssh_opts, timeout) do
-        {:ok, c} ->
-          c
+    direct_host = String.to_charlist(session.cluster.host)
 
-        {:error, reason} ->
-          safe_port_close(tunnel_os_port)
+    direct_result = :ssh.connect(direct_host, 22, ssh_opts, timeout)
 
-          if attempts_left > 1 and retryable_connect_error?(reason) do
-            Process.sleep(1_000)
-            do_open_connection!(session, timeout, attempts_left - 1)
+    {conn, tunnel_os_port} =
+      case direct_result do
+        {:ok, conn} ->
+          {conn, nil}
+
+        {:error, direct_reason} ->
+          if proxy_jump do
+            local_port = find_free_local_port()
+            target_host = session.cluster.host
+            tunnel_args = build_proxy_tunnel_args(session, proxy_jump, target_host, local_port)
+
+            os_port =
+              Port.open({:spawn_executable, ssh_binary()}, [
+                :binary,
+                :exit_status,
+                :stderr_to_stdout,
+                args: tunnel_args
+              ])
+
+            # Poll until the tunnel's local port is accepting connections.
+            wait_for_local_port(local_port, 8_000)
+
+            case :ssh.connect(~c"127.0.0.1", local_port, ssh_opts, timeout) do
+              {:ok, conn} ->
+                {conn, os_port}
+
+              {:error, reason} ->
+                safe_port_close(os_port)
+
+                if attempts_left > 1 and retryable_connect_error?(reason) do
+                  Process.sleep(1_000)
+                  do_open_connection!(session, timeout, attempts_left - 1)
+                else
+                  raise RuntimeError,
+                        "SSH connect failed (direct: #{inspect(direct_reason)}, proxy: #{inspect(reason)})"
+                end
+            end
           else
-            raise RuntimeError, "SSH connect failed: #{inspect(reason)}"
+            if attempts_left > 1 and retryable_connect_error?(direct_reason) do
+              Process.sleep(1_000)
+              do_open_connection!(session, timeout, attempts_left - 1)
+            else
+              raise RuntimeError, "SSH connect failed: #{inspect(direct_reason)}"
+            end
           end
       end
 
@@ -335,8 +371,32 @@ defmodule HpcConnect.SSH do
   end
 
   defp retryable_connect_error?(reason) do
-    reason in [:econnrefused, :timeout, :closed, :ehostunreach, :enetunreach] or
-      String.contains?(inspect(reason), ["econnrefused", "timeout", "closed"])
+    # Auth failures are not retryable — only transient network errors are.
+    auth_failure? =
+      is_list(reason) and
+        :lists.member(:unable_to_connect_using_available_authentication_methods, reason)
+
+    not auth_failure? and
+      (reason in [:econnrefused, :timeout, :closed, :ehostunreach, :enetunreach] or
+         (is_list(reason) and
+            Enum.any?(reason, &(&1 in [:econnrefused, :timeout, :closed, :ehostunreach]))) or
+         String.contains?(inspect(reason), ["econnrefused", "timeout", "closed"]))
+  end
+
+  # Polls until localhost:port is accepting TCP connections (tunnel is ready).
+  defp wait_for_local_port(port, timeout_ms, waited \\ 0) do
+    case :gen_tcp.connect(~c"127.0.0.1", port, [:binary, active: false], 500) do
+      {:ok, sock} ->
+        :gen_tcp.close(sock)
+        :ok
+
+      {:error, _} when waited < timeout_ms ->
+        Process.sleep(200)
+        wait_for_local_port(port, timeout_ms, waited + 200)
+
+      {:error, reason} ->
+        raise RuntimeError, "proxy tunnel on port #{port} did not open: #{inspect(reason)}"
+    end
   end
 
   @doc """
@@ -348,8 +408,12 @@ defmodule HpcConnect.SSH do
   Returns `{output_binary, exit_status}` — same contract as `run/2`.
   """
   @spec exec(Session.t(), binary(), keyword()) :: {binary(), non_neg_integer()}
-  def exec(%Session{ssh_conn: nil} = session, command, opts),
-    do: session |> ssh_command(command, command) |> run(opts)
+  def exec(%Session{ssh_conn: nil} = session, command, opts) do
+    # `System.cmd/3` does not accept `:timeout`; keep it for native `:ssh`
+    # branch only and drop it when we fall back to OS ssh/scp commands.
+    os_opts = Keyword.drop(opts, [:timeout])
+    session |> ssh_command(command, command) |> run(os_opts)
+  end
 
   def exec(%Session{ssh_conn: conn}, command, opts) do
     timeout = Keyword.get(opts, :timeout, 120_000)

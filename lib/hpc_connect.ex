@@ -6,7 +6,19 @@ defmodule HpcConnect do
   across Windows, Linux, and macOS.
   """
 
-  alias HpcConnect.{Cluster, Command, EnvFile, Job, Livebook, Model, Scripts, Session, Slurm, SSH}
+  alias HpcConnect.{
+    Cluster,
+    Command,
+    EnvFile,
+    Job,
+    Livebook,
+    Model,
+    Scripts,
+    Session,
+    Shell,
+    Slurm,
+    SSH
+  }
 
   @doc """
   Returns the built-in cluster definitions.
@@ -62,10 +74,15 @@ defmodule HpcConnect do
   It performs `connection_setup/1`, optionally loads a local `.env` file into the
   runtime session environment, and gathers the most important remote status data
   (quota, downloaded models, free GPUs, jobs).
+
+  Options:
+  - `:reset_permission` (default: `false`) – when `true`, explicitly runs
+    remote `chmod 755` on hpc_connect working directories during bootstrap.
   """
   @spec bootstrap(keyword()) :: map()
   def bootstrap(opts \\ []) do
     result = connection_setup(opts)
+    reset_permission? = Keyword.get(opts, :reset_permission, false)
 
     session =
       case Keyword.get(opts, :env_file) do
@@ -88,7 +105,7 @@ defmodule HpcConnect do
 
     setup_session =
       if Keyword.get(opts, :install_scripts, true) do
-        install_remote_scripts!(session)
+        install_remote_scripts!(session, reset_permission: reset_permission?)
         session
       else
         session
@@ -101,7 +118,12 @@ defmodule HpcConnect do
 
         SSH.ssh_command(
           setup_session,
-          "mkdir -p #{HpcConnect.Shell.escape(def_dir)} #{HpcConnect.Shell.escape(img_dir)} && chmod 755 #{HpcConnect.Shell.escape(def_dir)} #{HpcConnect.Shell.escape(img_dir)}",
+          "mkdir -p #{HpcConnect.Shell.escape(def_dir)} #{HpcConnect.Shell.escape(img_dir)}" <>
+            if(reset_permission?,
+              do:
+                " && chmod 755 #{HpcConnect.Shell.escape(def_dir)} #{HpcConnect.Shell.escape(img_dir)}",
+              else: ""
+            ),
           "Ensure singularity directories"
         )
         |> run_command_with_retry!()
@@ -531,26 +553,36 @@ defmodule HpcConnect do
   Uploads the bundled helper scripts to the remote `work_dir/scripts/` directory.
   Normally you don't need this; script uploads happen automatically when a
   remote script is missing.
+
+  Options:
+  - `:reset_permission` (default: `false`) – when `true`, runs `chmod 755`
+    on remote hpc_connect directories after upload.
   """
-  @spec install_remote_scripts!(Session.t()) :: :ok
-  def install_remote_scripts!(%Session{ssh_conn: nil} = session) do
+  @spec install_remote_scripts!(Session.t(), keyword()) :: :ok
+  def install_remote_scripts!(session, opts \\ [])
+
+  def install_remote_scripts!(%Session{ssh_conn: nil} = session, opts) do
     session
-    |> Scripts.install_commands()
+    |> Scripts.install_commands(opts)
     |> Enum.each(&run_command_with_retry!/1)
 
     :ok
   end
 
-  def install_remote_scripts!(%Session{} = session) do
+  def install_remote_scripts!(%Session{} = session, opts) do
     scripts_dir = Path.join([:code.priv_dir(:hpc_connect), "scripts"])
     remote_dir = session.work_dir <> "/scripts"
     SSH.upload!(session, scripts_dir, remote_dir, recursive: true)
 
-    SSH.exec!(
-      session,
-      "chmod 755 #{HpcConnect.Shell.escape(session.work_dir)} #{HpcConnect.Shell.escape(remote_dir)}",
-      []
-    )
+    if Keyword.get(opts, :reset_permission, false) do
+      SSH.exec!(
+        session,
+        "chmod 755 #{HpcConnect.Shell.escape(session.work_dir)} #{HpcConnect.Shell.escape(remote_dir)}",
+        []
+      )
+    end
+
+    :ok
   end
 
   @doc """
@@ -712,57 +744,329 @@ defmodule HpcConnect do
     do: Slurm.submit_apptainer(session, opts)
 
   @doc """
-  High-level app launcher. Submits a `start_<app>.sh` script via sbatch with
-  SLURM and config arguments separated into two distinct keyword lists.
+  High-level app launcher. Submits a `start_<app>.sh` script via sbatch.
 
-  Config keys are translated to `<APP_UPPER>_<KEY_UPPER>` environment variables
-  (e.g. `app: "vllm", config: [model: "meta-llama/...", port: 50200]` becomes
-  `VLLM_MODEL` and `VLLM_PORT`). The port value is also passed as `APP_PORT` for
-  the generic fallback in scripts.
+  All arguments can be passed as a flat `args:` list. SLURM scheduling keys
+  (`partition`, `gpus`, `walltime`, `cpus`, `sif_name`, `sif_path`) are forwarded
+  to sbatch; all remaining keys become `<APP_UPPER>_<KEY_UPPER>` environment
+  variables inside the job script (e.g. `model:` → `VLLM_MODEL`). The `port`
+  value is also passed as `APP_PORT` for the generic fallback in scripts.
+
+  The legacy two-list form (`slurm: [...]`, `config: [...]`) is still accepted
+  for backward compatibility.
 
   Returns `%{job_id, node, partition, gpus, walltime, port, sif_path, logs_dir}`.
+  Retries silently on transient SSH connection errors (up to 3 attempts).
 
-  Options in `slurm:`:
-  - `:partition` – GPU partition
-  - `:gpus`      – number of GPUs (default: `1`)
-  - `:walltime`  – time limit (default: `"02:00:00"`)
-  - `:cpus`      – cpus-per-task (default: `8`)
-  - `:sif_name`  – stem name of the .sif (default: app name)
-  - `:sif_path`  – override full remote sif path
+  By default this call waits until a compute node is assigned, polling every 10s.
+  While pending, it prints `"Waiting for GPU allocation ..."`. Pressing Ctrl+C
+  attempts to auto-cancel the submitted job (`release_gpu(session, job_id)`) before
+  re-raising the interrupt.
+
+  Optional wait controls:
+  - `:wait_for_node` (default: `true`)
+  - `:node_poll_interval_ms` (default: `10_000`)
+  - `:node_poll_timeout_ms` (default: `:infinity`)
+  - `:cancel_on_interrupt` (default: `true`)
+
+  vLLM convenience controls (`app: "vllm"` only):
+  - `:native_ssh` (default: `true`) ensures a persistent native `:ssh` session
+  - `:auto_proxy` (default: `false`) opens a local OpenSSH tunnel (legacy mode)
+  - `:local_port` optional fixed local tunnel port
+  - `:wait_for_app` (default: `true`) waits for `/v1/models` to become reachable
+  - `:app_ready_timeout_ms` (default: `600_000`)
+  - `:app_ready_interval_ms` (default: `5_000`)
 
   Example:
       HpcConnect.start_app(session,
         app: "vllm",
-        slurm: [partition: "a100", gpus: 1, walltime: "02:00:00"],
-        config: [model: "meta-llama/Llama-3.2-1B-Instruct", port: 50200]
+        args: [partition: "a100", gpus: 1, walltime: "02:00:00",
+               model: "meta-llama/Llama-3.2-1B-Instruct", port: 50200]
       )
   """
+  @slurm_keys [:partition, :gpus, :walltime, :cpus, :sif_name, :sif_path]
+
   @spec start_app(Session.t(), keyword()) :: map()
   def start_app(%Session{} = session, opts) do
     app = Keyword.fetch!(opts, :app)
-    slurm = Keyword.get(opts, :slurm, [])
-    config = Keyword.get(opts, :config, [])
-
+    session = maybe_prepare_session_for_app(session, app, opts)
     app_upper = app |> to_string() |> String.upcase()
 
+    # Support both flat `args:` and legacy `slurm:` + `config:` forms.
+    {slurm_kw, config_kw} =
+      case Keyword.fetch(opts, :args) do
+        {:ok, args} ->
+          {Enum.filter(args, fn {k, _} -> k in @slurm_keys end),
+           Enum.reject(args, fn {k, _} -> k in @slurm_keys end)}
+
+        :error ->
+          slurm = Keyword.get(opts, :slurm, [])
+          config = Keyword.get(opts, :config, [])
+          {slurm, config}
+      end
+
+    port = Keyword.get(config_kw, :port, Keyword.get(slurm_kw, :port, 8000))
+
     app_env =
-      Map.new(config, fn {k, v} ->
+      Map.new(config_kw, fn {k, v} ->
         {"#{app_upper}_#{k |> to_string() |> String.upcase()}", v}
       end)
 
-    port = Keyword.get(config, :port, Keyword.get(slurm, :port, 8000))
+    slurm_opts =
+      [app: app, port: port, app_env: app_env] ++
+        Enum.flat_map(@slurm_keys, &maybe_opt(slurm_kw, &1))
 
-    submit_apptainer(session,
-      app: app,
-      partition: Keyword.get(slurm, :partition),
-      gpus: Keyword.get(slurm, :gpus),
-      walltime: Keyword.get(slurm, :walltime),
-      cpus: Keyword.get(slurm, :cpus),
-      sif_name: Keyword.get(slurm, :sif_name),
-      sif_path: Keyword.get(slurm, :sif_path),
-      port: port,
-      app_env: app_env
-    )
+    submitted = with_retry(fn -> submit_apptainer(session, slurm_opts) end, opts)
+
+    submitted
+    |> maybe_wait_for_allocation(session, opts)
+    |> maybe_attach_vllm_access(session, app, opts)
+  end
+
+  defp maybe_prepare_session_for_app(%Session{} = session, app, opts) do
+    app_name = app |> to_string() |> String.downcase()
+
+    if app_name == "vllm" and Keyword.get(opts, :native_ssh, true) and is_nil(session.ssh_conn) do
+      try do
+        {updated, _tunnel} =
+          open_connection!(session,
+            timeout: Keyword.get(opts, :ssh_timeout_ms, 20_000),
+            attempts: Keyword.get(opts, :ssh_attempts, 3)
+          )
+
+        updated
+      rescue
+        e in RuntimeError ->
+          if Keyword.get(opts, :native_ssh_fallback_to_os, true) do
+            IO.puts(
+              "Native Erlang SSH unavailable (#{Exception.message(e)}). " <>
+                "Falling back to managed OpenSSH commands/tunnel ..."
+            )
+
+            session
+          else
+            reraise e, __STACKTRACE__
+          end
+      end
+    else
+      session
+    end
+  end
+
+  defp maybe_wait_for_allocation(%{job_id: job_id} = submitted, _session, _opts)
+       when job_id in [nil, ""] do
+    submitted
+  end
+
+  defp maybe_wait_for_allocation(submitted, %Session{} = session, opts) do
+    if Keyword.get(opts, :wait_for_node, true) do
+      interval_ms = Keyword.get(opts, :node_poll_interval_ms, 10_000)
+      timeout_ms = Keyword.get(opts, :node_poll_timeout_ms, :infinity)
+      cancel_on_interrupt? = Keyword.get(opts, :cancel_on_interrupt, true)
+
+      IO.puts("Waiting for GPU allocation ...")
+
+      try do
+        node =
+          wait_for_node_with_progress(session, submitted.job_id,
+            interval_ms: interval_ms,
+            timeout_ms: timeout_ms,
+            connect_opts: Keyword.get(opts, :connect_opts, [])
+          )
+
+        %{submitted | node: node}
+      rescue
+        e ->
+          if cancel_on_interrupt?, do: safe_release_gpu(session, submitted.job_id)
+          reraise e, __STACKTRACE__
+      catch
+        kind, value ->
+          if cancel_on_interrupt?, do: safe_release_gpu(session, submitted.job_id)
+
+          case kind do
+            :exit -> exit(value)
+            :throw -> throw(value)
+            :error -> :erlang.error(value)
+          end
+      end
+    else
+      submitted
+    end
+  end
+
+  defp maybe_attach_vllm_access(submitted, _session, app, _opts)
+       when not is_binary(app) and not is_atom(app) do
+    submitted
+  end
+
+  defp maybe_attach_vllm_access(submitted, %Session{} = session, app, opts) do
+    app_name = app |> to_string() |> String.downcase()
+
+    if app_name == "vllm" do
+      submitted = Map.put_new(submitted, :session, session)
+
+      node =
+        submitted.node ||
+          wait_for_job_node(session, submitted.job_id,
+            timeout: Keyword.get(opts, :proxy_wait_timeout_ms, 600_000),
+            interval: Keyword.get(opts, :node_poll_interval_ms, 10_000)
+          )
+
+      native_enriched =
+        submitted
+        |> Map.put(:node, node)
+        |> Map.put(:session, session)
+        |> Map.put(:port, submitted.port)
+        |> Map.put(:base_url, "http://#{node}:#{submitted.port}")
+        |> Map.put(:access_mode, :native_ssh)
+
+      use_proxy? = Keyword.get(opts, :auto_proxy, false) or is_nil(session.ssh_conn)
+
+      if use_proxy? do
+        proxy =
+          start_proxy(session, node, remote_port: submitted.port, local_port: opts[:local_port])
+
+        tunnel_port = open_proxy!(proxy)
+
+        enriched =
+          native_enriched
+          |> Map.put(:proxy, proxy)
+          |> Map.put(:tunnel_port, tunnel_port)
+          |> Map.put(:base_url, proxy.base_url)
+          |> Map.put(:access_mode, :openssh_proxy)
+
+        maybe_wait_for_vllm_ready(enriched, opts)
+      else
+        maybe_wait_for_vllm_ready(native_enriched, opts)
+      end
+    else
+      submitted
+    end
+  end
+
+  defp wait_for_node_with_progress(%Session{} = session, job_id, opts) do
+    interval_ms = Keyword.get(opts, :interval_ms, 10_000)
+    timeout_ms = Keyword.get(opts, :timeout_ms, :infinity)
+    connect_opts = Keyword.get(opts, :connect_opts, [])
+
+    deadline =
+      case timeout_ms do
+        :infinity ->
+          :infinity
+
+        nil ->
+          :infinity
+
+        value when is_integer(value) and value > 0 ->
+          System.monotonic_time(:millisecond) + value
+
+        _ ->
+          System.monotonic_time(:millisecond)
+      end
+
+    do_wait_for_node_with_progress(session, job_id, interval_ms, deadline, connect_opts)
+  end
+
+  defp do_wait_for_node_with_progress(session, job_id, interval_ms, deadline, connect_opts) do
+    case get_job_node(session, job_id, connect_opts: connect_opts) do
+      nil ->
+        if deadline == :infinity or System.monotonic_time(:millisecond) < deadline do
+          IO.puts("Waiting for GPU allocation ...")
+          Process.sleep(interval_ms)
+          do_wait_for_node_with_progress(session, job_id, interval_ms, deadline, connect_opts)
+        else
+          raise RuntimeError,
+                "Job #{job_id} did not receive a compute node within the configured timeout"
+        end
+
+      node ->
+        node
+    end
+  end
+
+  defp safe_release_gpu(%Session{} = session, job_id) do
+    IO.puts("Interrupt received — releasing pending GPU job #{job_id} ...")
+    _ = release_gpu(session, job_id)
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp maybe_opt(kw, key) do
+    case Keyword.fetch(kw, key) do
+      {:ok, val} -> [{key, val}]
+      :error -> []
+    end
+  end
+
+  defp maybe_wait_for_vllm_ready(%{base_url: base_url} = app, opts) when is_binary(base_url) do
+    if Keyword.get(opts, :wait_for_app, true) do
+      timeout_ms = Keyword.get(opts, :app_ready_timeout_ms, 600_000)
+      interval_ms = Keyword.get(opts, :app_ready_interval_ms, 5_000)
+
+      request_fun =
+        case app do
+          %{
+            access_mode: :native_ssh,
+            session: %Session{} = session,
+            node: node,
+            port: port,
+            job_id: job_id
+          } ->
+            Keyword.get(opts, :request_fun, ssh_http_request_fun(session, node, port, job_id))
+
+          %{access_mode: :native_ssh, session: %Session{} = session, node: node, port: port} ->
+            Keyword.get(opts, :request_fun, ssh_http_request_fun(session, node, port, nil))
+
+          _ ->
+            Keyword.get(opts, :request_fun, &default_http_request/5)
+        end
+
+      IO.puts("Waiting for vLLM API readiness ...")
+      wait_for_vllm_ready!(base_url, timeout_ms, interval_ms, request_fun)
+      app
+    else
+      app
+    end
+  end
+
+  defp maybe_wait_for_vllm_ready(app, _opts), do: app
+
+  defp wait_for_vllm_ready!(base_url, timeout_ms, interval_ms, request_fun) do
+    deadline =
+      case timeout_ms do
+        :infinity -> :infinity
+        value when is_integer(value) and value > 0 -> System.monotonic_time(:millisecond) + value
+        _ -> System.monotonic_time(:millisecond)
+      end
+
+    do_wait_for_vllm_ready(base_url, interval_ms, deadline, request_fun)
+  end
+
+  defp do_wait_for_vllm_ready(base_url, interval_ms, deadline, request_fun) do
+    url = normalize_base_url(base_url) <> "/v1/models"
+
+    case request_fun.(:get, url, [], nil, max(interval_ms, 2_000)) do
+      {:ok, status, body, _headers} when status in 200..299 ->
+        case Jason.decode(body) do
+          {:ok, %{"data" => [_ | _]}} -> :ok
+          _ -> wait_or_timeout(base_url, interval_ms, deadline, request_fun)
+        end
+
+      _ ->
+        wait_or_timeout(base_url, interval_ms, deadline, request_fun)
+    end
+  end
+
+  defp wait_or_timeout(base_url, interval_ms, deadline, request_fun) do
+    if deadline == :infinity or System.monotonic_time(:millisecond) < deadline do
+      IO.puts("Waiting for vLLM API readiness ...")
+      Process.sleep(interval_ms)
+      do_wait_for_vllm_ready(base_url, interval_ms, deadline, request_fun)
+    else
+      raise RuntimeError,
+            "vLLM API did not become ready in time at #{normalize_base_url(base_url)}/v1/models"
+    end
   end
 
   @doc """
@@ -813,9 +1117,557 @@ defmodule HpcConnect do
   Close it with `Port.close(port)` or kill the underlying OS process.
   """
   @spec open_proxy!(map()) :: port()
-  def open_proxy!(%{command: %Command{binary: binary, args: args}}) do
-    Port.open({:spawn_executable, binary}, [:binary, :exit_status, args: args])
+  def open_proxy!(%{command: %Command{binary: binary, args: args}, local_port: local_port}) do
+    port =
+      Port.open({:spawn_executable, binary}, [
+        :binary,
+        :exit_status,
+        :stderr_to_stdout,
+        args: args
+      ])
+
+    wait_for_local_proxy_port!(port, local_port, 15_000)
+    port
   end
+
+  def open_proxy!(%{command: %Command{binary: binary, args: args}}) do
+    Port.open({:spawn_executable, binary}, [:binary, :exit_status, :stderr_to_stdout, args: args])
+  end
+
+  defp wait_for_local_proxy_port!(port, local_port, timeout_ms, waited \\ 0)
+
+  defp wait_for_local_proxy_port!(_port, local_port, timeout_ms, waited)
+       when waited >= timeout_ms do
+    raise RuntimeError,
+          "SSH proxy did not open localhost:#{local_port} within #{timeout_ms}ms"
+  end
+
+  defp wait_for_local_proxy_port!(port, local_port, timeout_ms, waited) do
+    case :gen_tcp.connect(~c"127.0.0.1", local_port, [:binary, {:active, false}], 500) do
+      {:ok, sock} ->
+        :gen_tcp.close(sock)
+        :ok
+
+      {:error, _reason} ->
+        if Port.info(port) == nil do
+          raise RuntimeError,
+                "SSH proxy process exited before localhost:#{local_port} became reachable"
+        else
+          Process.sleep(200)
+          wait_for_local_proxy_port!(port, local_port, timeout_ms, waited + 200)
+        end
+    end
+  end
+
+  @doc """
+  Sends a chat completion request to a running vLLM OpenAI-compatible endpoint.
+
+  `app_or_url` can be:
+  - the map returned by `start_app/2` (for `app: "vllm"`), or
+  - a base URL string (e.g. `"http://localhost:58886"`).
+
+  Options:
+  - `:model` (optional; auto-detected from `/v1/models` when omitted)
+  - `:max_tokens` (default: `256`)
+  - `:temperature` (default: `0.2`)
+  - `:system` (optional system instruction)
+  - `:timeout` ms for HTTP calls (default: `60_000`)
+  - `:stream` (default: `false`)
+
+  Returns a map containing at least `:content`, `:model`, and `:base_url`.
+  """
+  @spec vllm_chat(map() | binary(), binary(), keyword()) :: map()
+  def vllm_chat(app_or_url, message, opts \\ []) when is_binary(message) do
+    {base_url, request_fun} = resolve_vllm_endpoint(app_or_url, opts)
+    timeout_ms = Keyword.get(opts, :timeout, 60_000)
+    stream? = Keyword.get(opts, :stream, false)
+
+    model = Keyword.get(opts, :model) || fetch_first_model!(base_url, timeout_ms, request_fun)
+    max_tokens = Keyword.get(opts, :max_tokens, 256)
+    temperature = Keyword.get(opts, :temperature, 0.2)
+    system = Keyword.get(opts, :system)
+
+    messages =
+      case system do
+        value when is_binary(value) and value != "" ->
+          [
+            %{role: "system", content: value},
+            %{role: "user", content: message}
+          ]
+
+        _ ->
+          [%{role: "user", content: message}]
+      end
+
+    payload = %{
+      model: model,
+      messages: messages,
+      max_tokens: max_tokens,
+      temperature: temperature,
+      stream: stream?
+    }
+
+    body = Jason.encode!(payload)
+    url = normalize_base_url(base_url) <> "/v1/chat/completions"
+
+    case request_fun.(:post, url, [{"content-type", "application/json"}], body, timeout_ms) do
+      {:ok, status, response_body, _headers} when status in 200..299 ->
+        if stream? do
+          content = parse_stream_content(response_body)
+
+          %{
+            ok?: true,
+            stream: true,
+            base_url: normalize_base_url(base_url),
+            model: model,
+            content: content,
+            raw: response_body
+          }
+        else
+          decoded = Jason.decode!(response_body)
+
+          content =
+            get_in(decoded, ["choices", Access.at(0), "message", "content"]) ||
+              get_in(decoded, ["choices", Access.at(0), "text"]) || ""
+
+          %{
+            ok?: true,
+            stream: false,
+            base_url: normalize_base_url(base_url),
+            model: model,
+            content: content,
+            finish_reason: get_in(decoded, ["choices", Access.at(0), "finish_reason"]),
+            raw: decoded
+          }
+        end
+
+      {:ok, status, response_body, _headers} ->
+        raise RuntimeError,
+              "vLLM chat request failed (HTTP #{status}): #{truncate_http_body(response_body)}"
+
+      {:error, reason} ->
+        raise RuntimeError, "vLLM chat request failed: #{inspect(reason)}"
+    end
+  end
+
+  defp resolve_vllm_endpoint(
+         %{
+           access_mode: :native_ssh,
+           session: %Session{} = session,
+           node: node,
+           port: port,
+           job_id: job_id
+         },
+         opts
+       ) do
+    {
+      "http://#{node}:#{port}",
+      Keyword.get(opts, :request_fun, ssh_http_request_fun(session, node, port, job_id))
+    }
+  end
+
+  defp resolve_vllm_endpoint(
+         %{access_mode: :native_ssh, session: %Session{} = session, node: node, port: port},
+         opts
+       ) do
+    {
+      "http://#{node}:#{port}",
+      Keyword.get(opts, :request_fun, ssh_http_request_fun(session, node, port, nil))
+    }
+  end
+
+  defp resolve_vllm_endpoint(%{session: %Session{} = session, node: node, port: port}, opts)
+       when is_binary(node) do
+    {
+      "http://#{node}:#{port}",
+      Keyword.get(opts, :request_fun, ssh_http_request_fun(session, node, port, nil))
+    }
+  end
+
+  defp resolve_vllm_endpoint(%{base_url: base_url}, opts) when is_binary(base_url) do
+    {base_url, Keyword.get(opts, :request_fun, &default_http_request/5)}
+  end
+
+  defp resolve_vllm_endpoint(%{proxy: %{base_url: base_url}}, opts) when is_binary(base_url) do
+    {base_url, Keyword.get(opts, :request_fun, &default_http_request/5)}
+  end
+
+  defp resolve_vllm_endpoint(base_url, opts) when is_binary(base_url) do
+    {base_url, Keyword.get(opts, :request_fun, &default_http_request/5)}
+  end
+
+  defp resolve_vllm_endpoint(other, _opts) do
+    raise ArgumentError,
+          "vllm_chat expects a vLLM app map or a base URL string, got: #{inspect(other)}"
+  end
+
+  defp ssh_http_request_fun(%Session{} = session, node, remote_port, job_id) do
+    fn method, url, headers, body, timeout_ms ->
+      ssh_http_request(session, node, remote_port, job_id, method, url, headers, body, timeout_ms)
+    end
+  end
+
+  defp ssh_http_request(
+         %Session{} = session,
+         node,
+         remote_port,
+         job_id,
+         method,
+         url,
+         headers,
+         body,
+         timeout_ms
+       ) do
+    uri = URI.parse(url)
+    path = if uri.path in [nil, ""], do: "/", else: uri.path
+    path = if uri.query, do: path <> "?" <> uri.query, else: path
+    target_url = "http://#{node}:#{remote_port}#{path}"
+
+    method_arg = "-X #{method |> to_string() |> String.upcase()}"
+
+    header_args =
+      headers
+      |> Enum.map(fn {k, v} -> "-H #{Shell.escape("#{k}: #{v}")}" end)
+      |> Enum.join(" ")
+
+    data_arg =
+      case body do
+        value when is_binary(value) and value != "" -> "--data-binary #{Shell.escape(value)}"
+        _ -> ""
+      end
+
+    timeout_s = max(div(timeout_ms + 999, 1_000), 1)
+
+    cmd =
+      [
+        "curl -sS",
+        "--connect-timeout #{min(timeout_s, 30)}",
+        "--max-time #{timeout_s}",
+        method_arg,
+        header_args,
+        data_arg,
+        "-w '__HPC_STATUS__:%{http_code}'",
+        Shell.escape(target_url)
+      ]
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join(" ")
+
+    case SSH.exec(session, cmd, timeout: timeout_ms + 5_000) do
+      {output, 0} ->
+        parse_curl_wrapped_response(output)
+
+      {_output, _status} when job_id in [nil, ""] ->
+        {:error, :direct_node_http_failed}
+
+      {_output, _status} ->
+        ssh_http_request_via_srun(
+          session,
+          remote_port,
+          job_id,
+          method,
+          url,
+          headers,
+          body,
+          timeout_ms
+        )
+    end
+  end
+
+  defp ssh_http_request_via_srun(
+         %Session{} = session,
+         remote_port,
+         job_id,
+         method,
+         url,
+         headers,
+         body,
+         timeout_ms
+       ) do
+    uri = URI.parse(url)
+    path = if uri.path in [nil, ""], do: "/", else: uri.path
+    path = if uri.query, do: path <> "?" <> uri.query, else: path
+    target_url = "http://127.0.0.1:#{remote_port}#{path}"
+
+    method_arg = "-X #{method |> to_string() |> String.upcase()}"
+
+    header_args =
+      headers
+      |> Enum.map(fn {k, v} -> "-H #{Shell.escape("#{k}: #{v}")}" end)
+      |> Enum.join(" ")
+
+    data_arg =
+      case body do
+        value when is_binary(value) and value != "" -> "--data-binary #{Shell.escape(value)}"
+        _ -> ""
+      end
+
+    timeout_s = max(div(timeout_ms + 999, 1_000), 1)
+
+    curl_inner =
+      [
+        "curl -sS",
+        "--connect-timeout #{min(timeout_s, 30)}",
+        "--max-time #{timeout_s}",
+        method_arg,
+        header_args,
+        data_arg,
+        "-w '__HPC_STATUS__:%{http_code}'",
+        Shell.escape(target_url)
+      ]
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.join(" ")
+
+    cmd =
+      "srun --jobid=#{job_id} --overlap --ntasks=1 bash -lc #{Shell.escape(curl_inner)}"
+
+    case SSH.exec(session, cmd, timeout: timeout_ms + 10_000) do
+      {output, 0} ->
+        parse_curl_wrapped_response(output)
+
+      {output, status} ->
+        {:error, {:curl_failed, status, String.trim(output)}}
+    end
+  end
+
+  defp parse_curl_wrapped_response(output) do
+    case Regex.run(~r/__HPC_STATUS__:(\d{3})\s*$/s, output, capture: :all_but_first) do
+      [status_str] ->
+        {status, _} = Integer.parse(status_str)
+
+        body_without_marker =
+          output
+          |> String.replace(~r/__HPC_STATUS__:\d{3}\s*$/s, "")
+
+        {:ok, status, body_without_marker, []}
+
+      _ ->
+        {:error, :invalid_curl_status_marker}
+    end
+  end
+
+  defp fetch_first_model!(base_url, timeout_ms, request_fun) do
+    url = normalize_base_url(base_url) <> "/v1/models"
+
+    case request_fun.(:get, url, [], nil, timeout_ms) do
+      {:ok, status, body, _headers} when status in 200..299 ->
+        decoded = Jason.decode!(body)
+
+        case get_in(decoded, ["data", Access.at(0), "id"]) do
+          id when is_binary(id) and id != "" ->
+            id
+
+          _ ->
+            raise RuntimeError,
+                  "vLLM /v1/models returned no model id: #{truncate_http_body(body)}"
+        end
+
+      {:ok, status, body, _headers} ->
+        raise RuntimeError,
+              "vLLM model discovery failed (HTTP #{status}): #{truncate_http_body(body)}"
+
+      {:error, reason} ->
+        raise RuntimeError, "vLLM model discovery failed: #{inspect(reason)}"
+    end
+  end
+
+  defp default_http_request(method, url, headers, body, timeout_ms) do
+    uri = URI.parse(url)
+
+    with {:ok, host} <- tcp_host(uri),
+         {:ok, port} <- tcp_port(uri),
+         {:ok, socket} <- tcp_connect(host, port, timeout_ms),
+         :ok <-
+           :gen_tcp.send(socket, build_http_request(method, uri, headers, body || "", host, port)),
+         {:ok, raw_response} <- recv_all(socket, [], timeout_ms) do
+      :gen_tcp.close(socket)
+      parse_http_response(raw_response)
+    else
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp tcp_host(%URI{host: nil}), do: {:error, :missing_host}
+  defp tcp_host(%URI{host: host}), do: {:ok, host}
+
+  defp tcp_port(%URI{scheme: "http", port: nil}), do: {:ok, 80}
+  defp tcp_port(%URI{scheme: "https", port: nil}), do: {:ok, 443}
+  defp tcp_port(%URI{port: port}) when is_integer(port), do: {:ok, port}
+  defp tcp_port(_), do: {:error, :invalid_port}
+
+  defp tcp_connect(host, port, timeout_ms) do
+    opts = [:binary, {:packet, :raw}, {:active, false}]
+    :gen_tcp.connect(String.to_charlist(host), port, opts, timeout_ms)
+  end
+
+  defp build_http_request(method, %URI{} = uri, headers, body, host, port) do
+    method_str = method |> to_string() |> String.upcase()
+    path = (uri.path && uri.path != "" && uri.path) || "/"
+    full_path = if uri.query, do: path <> "?" <> uri.query, else: path
+
+    host_header =
+      if (uri.scheme == "http" and port == 80) or (uri.scheme == "https" and port == 443) do
+        host
+      else
+        "#{host}:#{port}"
+      end
+
+    default_headers =
+      [
+        {"Host", host_header},
+        {"Connection", "close"}
+      ] ++
+        if(method == :post,
+          do: [{"Content-Length", Integer.to_string(byte_size(body))}],
+          else: []
+        )
+
+    rendered_headers =
+      (headers ++ default_headers)
+      |> Enum.map(fn {k, v} -> "#{k}: #{v}\r\n" end)
+      |> IO.iodata_to_binary()
+
+    [method_str, " ", full_path, " HTTP/1.1\r\n", rendered_headers, "\r\n", body]
+    |> IO.iodata_to_binary()
+  end
+
+  defp recv_all(socket, acc, timeout_ms) do
+    case :gen_tcp.recv(socket, 0, timeout_ms) do
+      {:ok, chunk} -> recv_all(socket, [acc, chunk], timeout_ms)
+      {:error, :closed} -> {:ok, IO.iodata_to_binary(acc)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp parse_http_response(raw) when is_binary(raw) do
+    case String.split(raw, "\r\n\r\n", parts: 2) do
+      [head, body] ->
+        lines = String.split(head, "\r\n", trim: true)
+
+        with [status_line | header_lines] <- lines,
+             {status, _} <- parse_status_line(status_line) do
+          headers =
+            Enum.map(header_lines, fn line ->
+              case String.split(line, ":", parts: 2) do
+                [k, v] -> {String.trim(k), String.trim(v)}
+                _ -> {line, ""}
+              end
+            end)
+
+          parsed_body =
+            if chunked_transfer?(headers) do
+              case decode_chunked_body(body) do
+                {:ok, decoded} -> decoded
+                _ -> body
+              end
+            else
+              body
+            end
+
+          {:ok, status, parsed_body, headers}
+        else
+          _ -> {:error, :invalid_status_line}
+        end
+
+      _ ->
+        {:error, :invalid_http_response}
+    end
+  end
+
+  defp parse_status_line(line) do
+    case Regex.run(~r/^HTTP\/\d\.\d\s+(\d{3})/, line, capture: :all_but_first) do
+      [status] ->
+        case Integer.parse(status) do
+          {value, _} -> {value, line}
+          :error -> {:error, :invalid_status}
+        end
+
+      _ ->
+        {:error, :invalid_status}
+    end
+  end
+
+  defp chunked_transfer?(headers) do
+    Enum.any?(headers, fn {k, v} ->
+      String.downcase(k) == "transfer-encoding" and
+        String.contains?(String.downcase(v), "chunked")
+    end)
+  end
+
+  defp decode_chunked_body(body) when is_binary(body), do: do_decode_chunked(body, [])
+
+  defp do_decode_chunked(body, acc) do
+    case :binary.match(body, "\r\n") do
+      {idx, 2} ->
+        size_line = binary_part(body, 0, idx)
+        rest = binary_part(body, idx + 2, byte_size(body) - idx - 2)
+
+        chunk_size_hex =
+          size_line
+          |> String.split(";", parts: 2)
+          |> hd()
+          |> String.trim()
+
+        case Integer.parse(chunk_size_hex, 16) do
+          {0, _} ->
+            {:ok, IO.iodata_to_binary(acc)}
+
+          {chunk_size, _} when chunk_size > 0 ->
+            if byte_size(rest) >= chunk_size + 2 do
+              chunk = binary_part(rest, 0, chunk_size)
+              tail = binary_part(rest, chunk_size, byte_size(rest) - chunk_size)
+
+              if String.starts_with?(tail, "\r\n") do
+                remaining = binary_part(tail, 2, byte_size(tail) - 2)
+                do_decode_chunked(remaining, [acc, chunk])
+              else
+                {:error, :invalid_chunk_terminator}
+              end
+            else
+              {:error, :truncated_chunk}
+            end
+
+          _ ->
+            {:error, :invalid_chunk_size}
+        end
+
+      :nomatch ->
+        {:error, :invalid_chunk_header}
+    end
+  end
+
+  defp parse_stream_content(raw) when is_binary(raw) do
+    raw
+    |> String.split("\n", trim: true)
+    |> Enum.filter(&String.starts_with?(&1, "data:"))
+    |> Enum.map(&String.trim(String.trim_leading(&1, "data:")))
+    |> Enum.reject(&(&1 in ["", "[DONE]"]))
+    |> Enum.reduce("", fn chunk, acc ->
+      case Jason.decode(chunk) do
+        {:ok, decoded} ->
+          delta =
+            get_in(decoded, ["choices", Access.at(0), "delta", "content"]) ||
+              get_in(decoded, ["choices", Access.at(0), "message", "content"]) ||
+              get_in(decoded, ["choices", Access.at(0), "text"]) || ""
+
+          acc <> delta
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
+  defp normalize_base_url(base_url) do
+    String.trim_trailing(base_url, "/")
+  end
+
+  defp truncate_http_body(body) when is_binary(body) and byte_size(body) > 500 do
+    binary_part(body, 0, 500) <> "..."
+  end
+
+  defp truncate_http_body(body) when is_binary(body), do: body
+  defp truncate_http_body(other), do: inspect(other)
 
   @doc """
   Opens a **persistent native SSH connection** and returns `{updated_session, tunnel_port_or_nil}`.
