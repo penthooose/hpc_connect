@@ -25,24 +25,26 @@ defmodule HpcConnect.SSHKeyCallback do
     else
       pem = File.read!(identity_file)
 
-      # Try every PEM entry in the file until one decodes to a supported key type.
-      # This intentionally tries ALL entry types, including the modern
-      # "OPENSSH PRIVATE KEY" format (OTP 24+) in addition to the legacy
-      # RSAPrivateKey / ECPrivateKey / DSAPrivateKey / OKPPrivateKey formats.
-      result =
-        pem
-        |> :public_key.pem_decode()
-        |> Enum.find_value(fn entry ->
-          try do
-            {:ok, :public_key.pem_entry_decode(entry)}
-          rescue
-            _ -> nil
-          catch
-            _, _ -> nil
-          end
-        end)
+      if String.starts_with?(pem, "-----BEGIN OPENSSH PRIVATE KEY-----") do
+        {:error,
+         "unsupported OPENSSH PRIVATE KEY format for native Erlang :ssh key callback (use PEM key)"}
+      else
+        # Try every PEM entry in the file until one decodes to a supported key type.
+        result =
+          pem
+          |> :public_key.pem_decode()
+          |> Enum.find_value(fn entry ->
+            try do
+              {:ok, :public_key.pem_entry_decode(entry)}
+            rescue
+              _ -> nil
+            catch
+              _, _ -> nil
+            end
+          end)
 
-      result || {:error, "no supported private key found in #{identity_file}"}
+        result || {:error, "no supported private key found in #{identity_file}"}
+      end
     end
   end
 end

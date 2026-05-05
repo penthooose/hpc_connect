@@ -73,20 +73,7 @@ defmodule HpcConnect.SSH do
   """
   @spec port_forward_command(Session.t(), binary(), pos_integer(), pos_integer()) :: Command.t()
   def port_forward_command(%Session{} = session, node, local_port, remote_port) do
-    proxy_jump_target =
-      cond do
-        is_nil(session.proxy_jump) or session.proxy_jump == "" ->
-          nil
-
-        String.contains?(session.proxy_jump, "@") ->
-          session.proxy_jump
-
-        session.username ->
-          "#{session.username}@#{session.proxy_jump}"
-
-        true ->
-          session.proxy_jump
-      end
+    proxy_jump_target = proxy_jump_target(session)
 
     args =
       []
@@ -95,6 +82,10 @@ defmodule HpcConnect.SSH do
       |> maybe_append_option("-J", proxy_jump_target)
       |> Kernel.++([
         ["-o", "BatchMode=yes"],
+        ["-o", "IdentitiesOnly=yes"],
+        ["-o", "PasswordAuthentication=no"],
+        ["-o", "PreferredAuthentications=publickey"],
+        ["-o", "NumberOfPasswordPrompts=0"],
         ["-o", "ConnectTimeout=30"],
         ["-o", "ExitOnForwardFailure=yes"],
         ["-o", "StrictHostKeyChecking=accept-new"],
@@ -130,10 +121,23 @@ defmodule HpcConnect.SSH do
     base =
       []
       |> maybe_append_option("-F", session.ssh_config_file)
-      |> maybe_append_option("-J", session.proxy_jump)
+      |> maybe_append_option("-J", proxy_jump_target(session))
       |> maybe_append_option("-i", session.identity_file)
 
-    base = base ++ ["-o", "ConnectTimeout=30"]
+    base =
+      base ++
+        [
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "PasswordAuthentication=no",
+          "-o",
+          "PreferredAuthentications=publickey",
+          "-o",
+          "NumberOfPasswordPrompts=0",
+          "-o",
+          "ConnectTimeout=30"
+        ]
 
     case session.master_socket do
       nil -> base
@@ -145,10 +149,23 @@ defmodule HpcConnect.SSH do
     base =
       []
       |> maybe_append_option("-F", session.ssh_config_file)
-      |> maybe_append_option("-J", session.proxy_jump)
+      |> maybe_append_option("-J", proxy_jump_target(session))
       |> maybe_append_option("-i", session.identity_file)
 
-    base = base ++ ["-o", "ConnectTimeout=30"]
+    base =
+      base ++
+        [
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "PasswordAuthentication=no",
+          "-o",
+          "PreferredAuthentications=publickey",
+          "-o",
+          "NumberOfPasswordPrompts=0",
+          "-o",
+          "ConnectTimeout=30"
+        ]
 
     case session.master_socket do
       nil -> base
@@ -182,8 +199,16 @@ defmodule HpcConnect.SSH do
       []
       |> maybe_append_option("-i", session.identity_file)
       |> maybe_append_option("-F", session.ssh_config_file)
-      |> maybe_append_option("-J", session.proxy_jump)
+      |> maybe_append_option("-J", proxy_jump_target(session))
       |> Kernel.++([
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "PasswordAuthentication=no",
+        "-o",
+        "PreferredAuthentications=publickey",
+        "-o",
+        "NumberOfPasswordPrompts=0",
         "-M",
         "-N",
         "-S",
@@ -230,6 +255,22 @@ defmodule HpcConnect.SSH do
   defp maybe_append_option(args, _flag, nil), do: args
   defp maybe_append_option(args, _flag, ""), do: args
   defp maybe_append_option(args, flag, value), do: args ++ [flag, value]
+
+  defp proxy_jump_target(%Session{} = session) do
+    cond do
+      is_nil(session.proxy_jump) or session.proxy_jump == "" ->
+        nil
+
+      String.contains?(session.proxy_jump, "@") ->
+        session.proxy_jump
+
+      session.username ->
+        "#{session.username}@#{session.proxy_jump}"
+
+      true ->
+        session.proxy_jump
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # Persistent Erlang :ssh connection
@@ -555,6 +596,14 @@ defmodule HpcConnect.SSH do
       "-N",
       "-L",
       "#{local_port}:#{target_host}:22",
+      "-o",
+      "IdentitiesOnly=yes",
+      "-o",
+      "PasswordAuthentication=no",
+      "-o",
+      "PreferredAuthentications=publickey",
+      "-o",
+      "NumberOfPasswordPrompts=0",
       "-o",
       "StrictHostKeyChecking=no",
       "-o",

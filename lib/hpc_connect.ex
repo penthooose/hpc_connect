@@ -771,7 +771,13 @@ defmodule HpcConnect do
 
   vLLM convenience controls (`app: "vllm"` only):
   - `:native_ssh` (default: `true`) ensures a persistent native `:ssh` session
-  - `:auto_proxy` (default: `false`) opens a local OpenSSH tunnel (legacy mode)
+  - `:native_ssh_fallback_to_os` (default: `false`) — when `true`, falls back
+    to managed OpenSSH commands/tunnel if native `:ssh` cannot connect
+  - `:auto_proxy` (default: `:auto`) where:
+      - `:auto` opens an OpenSSH tunnel only when native `:ssh` is unavailable
+      - `true` always opens an OpenSSH tunnel
+      - `false` keeps native-only access (no localhost proxy)
+    Local port is selected automatically unless `:local_port` is set.
   - `:local_port` optional fixed local tunnel port
   - `:wait_for_app` (default: `true`) waits for `/v1/models` to become reachable
   - `:app_ready_timeout_ms` (default: `600_000`)
@@ -785,6 +791,7 @@ defmodule HpcConnect do
       )
   """
   @slurm_keys [:partition, :gpus, :walltime, :cpus, :sif_name, :sif_path]
+  @pending_wait_table :hpc_connect_pending_waits
 
   @spec start_app(Session.t(), keyword()) :: map()
   def start_app(%Session{} = session, opts) do
@@ -792,20 +799,8 @@ defmodule HpcConnect do
     session = maybe_prepare_session_for_app(session, app, opts)
     app_upper = app |> to_string() |> String.upcase()
 
-    # Support both flat `args:` and legacy `slurm:` + `config:` forms.
-    {slurm_kw, config_kw} =
-      case Keyword.fetch(opts, :args) do
-        {:ok, args} ->
-          {Enum.filter(args, fn {k, _} -> k in @slurm_keys end),
-           Enum.reject(args, fn {k, _} -> k in @slurm_keys end)}
-
-        :error ->
-          slurm = Keyword.get(opts, :slurm, [])
-          config = Keyword.get(opts, :config, [])
-          {slurm, config}
-      end
-
-    port = Keyword.get(config_kw, :port, Keyword.get(slurm_kw, :port, 8000))
+    {slurm_kw, config_kw} = split_start_app_args(opts)
+    port = start_app_port(slurm_kw, config_kw)
 
     app_env =
       Map.new(config_kw, fn {k, v} ->
@@ -823,10 +818,48 @@ defmodule HpcConnect do
     |> maybe_attach_vllm_access(session, app, opts)
   end
 
+  @doc """
+  Reconnects to an already submitted/running app job without submitting a new one.
+
+  This is useful after `recompile()`, shell restart, or Livebook kernel restart when
+  the SLURM job is still alive.
+
+  Example:
+
+      HpcConnect.reconnect(session, 1591066,
+        app: "vllm",
+        args: [port: 50200]
+      )
+
+  For vLLM this returns the same enriched structure as `start_app/2` (including
+  `:base_url`, and optionally `:proxy`/`:tunnel_port` depending on access mode).
+  """
+  @spec reconnect(Session.t(), binary() | pos_integer(), keyword()) :: map()
+  def reconnect(%Session{} = session, job_id, opts) do
+    app = Keyword.fetch!(opts, :app)
+    session = maybe_prepare_session_for_app(session, app, opts)
+
+    {slurm_kw, config_kw} = split_start_app_args(opts)
+    job_id = to_string(job_id)
+
+    submitted =
+      %{job_id: job_id, port: start_app_port(slurm_kw, config_kw)}
+      |> maybe_put(:partition, Keyword.get(slurm_kw, :partition))
+      |> maybe_put(:gpus, Keyword.get(slurm_kw, :gpus))
+      |> maybe_put(:walltime, Keyword.get(slurm_kw, :walltime))
+      |> enrich_reconnect_submission(session, job_id, opts)
+
+    submitted
+    |> maybe_wait_for_allocation(session, Keyword.put_new(opts, :cancel_on_interrupt, false))
+    |> maybe_attach_vllm_access(session, app, opts)
+  end
+
   defp maybe_prepare_session_for_app(%Session{} = session, app, opts) do
     app_name = app |> to_string() |> String.downcase()
 
     if app_name == "vllm" and Keyword.get(opts, :native_ssh, true) and is_nil(session.ssh_conn) do
+      ensure_native_ssh_key_supported!(session, opts)
+
       try do
         {updated, _tunnel} =
           open_connection!(session,
@@ -837,10 +870,12 @@ defmodule HpcConnect do
         updated
       rescue
         e in RuntimeError ->
-          if Keyword.get(opts, :native_ssh_fallback_to_os, true) do
+          if Keyword.get(opts, :native_ssh_fallback_to_os, false) do
+            key_hint = native_ssh_key_hint(session)
+
             IO.puts(
               "Native Erlang SSH unavailable (#{Exception.message(e)}). " <>
-                "Falling back to managed OpenSSH commands/tunnel ..."
+                "Falling back to managed OpenSSH commands/tunnel ..." <> key_hint
             )
 
             session
@@ -850,6 +885,24 @@ defmodule HpcConnect do
       end
     else
       session
+    end
+  end
+
+  defp ensure_native_ssh_key_supported!(session, opts) do
+    # If the caller explicitly allows fallback, we can still attempt native first.
+    if Keyword.get(opts, :native_ssh_fallback_to_os, false) do
+      :ok
+    else
+      case native_ssh_key_format(session) do
+        :openssh ->
+          raise RuntimeError,
+                "native_ssh requires a PEM private key on this OTP build; " <>
+                  "the configured key is OPENSSH format. " <>
+                  "Use a PEM RSA/ECDSA key (or set native_ssh_fallback_to_os: true)."
+
+        _ ->
+          :ok
+      end
     end
   end
 
@@ -864,7 +917,24 @@ defmodule HpcConnect do
       timeout_ms = Keyword.get(opts, :node_poll_timeout_ms, :infinity)
       cancel_on_interrupt? = Keyword.get(opts, :cancel_on_interrupt, true)
 
-      IO.puts("Waiting for GPU allocation ...")
+      IO.puts("Submitted app job #{submitted.job_id}. Waiting for GPU allocation ...")
+
+      IO.puts(
+        "IEx stop: Ctrl+C then k. Manual cancel from another shell: HpcConnect.release_gpu(session, #{submitted.job_id})"
+      )
+
+      IO.puts(
+        "Or cancel all pending waits from another process in the same BEAM VM: HpcConnect.cancel_pending_waits()"
+      )
+
+      register_pending_wait(self(), session, submitted.job_id)
+
+      interrupt_guard =
+        if cancel_on_interrupt? do
+          start_interrupt_guard(session, submitted.job_id)
+        else
+          nil
+        end
 
       try do
         node =
@@ -880,6 +950,12 @@ defmodule HpcConnect do
           if cancel_on_interrupt?, do: safe_release_gpu(session, submitted.job_id)
           reraise e, __STACKTRACE__
       catch
+        :throw, {:hpc_connect_cancel_wait, reason} ->
+          if cancel_on_interrupt?, do: safe_release_gpu(session, submitted.job_id)
+
+          raise RuntimeError,
+                "GPU allocation wait canceled (#{reason}) for job #{submitted.job_id}"
+
         kind, value ->
           if cancel_on_interrupt?, do: safe_release_gpu(session, submitted.job_id)
 
@@ -888,6 +964,9 @@ defmodule HpcConnect do
             :throw -> throw(value)
             :error -> :erlang.error(value)
           end
+      after
+        stop_interrupt_guard(interrupt_guard)
+        unregister_pending_wait(self())
       end
     else
       submitted
@@ -904,40 +983,49 @@ defmodule HpcConnect do
 
     if app_name == "vllm" do
       submitted = Map.put_new(submitted, :session, session)
+      wait_for_node? = Keyword.get(opts, :wait_for_node, true)
 
-      node =
-        submitted.node ||
-          wait_for_job_node(session, submitted.job_id,
-            timeout: Keyword.get(opts, :proxy_wait_timeout_ms, 600_000),
-            interval: Keyword.get(opts, :node_poll_interval_ms, 10_000)
-          )
-
-      native_enriched =
+      if is_nil(submitted[:node]) and not wait_for_node? do
         submitted
-        |> Map.put(:node, node)
-        |> Map.put(:session, session)
-        |> Map.put(:port, submitted.port)
-        |> Map.put(:base_url, "http://#{node}:#{submitted.port}")
-        |> Map.put(:access_mode, :native_ssh)
-
-      use_proxy? = Keyword.get(opts, :auto_proxy, false) or is_nil(session.ssh_conn)
-
-      if use_proxy? do
-        proxy =
-          start_proxy(session, node, remote_port: submitted.port, local_port: opts[:local_port])
-
-        tunnel_port = open_proxy!(proxy)
-
-        enriched =
-          native_enriched
-          |> Map.put(:proxy, proxy)
-          |> Map.put(:tunnel_port, tunnel_port)
-          |> Map.put(:base_url, proxy.base_url)
-          |> Map.put(:access_mode, :openssh_proxy)
-
-        maybe_wait_for_vllm_ready(enriched, opts)
+        |> Map.put(:pending?, true)
+        |> Map.put(:access_mode, :pending_allocation)
       else
-        maybe_wait_for_vllm_ready(native_enriched, opts)
+        node =
+          submitted.node ||
+            wait_for_job_node(session, submitted.job_id,
+              timeout: Keyword.get(opts, :proxy_wait_timeout_ms, 600_000),
+              interval: Keyword.get(opts, :node_poll_interval_ms, 10_000)
+            )
+
+        native_enriched =
+          submitted
+          |> Map.put(:node, node)
+          |> Map.put(:session, session)
+          |> Map.put(:port, submitted.port)
+          |> Map.put(:base_url, "http://#{node}:#{submitted.port}")
+          |> Map.put(:access_mode, :native_ssh)
+
+        use_proxy? = auto_proxy_enabled?(session, opts)
+
+        if use_proxy? do
+          {proxy, tunnel_port} =
+            open_proxy_with_retry!(session, node,
+              remote_port: submitted.port,
+              local_port: opts[:local_port],
+              attempts: Keyword.get(opts, :proxy_open_attempts, 5)
+            )
+
+          enriched =
+            native_enriched
+            |> Map.put(:proxy, proxy)
+            |> Map.put(:tunnel_port, tunnel_port)
+            |> Map.put(:base_url, proxy.base_url)
+            |> Map.put(:access_mode, :openssh_proxy)
+
+          maybe_wait_for_vllm_ready(enriched, opts)
+        else
+          maybe_wait_for_vllm_ready(native_enriched, opts)
+        end
       end
     else
       submitted
@@ -972,7 +1060,7 @@ defmodule HpcConnect do
       nil ->
         if deadline == :infinity or System.monotonic_time(:millisecond) < deadline do
           IO.puts("Waiting for GPU allocation ...")
-          Process.sleep(interval_ms)
+          interruptible_sleep(interval_ms)
           do_wait_for_node_with_progress(session, job_id, interval_ms, deadline, connect_opts)
         else
           raise RuntimeError,
@@ -990,6 +1078,209 @@ defmodule HpcConnect do
     :ok
   rescue
     _ -> :ok
+  end
+
+  defp start_interrupt_guard(%Session{} = _session, job_id) when job_id in [nil, ""], do: nil
+
+  defp start_interrupt_guard(%Session{} = session, job_id) do
+    owner = self()
+
+    spawn(fn ->
+      ref = Process.monitor(owner)
+
+      receive do
+        :done ->
+          :ok
+
+        {:DOWN, ^ref, :process, ^owner, reason} ->
+          # If the caller process gets killed from the IEx break menu (`k`),
+          # ensure we still attempt to clean up the pending allocation.
+          if reason not in [:normal, :shutdown] do
+            safe_release_gpu(session, job_id)
+          end
+      end
+    end)
+  end
+
+  defp stop_interrupt_guard(nil), do: :ok
+
+  defp stop_interrupt_guard(pid) when is_pid(pid) do
+    send(pid, :done)
+    :ok
+  end
+
+  defp split_start_app_args(opts) do
+    case Keyword.fetch(opts, :args) do
+      {:ok, args} ->
+        {Enum.filter(args, fn {k, _} -> k in @slurm_keys end),
+         Enum.reject(args, fn {k, _} -> k in @slurm_keys end)}
+
+      :error ->
+        {Keyword.get(opts, :slurm, []), Keyword.get(opts, :config, [])}
+    end
+  end
+
+  defp start_app_port(slurm_kw, config_kw) do
+    Keyword.get(config_kw, :port, Keyword.get(slurm_kw, :port, 8000))
+  end
+
+  defp enrich_reconnect_submission(submitted, %Session{} = session, job_id, opts) do
+    connect_opts = Keyword.get(opts, :connect_opts, [])
+
+    job_entry =
+      session
+      |> list_jobs_summary(connect_opts: connect_opts)
+      |> Enum.find(fn row -> to_string(Map.get(row, :job_id)) == to_string(job_id) end)
+
+    case job_entry do
+      nil ->
+        submitted
+
+      row ->
+        submitted
+        |> Map.put_new(:partition, Map.get(row, :partition))
+        |> Map.put_new(:walltime, Map.get(row, :time_limit))
+        |> maybe_put(:node, normalize_squeue_node(Map.get(row, :node_list)))
+    end
+  rescue
+    _ -> submitted
+  end
+
+  defp normalize_squeue_node(nil), do: nil
+
+  defp normalize_squeue_node(value) when is_binary(value) do
+    value = String.trim(value)
+
+    cond do
+      value == "" -> nil
+      String.starts_with?(value, "(") -> nil
+      true -> value
+    end
+  end
+
+  defp normalize_squeue_node(_), do: nil
+
+  defp native_ssh_key_hint(%Session{identity_file: nil}), do: ""
+
+  defp native_ssh_key_hint(%Session{identity_file: path}) when is_binary(path) do
+    case File.read(path) do
+      {:ok, "-----BEGIN OPENSSH PRIVATE KEY-----" <> _rest} ->
+        " Native Erlang :ssh on this OTP build cannot parse OpenSSH private keys directly. " <>
+          "Use a PEM key for native_ssh (or keep fallback enabled)."
+
+      _ ->
+        ""
+    end
+  end
+
+  defp native_ssh_key_hint(_), do: ""
+
+  defp native_ssh_key_format(%Session{identity_file: path}) when is_binary(path) do
+    case File.read(path) do
+      {:ok, "-----BEGIN OPENSSH PRIVATE KEY-----" <> _rest} -> :openssh
+      {:ok, "-----BEGIN " <> _rest} -> :pem
+      _ -> :unknown
+    end
+  end
+
+  defp native_ssh_key_format(_), do: :unknown
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  @doc """
+  Cancels all currently pending `start_app/2` or `reconnect/3` allocation waits.
+
+  This is intended for interactive IEx workflows where keyboard interrupt handling
+  may not reliably stop a long-running wait.
+
+  Note: this helper works within the same BEAM VM (same IEx runtime).
+
+  Returns the number of waiters signaled for cancellation.
+  """
+  @spec cancel_pending_waits() :: non_neg_integer()
+  def cancel_pending_waits do
+    ensure_pending_wait_table()
+
+    @pending_wait_table
+    |> :ets.tab2list()
+    |> Enum.reduce(0, fn {pid, session, job_id}, acc ->
+      send(pid, {:hpc_connect_cancel_wait, :manual})
+      _ = safe_release_gpu_public(session, job_id)
+      acc + 1
+    end)
+  end
+
+  @doc """
+  Cancels a specific pending allocation waiter process.
+
+  Returns `:ok` when a waiter entry was found and signaled, otherwise `:not_found`.
+  """
+  @spec cancel_pending_wait(pid()) :: :ok | :not_found
+  def cancel_pending_wait(pid) when is_pid(pid) do
+    ensure_pending_wait_table()
+
+    case :ets.lookup(@pending_wait_table, pid) do
+      [{^pid, session, job_id}] ->
+        send(pid, {:hpc_connect_cancel_wait, :manual})
+        _ = safe_release_gpu_public(session, job_id)
+        :ok
+
+      _ ->
+        :not_found
+    end
+  end
+
+  defp ensure_pending_wait_table do
+    case :ets.whereis(@pending_wait_table) do
+      :undefined ->
+        :ets.new(@pending_wait_table, [:named_table, :public, :set])
+        :ok
+
+      _tid ->
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp register_pending_wait(pid, %Session{} = session, job_id)
+       when is_pid(pid) and job_id not in [nil, ""] do
+    ensure_pending_wait_table()
+    :ets.insert(@pending_wait_table, {pid, session, job_id})
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp register_pending_wait(_pid, _session, _job_id), do: :ok
+
+  defp unregister_pending_wait(pid) when is_pid(pid) do
+    case :ets.whereis(@pending_wait_table) do
+      :undefined -> :ok
+      _ ->
+        :ets.delete(@pending_wait_table, pid)
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
+
+  defp safe_release_gpu_public(%Session{} = session, job_id) do
+    _ = release_gpu(session, job_id)
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  defp auto_proxy_enabled?(%Session{} = session, opts) do
+    case Keyword.get(opts, :auto_proxy, :auto) do
+      true -> true
+      false -> false
+      :auto -> is_nil(session.ssh_conn)
+      nil -> is_nil(session.ssh_conn)
+      _other -> is_nil(session.ssh_conn)
+    end
   end
 
   defp maybe_opt(kw, key) do
@@ -1061,7 +1352,7 @@ defmodule HpcConnect do
   defp wait_or_timeout(base_url, interval_ms, deadline, request_fun) do
     if deadline == :infinity or System.monotonic_time(:millisecond) < deadline do
       IO.puts("Waiting for vLLM API readiness ...")
-      Process.sleep(interval_ms)
+      interruptible_sleep(interval_ms)
       do_wait_for_vllm_ready(base_url, interval_ms, deadline, request_fun)
     else
       raise RuntimeError,
@@ -1101,6 +1392,7 @@ defmodule HpcConnect do
     command = SSH.port_forward_command(session, node, local_port, remote_port)
 
     %{
+      session: session,
       local_port: local_port,
       remote_port: remote_port,
       node: node,
@@ -1132,6 +1424,40 @@ defmodule HpcConnect do
 
   def open_proxy!(%{command: %Command{binary: binary, args: args}}) do
     Port.open({:spawn_executable, binary}, [:binary, :exit_status, :stderr_to_stdout, args: args])
+  end
+
+  defp open_proxy_with_retry!(%Session{} = session, node, opts) do
+    attempts = max(1, Keyword.get(opts, :attempts, 5))
+    requested_local_port = Keyword.get(opts, :local_port)
+    remote_port = Keyword.get(opts, :remote_port, 8000)
+
+    do_open_proxy_with_retry!(session, node, remote_port, requested_local_port, attempts)
+  end
+
+  defp do_open_proxy_with_retry!(_session, _node, _remote_port, _requested_local_port, 0) do
+    raise RuntimeError, "failed to open SSH proxy after multiple local port attempts"
+  end
+
+  defp do_open_proxy_with_retry!(session, node, remote_port, requested_local_port, attempts_left) do
+    local_port =
+      if attempts_left == 1 and is_integer(requested_local_port) do
+        requested_local_port
+      else
+        requested_local_port || SSH.find_free_local_port()
+      end
+
+    proxy = start_proxy(session, node, remote_port: remote_port, local_port: local_port)
+
+    try do
+      {proxy, open_proxy!(proxy)}
+    rescue
+      err in RuntimeError ->
+        if attempts_left > 1 do
+          do_open_proxy_with_retry!(session, node, remote_port, nil, attempts_left - 1)
+        else
+          reraise err, __STACKTRACE__
+        end
+    end
   end
 
   defp wait_for_local_proxy_port!(port, local_port, timeout_ms, waited \\ 0)
@@ -1751,6 +2077,23 @@ defmodule HpcConnect do
   defp maybe_cancel_job(session, job_id) do
     cancel_job(session, job_id)
     :ok
+  end
+
+  # Sleep in small chunks so interactive interrupts (Ctrl+C in IEx) are handled promptly.
+  defp interruptible_sleep(ms) when not is_integer(ms) or ms <= 0, do: :ok
+
+  defp interruptible_sleep(ms) do
+    step = min(ms, 200)
+
+    receive do
+      {:hpc_connect_cancel_wait, reason} ->
+        throw({:hpc_connect_cancel_wait, reason})
+
+    after
+      step -> :ok
+    end
+
+    interruptible_sleep(ms - step)
   end
 
   @doc """
