@@ -901,7 +901,12 @@ defmodule HpcConnect.Slurm do
 
     if is_binary(local_def_path) do
       remote_path = remote_def_path(session, name)
-      upload_with_retry!(session, local_def_path, remote_path, [])
+
+      upload_with_retry!(session, local_def_path, remote_path,
+        normalize_line_endings: :lf,
+        normalize_extensions: [".def"]
+      )
+
       remote_path
     else
       local_dir = Path.join([to_string(:code.priv_dir(:hpc_connect)), "def_files"])
@@ -914,7 +919,10 @@ defmodule HpcConnect.Slurm do
         def_name = Path.basename(file, ".def")
         remote_path = remote_def_path(session, def_name)
 
-        upload_with_retry!(session, local_path, remote_path, [])
+        upload_with_retry!(session, local_path, remote_path,
+          normalize_line_endings: :lf,
+          normalize_extensions: [".def"]
+        )
       end)
 
       remote_def_path(session, name)

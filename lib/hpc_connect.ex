@@ -640,7 +640,7 @@ defmodule HpcConnect do
   """
   @spec command_preview(Command.t()) :: binary()
   def command_preview(%Command{binary: binary, args: args}) do
-    Enum.join([binary | Enum.map(args, &SSH.preview_arg/1)], " ")
+    Enum.join([SSH.preview_binary(binary) | Enum.map(args, &SSH.preview_arg/1)], " ")
   end
 
   @doc """
@@ -1101,9 +1101,32 @@ defmodule HpcConnect do
   def install_remote_scripts!(session, opts \\ [])
 
   def install_remote_scripts!(%Session{ssh_conn: nil} = session, opts) do
-    session
-    |> Scripts.install_commands(opts)
-    |> Enum.each(&run_command_with_retry!/1)
+    remote_root = session.work_dir
+    remote_scripts = Scripts.remote_script_dir(session)
+
+    run_command_with_retry!(
+      SSH.ssh_command(
+        session,
+        "mkdir -p #{Shell.escape(remote_root)} #{Shell.escape(remote_scripts)}",
+        "Create remote hpc_connect directories"
+      )
+    )
+
+    SSH.upload!(session, Scripts.local_script_dir(), remote_root,
+      recursive: true,
+      normalize_line_endings: :lf,
+      normalize_extensions: [".sh"]
+    )
+
+    if Keyword.get(opts, :reset_permission, false) do
+      run_command_with_retry!(
+        SSH.ssh_command(
+          session,
+          "chmod 755 #{Shell.escape(session.work_dir)} #{Shell.escape(remote_scripts)}",
+          "Ensure read/write/execute permissions on hpc_connect dirs"
+        )
+      )
+    end
 
     :ok
   end
@@ -1111,7 +1134,12 @@ defmodule HpcConnect do
   def install_remote_scripts!(%Session{} = session, opts) do
     scripts_dir = Path.join([:code.priv_dir(:hpc_connect), "scripts"])
     remote_dir = session.work_dir <> "/scripts"
-    SSH.upload!(session, scripts_dir, remote_dir, recursive: true)
+
+    SSH.upload!(session, scripts_dir, remote_dir,
+      recursive: true,
+      normalize_line_endings: :lf,
+      normalize_extensions: [".sh"]
+    )
 
     if Keyword.get(opts, :reset_permission, false) do
       SSH.exec!(

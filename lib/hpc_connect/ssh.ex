@@ -54,6 +54,15 @@ defmodule HpcConnect.SSH do
     end
   end
 
+  @doc false
+  @spec preview_binary(binary()) :: binary()
+  def preview_binary(binary) do
+    binary
+    |> to_string()
+    |> Path.basename()
+    |> preview_arg()
+  end
+
   @spec ssh_binary() :: binary()
   def ssh_binary, do: System.find_executable("ssh") || "ssh"
 
@@ -106,12 +115,7 @@ defmodule HpcConnect.SSH do
   @spec native_compute_tunnel_preview(Session.t(), binary(), pos_integer(), pos_integer() | nil) ::
           binary()
   def native_compute_tunnel_preview(%Session{} = session, node, remote_port, local_port \\ nil) do
-    # Use the explicit user@hostname for the jump to show the direct-to-login-node path.
-    login_jump_target =
-      case session.username do
-        u when is_binary(u) and u != "" -> "#{u}@#{session.cluster.host}"
-        _ -> session.cluster.host
-      end
+    jump_chain_target = compute_jump_target(session)
 
     compute_target =
       case session.username do
@@ -125,7 +129,7 @@ defmodule HpcConnect.SSH do
     args =
       []
       |> maybe_append_option("-i", session.identity_file)
-      |> maybe_append_option("-J", login_jump_target)
+      |> maybe_append_option("-J", jump_chain_target)
       |> Kernel.++(maybe_user_known_hosts_args(session))
       |> Kernel.++([
         "-o",
@@ -171,13 +175,10 @@ defmodule HpcConnect.SSH do
   """
   @spec port_forward_command(Session.t(), binary(), pos_integer(), pos_integer()) :: Command.t()
   def port_forward_command(%Session{} = session, node, local_port, remote_port) do
-    # Use the explicit user@hostname (not the ssh_alias) so the OS tunnel connects
-    # directly to the login node without going through ~/.ssh/config ProxyJump entries.
-    login_jump_target =
-      case session.username do
-        u when is_binary(u) and u != "" -> "#{u}@#{session.cluster.host}"
-        _ -> session.cluster.host
-      end
+    # Use an explicit jump chain so port forwarding works without depending on
+    # any generated ssh_config file. For FAU clusters this may be:
+    #   user@csnhr,user@alex
+    jump_chain_target = compute_jump_target(session)
 
     compute_target =
       case session.username do
@@ -188,7 +189,7 @@ defmodule HpcConnect.SSH do
     args =
       []
       |> maybe_append_option("-i", session.identity_file)
-      |> maybe_append_option("-J", login_jump_target)
+      |> maybe_append_option("-J", jump_chain_target)
       |> Kernel.++(maybe_user_known_hosts_args(session))
       |> Kernel.++([
         ["-o", "BatchMode=yes"],
@@ -212,7 +213,7 @@ defmodule HpcConnect.SSH do
       binary: ssh_binary(),
       args: args,
       summary:
-        "Tunnel localhost:#{local_port} -> #{node}:#{remote_port} via jump #{login_jump_target}",
+        "Tunnel localhost:#{local_port} -> #{node}:#{remote_port} via jump #{jump_chain_target}",
       remote_command: nil
     }
   end
@@ -354,7 +355,7 @@ defmodule HpcConnect.SSH do
   defp maybe_append_option(args, flag, value), do: args ++ [flag, value]
 
   defp preview_command(binary, args) do
-    ([binary] ++ args)
+    ([preview_binary(binary)] ++ args)
     |> Enum.map(&preview_arg(to_string(&1)))
     |> Enum.join(" ")
   end
@@ -371,6 +372,15 @@ defmodule HpcConnect.SSH do
   end
 
   defp include_explicit_proxy_jump?(_session), do: true
+
+  defp compute_jump_target(%Session{} = session) do
+    login_target = direct_login_target(session)
+
+    case proxy_jump_target(session) do
+      nil -> login_target
+      jump -> "#{jump},#{login_target}"
+    end
+  end
 
   defp open_master_args(%Session{} = session, socket_path) do
     proxy_jump =
@@ -1189,17 +1199,23 @@ defmodule HpcConnect.SSH do
   def upload!(%Session{ssh_conn: nil} = session, local_path, remote_path, opts) do
     recursive? = Keyword.get(opts, :recursive, false)
 
-    cmd =
-      scp_to_command(session, local_path, remote_path, "upload #{local_path}",
-        recursive: recursive?
-      )
+    {upload_path, cleanup_dir} = prepare_upload_source(local_path, recursive?, opts)
 
-    {output, status} = run(cmd)
+    try do
+      cmd =
+        scp_to_command(session, upload_path, remote_path, "upload #{local_path}",
+          recursive: recursive?
+        )
 
-    if status == 0 do
-      :ok
-    else
-      raise RuntimeError, "scp failed (status #{status}): #{String.trim(output)}"
+      {output, status} = run(cmd)
+
+      if status == 0 do
+        :ok
+      else
+        raise RuntimeError, "scp failed (status #{status}): #{String.trim(output)}"
+      end
+    after
+      cleanup_upload_source(cleanup_dir)
     end
   end
 
@@ -1211,9 +1227,9 @@ defmodule HpcConnect.SSH do
 
     try do
       if recursive? and File.dir?(local_path) do
-        sftp_upload_dir(sftp, local_path, remote_path, timeout)
+        sftp_upload_dir(sftp, local_path, remote_path, timeout, opts)
       else
-        sftp_upload_file(sftp, local_path, remote_path, timeout)
+        sftp_upload_file(sftp, local_path, remote_path, timeout, opts)
       end
     after
       :ssh_sftp.stop_channel(sftp)
@@ -1223,7 +1239,7 @@ defmodule HpcConnect.SSH do
   end
 
   # Recursively uploads a directory tree via SFTP.
-  defp sftp_upload_dir(sftp, local_dir, remote_dir, timeout) do
+  defp sftp_upload_dir(sftp, local_dir, remote_dir, timeout, opts) do
     sftp_mkdir_p(sftp, remote_dir, timeout)
 
     File.ls!(local_dir)
@@ -1232,15 +1248,18 @@ defmodule HpcConnect.SSH do
       remote_child = remote_dir <> "/" <> name
 
       if File.dir?(local_child) do
-        sftp_upload_dir(sftp, local_child, remote_child, timeout)
+        sftp_upload_dir(sftp, local_child, remote_child, timeout, opts)
       else
-        sftp_upload_file(sftp, local_child, remote_child, timeout)
+        sftp_upload_file(sftp, local_child, remote_child, timeout, opts)
       end
     end)
   end
 
-  defp sftp_upload_file(sftp, local_path, remote_path, timeout) do
-    data = File.read!(local_path)
+  defp sftp_upload_file(sftp, local_path, remote_path, timeout, opts) do
+    data =
+      local_path
+      |> File.read!()
+      |> maybe_normalize_upload_data(local_path, opts)
 
     case :ssh_sftp.write_file(sftp, String.to_charlist(remote_path), data, timeout) do
       :ok ->
@@ -1340,6 +1359,95 @@ defmodule HpcConnect.SSH do
   end
 
   defp maybe_user_known_hosts_args(_session), do: []
+
+  @doc false
+  @spec normalize_line_endings(binary(), :lf | nil) :: binary()
+  def normalize_line_endings(data, :lf) when is_binary(data) do
+    data
+    |> String.replace("\r\n", "\n")
+    |> String.replace("\r", "\n")
+  end
+
+  def normalize_line_endings(data, _mode), do: data
+
+  defp prepare_upload_source(local_path, recursive?, opts) do
+    if normalize_upload?(local_path, recursive?, opts) do
+      temp_root =
+        Path.join(
+          System.tmp_dir!(),
+          "hpc_connect_upload_#{System.system_time(:millisecond)}_#{System.unique_integer([:positive])}"
+        )
+
+      staged_path = Path.join(temp_root, Path.basename(local_path))
+      File.mkdir_p!(temp_root)
+
+      if recursive? and File.dir?(local_path) do
+        stage_upload_dir(local_path, staged_path, opts)
+      else
+        stage_upload_file(local_path, staged_path, opts)
+      end
+
+      {staged_path, temp_root}
+    else
+      {local_path, nil}
+    end
+  end
+
+  defp cleanup_upload_source(nil), do: :ok
+  defp cleanup_upload_source(path), do: File.rm_rf(path)
+
+  defp normalize_upload?(local_path, recursive?, opts) do
+    case Keyword.get(opts, :normalize_line_endings) do
+      :lf -> recursive? or upload_path_matches_extension?(local_path, opts)
+      _ -> false
+    end
+  end
+
+  defp stage_upload_dir(source_dir, target_dir, opts) do
+    File.mkdir_p!(target_dir)
+
+    File.ls!(source_dir)
+    |> Enum.each(fn name ->
+      source_child = Path.join(source_dir, name)
+      target_child = Path.join(target_dir, name)
+
+      if File.dir?(source_child) do
+        stage_upload_dir(source_child, target_child, opts)
+      else
+        stage_upload_file(source_child, target_child, opts)
+      end
+    end)
+  end
+
+  defp stage_upload_file(source_path, target_path, opts) do
+    File.mkdir_p!(Path.dirname(target_path))
+
+    data =
+      source_path
+      |> File.read!()
+      |> maybe_normalize_upload_data(source_path, opts)
+
+    File.write!(target_path, data)
+  end
+
+  defp maybe_normalize_upload_data(data, local_path, opts) do
+    if upload_path_matches_extension?(local_path, opts) do
+      normalize_line_endings(data, Keyword.get(opts, :normalize_line_endings))
+    else
+      data
+    end
+  end
+
+  defp upload_path_matches_extension?(path, opts) do
+    extensions =
+      opts
+      |> Keyword.get(:normalize_extensions, [])
+      |> Enum.map(&String.downcase/1)
+
+    ext = path |> Path.extname() |> String.downcase()
+
+    extensions == [] or ext in extensions
+  end
 
   defp proxy_jump_identity(%Session{} = session) do
     jump_raw =
