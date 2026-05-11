@@ -198,7 +198,7 @@ defmodule HpcConnect.SSH do
         ["-o", "PasswordAuthentication=no"],
         ["-o", "PreferredAuthentications=publickey"],
         ["-o", "NumberOfPasswordPrompts=0"],
-        ["-o", "ConnectTimeout=30"],
+        ["-o", "ConnectTimeout=120"],
         ["-o", "ExitOnForwardFailure=yes"],
         ["-o", "StrictHostKeyChecking=accept-new"],
         ["-o", "ServerAliveInterval=30"],
@@ -252,7 +252,7 @@ defmodule HpcConnect.SSH do
           "-o",
           "NumberOfPasswordPrompts=0",
           "-o",
-          "ConnectTimeout=30"
+          "ConnectTimeout=120"
         ]
 
     case session.master_socket do
@@ -283,7 +283,7 @@ defmodule HpcConnect.SSH do
           "-o",
           "NumberOfPasswordPrompts=0",
           "-o",
-          "ConnectTimeout=30"
+          "ConnectTimeout=120"
         ]
 
     case session.master_socket do
@@ -408,7 +408,7 @@ defmodule HpcConnect.SSH do
       "-o",
       "NumberOfPasswordPrompts=0",
       "-o",
-      "ConnectTimeout=30",
+      "ConnectTimeout=120",
       "-o",
       "StrictHostKeyChecking=accept-new",
       "-o",
@@ -467,15 +467,15 @@ defmodule HpcConnect.SSH do
   Close with `close_connection/1`.
 
   Options:
-  - `:timeout` (ms, default 20_000)
-  - `:proxy_jump_via_native` (default `true`)
+  - `:timeout` (ms, default 30_000)
+  - `:proxy_jump_via_native` (default `false`)
   - `:proxy_jump_via_os` (default `false`)
   """
   @spec open_connection!(Session.t(), keyword()) :: {Session.t(), port() | nil}
   def open_connection!(%Session{} = session, opts \\ []) do
-    timeout = Keyword.get(opts, :timeout, 20_000)
+    timeout = Keyword.get(opts, :timeout, 30_000)
     attempts = Keyword.get(opts, :attempts, 3)
-    proxy_jump_via_native = Keyword.get(opts, :proxy_jump_via_native, true)
+    proxy_jump_via_native = Keyword.get(opts, :proxy_jump_via_native, false)
     proxy_jump_via_os = Keyword.get(opts, :proxy_jump_via_os, false)
 
     # Suppress :ssh application logger output during connection attempts.
