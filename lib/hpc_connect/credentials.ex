@@ -242,13 +242,13 @@ defmodule HpcConnect.Credentials do
         "Host #{Enum.join(aliases, " ")}",
         "  HostName #{cluster.host}",
         "  User #{username}",
-        "  IdentityFile #{identity_file}",
+        "  IdentityFile #{render_local_config_path(identity_file)}",
         "  IdentitiesOnly yes",
         "  PasswordAuthentication no",
         "  PreferredAuthentications publickey",
         "  ForwardX11 no",
         "  ForwardX11Trusted no",
-        "  UserKnownHostsFile #{known_hosts_file}",
+        "  UserKnownHostsFile #{render_local_config_path(known_hosts_file)}",
         "  StrictHostKeyChecking accept-new"
       ]
       |> maybe_append_proxy_jump(cluster.proxy_jump, username)
@@ -285,6 +285,19 @@ defmodule HpcConnect.Credentials do
     case :os.type() do
       {:win32, _} -> :ok
       _ -> File.chmod(path, 0o600)
+    end
+  end
+
+  defp render_local_config_path(path) when is_binary(path) do
+    rendered =
+      path
+      |> String.replace("\\", "/")
+      |> String.replace("\"", "\\\"")
+
+    if String.contains?(rendered, [" ", "\t"]) do
+      ~s("#{rendered}")
+    else
+      rendered
     end
   end
 end

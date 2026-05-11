@@ -137,6 +137,46 @@ defmodule HpcConnectTest do
     refute File.exists?(uploaded_key_path)
   end
 
+  test "render_config quotes local SSH paths with spaces" do
+    config =
+      HpcConnect.Credentials.render_config(
+        [HpcConnect.cluster!(:fritz)],
+        "hpcusr01",
+        "C:\\tmp\\team key",
+        "C:\\tmp\\known hosts"
+      )
+
+    assert config =~ ~s(IdentityFile "C:/tmp/team key")
+    assert config =~ ~s(UserKnownHostsFile "C:/tmp/known hosts")
+  end
+
+  test "livebook master preview avoids generated ssh config recursion" do
+    tmp_dir =
+      Path.join([
+        System.tmp_dir!(),
+        "livebook",
+        "test_session",
+        "registered_files"
+      ])
+
+    File.mkdir_p!(tmp_dir)
+
+    uploaded_key_path = Path.join(tmp_dir, "id_team_master_preview")
+    File.write!(uploaded_key_path, "FAKE_PRIVATE_KEY")
+
+    session = HpcConnect.new_livebook_session(:alex, "hpcusr01", uploaded_key_path)
+    preview = HpcConnect.SSH.master_command_preview(session, "/tmp/hpc_ctl_test")
+
+    assert preview =~ "-F"
+    assert preview =~ session.ssh_config_file
+    refute preview =~ " -J "
+    assert preview =~ "BatchMode=yes"
+    assert preview =~ "ControlPersist=no"
+
+    assert :ok == HpcConnect.cleanup_session(session, delete_uploaded: true)
+    refute File.exists?(uploaded_key_path)
+  end
+
   test "runs one-call livebook connect workflow" do
     tmp_dir =
       Path.join([

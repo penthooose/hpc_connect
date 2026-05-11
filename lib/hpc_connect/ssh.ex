@@ -151,6 +151,12 @@ defmodule HpcConnect.SSH do
     preview_command(ssh_binary(), args)
   end
 
+  @doc false
+  @spec master_command_preview(Session.t(), binary()) :: binary()
+  def master_command_preview(%Session{} = session, socket_path \\ "<socket>") do
+    preview_command(ssh_binary(), open_master_args(session, socket_path))
+  end
+
   @doc """
   Builds an SSH local port-forwarding command.
 
@@ -306,28 +312,7 @@ defmodule HpcConnect.SSH do
         "hpc_ctl_#{:erlang.unique_integer([:positive, :monotonic])}"
       )
 
-    args =
-      []
-      |> maybe_append_option("-i", session.identity_file)
-      |> maybe_append_option("-F", session.ssh_config_file)
-      |> maybe_append_option("-J", proxy_jump_target(session))
-      |> Kernel.++([
-        "-o",
-        "IdentitiesOnly=yes",
-        "-o",
-        "PasswordAuthentication=no",
-        "-o",
-        "PreferredAuthentications=publickey",
-        "-o",
-        "NumberOfPasswordPrompts=0",
-        "-M",
-        "-N",
-        "-S",
-        socket_path,
-        "-o",
-        "ControlPersist=no",
-        Session.target(session)
-      ])
+    args = open_master_args(session, socket_path)
 
     port =
       case TunnelManager.open_port(ssh_binary(), args, [:binary, :exit_status, :stderr_to_stdout]) do
@@ -386,6 +371,42 @@ defmodule HpcConnect.SSH do
   end
 
   defp include_explicit_proxy_jump?(_session), do: true
+
+  defp open_master_args(%Session{} = session, socket_path) do
+    proxy_jump =
+      if include_explicit_proxy_jump?(session), do: proxy_jump_target(session), else: nil
+
+    []
+    |> maybe_append_option("-i", session.identity_file)
+    |> maybe_append_option("-F", session.ssh_config_file)
+    |> maybe_append_option("-J", proxy_jump)
+    |> Kernel.++(maybe_user_known_hosts_args(session))
+    |> Kernel.++([
+      "-o",
+      "BatchMode=yes",
+      "-o",
+      "IdentitiesOnly=yes",
+      "-o",
+      "PasswordAuthentication=no",
+      "-o",
+      "PreferredAuthentications=publickey",
+      "-o",
+      "NumberOfPasswordPrompts=0",
+      "-o",
+      "ConnectTimeout=30",
+      "-o",
+      "StrictHostKeyChecking=accept-new",
+      "-o",
+      "LogLevel=ERROR",
+      "-M",
+      "-N",
+      "-S",
+      socket_path,
+      "-o",
+      "ControlPersist=no",
+      Session.target(session)
+    ])
+  end
 
   defp proxy_jump_target(%Session{} = session) do
     cond do
