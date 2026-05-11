@@ -184,7 +184,7 @@ defmodule HpcConnectTest do
       summary: "preview"
     }
 
-    assert HpcConnect.command_preview(command) == "ssh.exe -V"
+    assert HpcConnect.command_preview(command) == "ssh -V"
   end
 
   test "SSH.normalize_line_endings converts CRLF to LF" do
@@ -382,12 +382,12 @@ defmodule HpcConnectTest do
     assert opts[:uploaded_key_path] == Path.expand(uploaded_key_path)
     assert opts[:uploaded_filename] == "id_team_prepare_livebook"
     assert opts[:remote_command] == "hostname && whoami"
-    assert opts[:work_dir] == "$HOME/.cache/hpc_connect"
-    assert opts[:vault_dir] == "$HOME/vault/hpc_connect"
+    refute Keyword.has_key?(opts, :work_dir)
+    refute Keyword.has_key?(opts, :vault_dir)
     assert opts[:ui_rendered?] == false
   end
 
-  test "livebook placeholder work_dir and vault_dir are normalized to absolute user paths" do
+  test "livebook ignores explicit work_dir and vault_dir overrides and derives defaults" do
     tmp_dir =
       Path.join([
         System.tmp_dir!(),
@@ -480,7 +480,7 @@ defmodule HpcConnectTest do
     refute File.exists?(uploaded_key_path)
   end
 
-  test "livebook proxy tunnel command uses explicit jump chain without generated ssh config recursion" do
+  test "livebook proxy tunnel command uses direct login jump without generated ssh config recursion" do
     tmp_dir =
       Path.join([
         System.tmp_dir!(),
@@ -503,7 +503,6 @@ defmodule HpcConnectTest do
     assert preview =~ session.known_hosts_file
     assert preview =~ "UserKnownHostsFile=#{session.known_hosts_file}"
     assert preview =~ "-J"
-    assert preview =~ "hpcusr01@csnhr.nhr.fau.de"
     assert preview =~ "hpcusr01@alex.nhr.fau.de"
     assert preview =~ "hpcusr01@a0705"
 

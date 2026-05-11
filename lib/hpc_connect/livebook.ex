@@ -26,8 +26,6 @@ defmodule HpcConnect.Livebook do
       known_hosts_file: credentials.known_hosts_file,
       credential_dir: credentials.credential_dir,
       proxy_jump: nil,
-      work_dir: Keyword.get(opts, :work_dir),
-      vault_dir: Keyword.get(opts, :vault_dir),
       port_range: Keyword.get(opts, :port_range)
     ]
 
@@ -54,13 +52,12 @@ defmodule HpcConnect.Livebook do
   - `:uploaded_key_path` – optional direct uploaded-key path to skip UI
   - `:uploaded_filename` – optional display name for the uploaded key
   - `:remote_command` – probe command (default: `"hostname && whoami"`)
-  - `:work_dir`, `:vault_dir` – optional directory overrides
   - `:submit_label` – submit button label for the form
   - `:persist_form` – when `true`, persist non-secret form defaults for reuse
   - `:persist_path` – custom path for persisted defaults
 
-  Persisted defaults include cluster, username, remote command, work dir, and
-  vault dir. The uploaded SSH key itself is intentionally never persisted.
+  Persisted defaults include cluster, username, and remote command.
+  The uploaded SSH key itself is intentionally never persisted.
   """
   @spec prepare_session(keyword()) :: keyword()
   def prepare_session(opts \\ []) do
@@ -78,9 +75,7 @@ defmodule HpcConnect.Livebook do
             cluster: direct_cluster,
             uploaded_key_path: direct_key_path,
             uploaded_filename: direct_uploaded_filename,
-            remote_command: Keyword.get(opts, :remote_command),
-            work_dir: Keyword.get(opts, :work_dir),
-            vault_dir: Keyword.get(opts, :vault_dir)
+            remote_command: Keyword.get(opts, :remote_command)
           },
           false
         )
@@ -106,7 +101,7 @@ defmodule HpcConnect.Livebook do
   Shared options:
   - `:cluster` (default: `"fritz"`)
   - `:remote_command` (default: `"hostname && whoami"`)
-  - `:work_dir`, `:vault_dir`, `:port_range`
+  - `:port_range`
   - `:connect_fun`, `:connect_opts`
   """
   @spec connection_setup(keyword()) :: map()
@@ -388,29 +383,13 @@ defmodule HpcConnect.Livebook do
             Keyword.get(opts, :remote_command, @default_remote_command)
       )
 
-    work_dir_input =
-      kino_input_text("Remote work_dir",
-        default:
-          persisted["work_dir"] || Keyword.get(opts, :work_dir) ||
-            default_work_dir(default_cluster) || ""
-      )
-
-    vault_dir_input =
-      kino_input_text("Remote vault_dir",
-        default:
-          persisted["vault_dir"] || Keyword.get(opts, :vault_dir) ||
-            default_vault_dir(default_cluster) || ""
-      )
-
     form =
       kino_control_form(
         [
           cluster: cluster_input,
           username: username_input,
           ssh_key: upload_input,
-          remote_command: remote_command_input,
-          work_dir: work_dir_input,
-          vault_dir: vault_dir_input
+          remote_command: remote_command_input
         ],
         submit: Keyword.get(opts, :submit_label, @default_submit_label)
       )
@@ -463,9 +442,7 @@ defmodule HpcConnect.Livebook do
         cluster: Map.get(data, :cluster),
         uploaded_key_path: uploaded_key_path_from_form!(Map.get(data, :ssh_key)),
         uploaded_filename: uploaded_filename_from_form(Map.get(data, :ssh_key)),
-        remote_command: Map.get(data, :remote_command),
-        work_dir: Map.get(data, :work_dir),
-        vault_dir: Map.get(data, :vault_dir)
+        remote_command: Map.get(data, :remote_command)
       },
       true
     )
@@ -496,14 +473,14 @@ defmodule HpcConnect.Livebook do
       |> default_if_blank(@default_remote_command)
 
     opts
+    |> Keyword.delete(:work_dir)
+    |> Keyword.delete(:vault_dir)
     |> Keyword.put(:mode, :livebook)
     |> Keyword.put(:cluster, cluster)
     |> Keyword.put(:username, username)
     |> Keyword.put(:uploaded_key_path, uploaded_key_path)
     |> Keyword.put(:uploaded_filename, uploaded_filename)
     |> Keyword.put(:remote_command, remote_command)
-    |> put_optional_kw(:work_dir, Map.get(values, :work_dir, Keyword.get(opts, :work_dir)))
-    |> put_optional_kw(:vault_dir, Map.get(values, :vault_dir, Keyword.get(opts, :vault_dir)))
     |> Keyword.put(:ui_rendered?, ui_rendered?)
   end
 
@@ -613,33 +590,6 @@ defmodule HpcConnect.Livebook do
     end)
   end
 
-  defp default_work_dir(cluster_choice) do
-    cluster_choice
-    |> resolve_cluster_choice_default()
-    |> case do
-      %Cluster{default_work_dir: work_dir} -> work_dir
-      _ -> nil
-    end
-  end
-
-  defp default_vault_dir(cluster_choice) do
-    cluster_choice
-    |> resolve_cluster_choice_default()
-    |> case do
-      %Cluster{vault_dir: vault_dir} -> vault_dir
-      _ -> nil
-    end
-  end
-
-  defp resolve_cluster_choice_default(nil), do: nil
-  defp resolve_cluster_choice_default(value) when is_atom(value), do: Cluster.fetch!(value)
-
-  defp resolve_cluster_choice_default(value) when is_binary(value) do
-    value
-    |> resolve_cluster_choice()
-    |> resolve_cluster_choice_default()
-  end
-
   defp load_prepare_defaults(opts) do
     if persist_prepare_defaults?(opts) do
       path = prepare_defaults_path(opts)
@@ -661,9 +611,7 @@ defmodule HpcConnect.Livebook do
       defaults = %{
         "cluster" => cluster_value_for_persistence(Map.get(data, :cluster)),
         "username" => normalize_optional_text(Map.get(data, :username)),
-        "remote_command" => normalize_optional_text(Map.get(data, :remote_command)),
-        "work_dir" => normalize_optional_text(Map.get(data, :work_dir)),
-        "vault_dir" => normalize_optional_text(Map.get(data, :vault_dir))
+        "remote_command" => normalize_optional_text(Map.get(data, :remote_command))
       }
 
       path = prepare_defaults_path(opts)
@@ -713,13 +661,6 @@ defmodule HpcConnect.Livebook do
     case normalize_optional_text(value) do
       nil -> default
       normalized -> normalized
-    end
-  end
-
-  defp put_optional_kw(opts, key, value) do
-    case normalize_optional_text(value) do
-      nil -> Keyword.delete(opts, key)
-      normalized -> Keyword.put(opts, key, normalized)
     end
   end
 

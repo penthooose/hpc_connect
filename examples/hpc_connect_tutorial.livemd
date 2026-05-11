@@ -20,8 +20,6 @@ boot =
 	HpcConnect.prepare_livebook_session(
 		cluster: :alex,
 		remote_command: "hostname && whoami",
-		work_dir: "$HOME/.cache/hpc_connect",
-		vault_dir: "$HOME/vault/hpc_connect",
 		persist_form: true,
 		submit_label: "Connect to HPC"
 	)
