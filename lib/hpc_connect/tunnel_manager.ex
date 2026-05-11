@@ -5,7 +5,6 @@ defmodule HpcConnect.TunnelManager do
   (and any linked Ports) dies immediately after the cell completes.
   """
   use GenServer
-  require Logger
 
   @name __MODULE__
   @max_output_chars 16_384
@@ -126,10 +125,6 @@ defmodule HpcConnect.TunnelManager do
   def handle_info({port, {:exit_status, status}}, state) when is_port(port) do
     cmd = state |> Map.get(port, %{command: "unknown command"}) |> Map.get(:command)
 
-    Logger.debug(
-      "[HpcConnect.TunnelManager] Background port for '#{cmd}' exited with status #{status}"
-    )
-
     new_state =
       Map.update(state, port, %{command: cmd, output: "", exit_status: status}, fn entry ->
         %{entry | exit_status: status}
@@ -139,8 +134,6 @@ defmodule HpcConnect.TunnelManager do
   end
 
   def handle_info({:EXIT, port, reason}, state) when is_port(port) do
-    Logger.debug("[HpcConnect.TunnelManager] Port #{inspect(port)} exited: #{inspect(reason)}")
-
     new_state =
       Map.update(state, port, %{command: "unknown", output: "", exit_status: reason}, fn entry ->
         %{entry | exit_status: reason}

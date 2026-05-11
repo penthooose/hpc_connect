@@ -346,13 +346,22 @@ defmodule HpcConnect.Slurm do
 
   @doc """
   Cancels a SLURM job by ID.
+
+  Options:
+  - `:connect_opts` – keyword options forwarded to `SSH.run/2`
+
+  Internal/testing hooks:
+  - `:run_fun` – custom function `(command, connect_opts) -> {output, status}`
   """
   @spec cancel_job(Session.t(), binary() | pos_integer(), keyword()) :: binary()
   def cancel_job(%Session{} = session, job_id, opts \\ []) do
+    connect_opts = Keyword.get(opts, :connect_opts, [])
+    run_fun = Keyword.get(opts, :run_fun, &SSH.run/2)
+
     {output, _} =
       session
       |> SSH.ssh_command("scancel #{job_id}", "scancel #{job_id}")
-      |> SSH.run(Keyword.get(opts, :connect_opts, []))
+      |> run_fun.(connect_opts)
 
     output
   end

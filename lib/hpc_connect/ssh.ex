@@ -124,9 +124,9 @@ defmodule HpcConnect.SSH do
 
     args =
       []
-      |> maybe_append_option("-F", session.ssh_config_file)
       |> maybe_append_option("-i", session.identity_file)
       |> maybe_append_option("-J", login_jump_target)
+      |> Kernel.++(maybe_user_known_hosts_args(session))
       |> Kernel.++([
         "-o",
         "BatchMode=yes",
@@ -181,9 +181,9 @@ defmodule HpcConnect.SSH do
 
     args =
       []
-      |> maybe_append_option("-F", session.ssh_config_file)
       |> maybe_append_option("-i", session.identity_file)
       |> maybe_append_option("-J", login_jump_target)
+      |> Kernel.++(maybe_user_known_hosts_args(session))
       |> Kernel.++([
         ["-o", "BatchMode=yes"],
         ["-o", "IdentitiesOnly=yes"],
@@ -575,7 +575,7 @@ defmodule HpcConnect.SSH do
     )
 
     target_candidates =
-      [tunnel_target(session), session.cluster.host]
+      [session.cluster.host, session.cluster.ssh_alias]
       |> Enum.filter(&(is_binary(&1) and &1 != ""))
       |> Enum.uniq()
 
@@ -1251,9 +1251,9 @@ defmodule HpcConnect.SSH do
   #   ssh -N -L <local_port>:127.0.0.1:22 <target> [-J <proxy>]
   defp build_proxy_tunnel_args(session, local_port) do
     []
-    |> maybe_append_option("-F", session.ssh_config_file)
     |> maybe_append_option("-i", session.identity_file)
-    |> maybe_append_option("-J", proxy_jump_for_tunnel(session))
+    |> maybe_append_option("-J", proxy_jump_target(session))
+    |> Kernel.++(maybe_user_known_hosts_args(session))
     |> Kernel.++([
       "-N",
       "-L",
@@ -1281,30 +1281,25 @@ defmodule HpcConnect.SSH do
       "-o",
       "LogLevel=ERROR"
     ])
-    |> Kernel.++([tunnel_target(session)])
+    |> Kernel.++([direct_login_target(session)])
   end
 
-  # For tunnel setup we intentionally prefer host aliases without forcing
-  # `username@...`, so local ~/.ssh/config defaults can be applied.
-  defp tunnel_target(%Session{} = session) do
-    cond do
-      is_binary(session.ssh_alias) and session.ssh_alias != "" ->
-        session.ssh_alias
+  defp direct_login_target(%Session{} = session) do
+    case session.username do
+      username when is_binary(username) and username != "" ->
+        "#{username}@#{session.cluster.host}"
 
-      is_binary(session.cluster.ssh_alias) and session.cluster.ssh_alias != "" ->
-        session.cluster.ssh_alias
-
-      true ->
+      _ ->
         session.cluster.host
     end
   end
 
-  defp proxy_jump_for_tunnel(%Session{} = session) do
-    case session.proxy_jump || session.cluster.proxy_jump do
-      value when is_binary(value) and value != "" -> value
-      _ -> nil
-    end
+  defp maybe_user_known_hosts_args(%Session{known_hosts_file: path})
+       when is_binary(path) and path != "" do
+    ["-o", "UserKnownHostsFile=#{path}"]
   end
+
+  defp maybe_user_known_hosts_args(_session), do: []
 
   defp proxy_jump_identity(%Session{} = session) do
     jump_raw =

@@ -67,7 +67,9 @@ defmodule HpcConnectTest do
     job = HpcConnect.new_job(session, conda_env: "llm", port: 8123)
     command = HpcConnect.Scripts.start_vllm_command(session, model, job)
 
-    assert command.remote_command =~ "HF_HOME=/vault/models/Qwen--Qwen2.5-7B-Instruct"
+    assert command.remote_command =~
+             "HF_HOME=/vault/models/.cache/hpc_connect/models/Qwen--Qwen2.5-7B-Instruct"
+
     assert command.remote_command =~ "VLLM_WORKER_MULTIPROC_METHOD=spawn"
     assert command.remote_command =~ "--port 8123"
   end
@@ -124,7 +126,7 @@ defmodule HpcConnectTest do
     assert config =~ "Host meggie.rrze.fau.de meggie.rrze.uni-erlangen.de meggie"
     assert config =~ "User hpcusr01"
 
-    assert session.uploaded_key_path == uploaded_key_path
+    assert session.uploaded_key_path == Path.expand(uploaded_key_path)
 
     assert :ok == HpcConnect.cleanup_session(session)
     refute File.exists?(session.credential_dir)
@@ -246,6 +248,9 @@ defmodule HpcConnectTest do
         key_path: key_path,
         env_file: env_file,
         remote_command: "echo BOOT",
+        install_scripts: false,
+        install_def_files: false,
+        connect_opts: [timeout: 10],
         connect_fun: fn _session, _command, _opts -> "BOOT\n" end
       )
 
@@ -292,6 +297,79 @@ defmodule HpcConnectTest do
     refute File.exists?(uploaded_key_path)
   end
 
+  test "prepare_livebook_session normalizes direct values without requiring kino UI" do
+    tmp_dir =
+      Path.join([
+        System.tmp_dir!(),
+        "livebook",
+        "test_session",
+        "registered_files"
+      ])
+
+    File.mkdir_p!(tmp_dir)
+
+    uploaded_key_path = Path.join(tmp_dir, "id_team_prepare_livebook")
+    File.write!(uploaded_key_path, "FAKE_PRIVATE_KEY")
+
+    opts =
+      HpcConnect.prepare_livebook_session(
+        cluster: :alex,
+        username: "  hpcusr01  ",
+        uploaded_key_path: uploaded_key_path,
+        remote_command: "",
+        work_dir: "$HOME/.cache/hpc_connect",
+        vault_dir: "$HOME/vault/hpc_connect"
+      )
+
+    assert opts[:mode] == :livebook
+    assert opts[:cluster] == :alex
+    assert opts[:username] == "hpcusr01"
+    assert opts[:uploaded_key_path] == Path.expand(uploaded_key_path)
+    assert opts[:uploaded_filename] == "id_team_prepare_livebook"
+    assert opts[:remote_command] == "hostname && whoami"
+    assert opts[:work_dir] == "$HOME/.cache/hpc_connect"
+    assert opts[:vault_dir] == "$HOME/vault/hpc_connect"
+    assert opts[:ui_rendered?] == false
+  end
+
+  test "livebook placeholder work_dir and vault_dir are normalized to absolute user paths" do
+    tmp_dir =
+      Path.join([
+        System.tmp_dir!(),
+        "livebook",
+        "test_session",
+        "registered_files"
+      ])
+
+    File.mkdir_p!(tmp_dir)
+
+    uploaded_key_path = Path.join(tmp_dir, "id_team_livebook_paths")
+    File.write!(uploaded_key_path, "FAKE_PRIVATE_KEY")
+
+    result =
+      HpcConnect.connection_setup(
+        mode: :livebook,
+        cluster: :alex,
+        username: "barz123h",
+        uploaded_key_path: uploaded_key_path,
+        work_dir: "$HOME/.cache/hpc_connect",
+        vault_dir: "$HOME/vault/hpc_connect",
+        remote_command: "echo LIVEBOOK",
+        connect_fun: fn _session, _command, _opts -> "LIVEBOOK\n" end
+      )
+
+    assert result.session.work_dir == "/home/hpc/barz/barz123h/.cache/hpc_connect"
+    assert result.session.vault_dir == "/home/vault/barz/barz123h"
+
+    command = HpcConnect.Model.list_remote_command(result.session)
+
+    assert command.remote_command =~ "/home/vault/barz/barz123h/.cache/hpc_connect/models"
+    refute command.remote_command =~ "'$HOME"
+
+    assert :ok == HpcConnect.connection_cleanup(result, delete_uploaded: true)
+    refute File.exists?(uploaded_key_path)
+  end
+
   test "cleanup_livebook_orphans removes artifacts from interrupted sessions" do
     tmp_dir =
       Path.join([
@@ -316,6 +394,365 @@ defmodule HpcConnectTest do
 
     refute File.exists?(session.credential_dir)
     refute File.exists?(uploaded_key_path)
+  end
+
+  test "cleanup_livebook_session is the recommended happy-path cleanup alias" do
+    tmp_dir =
+      Path.join([
+        System.tmp_dir!(),
+        "livebook",
+        "test_session",
+        "registered_files"
+      ])
+
+    File.mkdir_p!(tmp_dir)
+
+    uploaded_key_path = Path.join(tmp_dir, "id_team_cleanup_alias")
+    File.write!(uploaded_key_path, "FAKE_PRIVATE_KEY")
+
+    result =
+      HpcConnect.livebook_connect(:fritz, "hpcusr01", uploaded_key_path,
+        remote_command: "echo READY",
+        connect_fun: fn _session, _command, _opts -> "READY\n" end
+      )
+
+    assert File.exists?(result.session.credential_dir)
+    assert File.exists?(uploaded_key_path)
+
+    assert :ok == HpcConnect.cleanup_livebook_session(result)
+
+    refute File.exists?(result.session.credential_dir)
+    refute File.exists?(uploaded_key_path)
+  end
+
+  test "livebook proxy tunnel command avoids generated ssh config recursion on windows" do
+    tmp_dir =
+      Path.join([
+        System.tmp_dir!(),
+        "livebook",
+        "test_session",
+        "registered_files"
+      ])
+
+    File.mkdir_p!(tmp_dir)
+
+    uploaded_key_path = Path.join(tmp_dir, "id_team_proxy_cmd")
+    File.write!(uploaded_key_path, "FAKE_PRIVATE_KEY")
+
+    session = HpcConnect.new_livebook_session(:alex, "hpcusr01", uploaded_key_path)
+    proxy = HpcConnect.start_proxy(session, "a0705", local_port: 55_000, remote_port: 50_200)
+    preview = HpcConnect.command_preview(proxy.command)
+
+    refute preview =~ " -F "
+    refute preview =~ session.ssh_config_file
+    assert preview =~ session.known_hosts_file
+    assert preview =~ "UserKnownHostsFile=#{session.known_hosts_file}"
+    assert preview =~ "-J"
+    assert preview =~ "hpcusr01@alex.nhr.fau.de"
+    assert preview =~ "hpcusr01@a0705"
+
+    assert :ok == HpcConnect.cleanup_session(session, delete_uploaded: true)
+    refute File.exists?(uploaded_key_path)
+  end
+
+  test "cancel_all_jobs cancels every listed job for the session user" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    jobs = [
+      %{job_id: "101", name: "job-a", partition: "a100", state: "R"},
+      %{job_id: "102", name: "job-b", partition: "a40", state: "PD"}
+    ]
+
+    result =
+      HpcConnect.cancel_all_jobs(session,
+        list_jobs_fun: fn _session -> jobs end,
+        cancel_job_fun: fn _session, job_id ->
+          send(parent, {:cancel_job_called, job_id})
+          ""
+        end
+      )
+
+    assert_receive {:cancel_job_called, "101"}
+    assert_receive {:cancel_job_called, "102"}
+    assert Enum.map(result, & &1.job_id) == ["101", "102"]
+    assert Enum.all?(result, &Map.has_key?(&1, :cancel_output))
+  end
+
+  test "cancel_all_jobs accepts boot map with session" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    boot = %{session: session, mode: :livebook}
+
+    jobs = [
+      %{job_id: "201", name: "job-a", partition: "a100", state: "R"},
+      %{job_id: "202", name: "job-b", partition: "a40", state: "PD"}
+    ]
+
+    result =
+      HpcConnect.cancel_all_jobs(boot,
+        list_jobs_fun: fn _session -> jobs end,
+        cancel_job_fun: fn _session, job_id ->
+          send(parent, {:cancel_job_called_from_boot, job_id})
+          ""
+        end
+      )
+
+    assert_receive {:cancel_job_called_from_boot, "201"}
+    assert_receive {:cancel_job_called_from_boot, "202"}
+    assert Enum.map(result, & &1.job_id) == ["201", "202"]
+  end
+
+  test "exit(boot) in livebook mode cancels jobs, clears cache, and triggers cleanup" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    boot = %{session: session, mode: :livebook}
+
+    assert :ok ==
+             HpcConnect.exit(boot,
+               cancel_all_jobs_fun: fn inner_session, _opts ->
+                 send(parent, {:exit_cancel_called, inner_session.username})
+                 []
+               end,
+               clear_app_cache_fun: fn _session, _opts ->
+                 send(parent, :exit_clear_cache_called)
+                 :ok
+               end,
+               cleanup_livebook_fun: fn result, cleanup_opts ->
+                 send(parent, {:exit_cleanup_called, result.mode, cleanup_opts[:delete_uploaded]})
+                 :ok
+               end
+             )
+
+    assert_receive {:exit_cancel_called, "hpcusr01"}
+    assert_receive :exit_clear_cache_called
+    assert_receive {:exit_cleanup_called, :livebook, true}
+  end
+
+  test "exit(boot) in local mode cancels jobs and clears cache only" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    boot = %{session: session, mode: :local}
+
+    assert :ok ==
+             HpcConnect.exit(boot,
+               cancel_all_jobs_fun: fn _inner_session, _opts ->
+                 send(parent, :exit_cancel_called)
+                 []
+               end,
+               clear_app_cache_fun: fn _session, _opts ->
+                 send(parent, :exit_clear_cache_called)
+                 :ok
+               end,
+               cleanup_livebook_fun: fn _result, _opts ->
+                 send(parent, :exit_cleanup_called)
+                 :ok
+               end
+             )
+
+    assert_receive :exit_cancel_called
+    assert_receive :exit_clear_cache_called
+    refute_receive :exit_cleanup_called
+  end
+
+  test "uninstall keeps models by default and clears app cache" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "v135ca12",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    assert :ok ==
+             HpcConnect.uninstall(session,
+               connect_fun: fn _inner_session, remote_command, _connect_opts ->
+                 send(parent, {:uninstall_command, remote_command})
+                 ""
+               end,
+               clear_app_cache_fun: fn _inner_session, _opts ->
+                 send(parent, :uninstall_clear_cache_called)
+                 :ok
+               end
+             )
+
+    assert_receive {:uninstall_command, command}
+    assert command =~ "rm -rf"
+    assert command =~ "find"
+    assert command =~ "! -name models"
+    assert_receive :uninstall_clear_cache_called
+  end
+
+  test "uninstall with remove_models deletes full vault hpc_connect cache root" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "v135ca12",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    assert :ok ==
+             HpcConnect.uninstall(session,
+               remove_models: true,
+               connect_fun: fn _inner_session, remote_command, _connect_opts ->
+                 send(parent, {:uninstall_command_remove_models, remote_command})
+                 ""
+               end,
+               clear_app_cache_fun: fn _inner_session, _opts -> :ok end
+             )
+
+    assert_receive {:uninstall_command_remove_models, command}
+    assert command =~ "rm -rf"
+    refute command =~ "find"
+    assert command =~ "/.cache/hpc_connect"
+  end
+
+  test "clear_app_cache accepts boot and pipes confirmation to apptainer cache clean" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    boot = %{session: session, mode: :livebook}
+
+    assert :ok ==
+             HpcConnect.clear_app_cache(boot,
+               connect_fun: fn _inner_session, remote_command, _connect_opts ->
+                 send(parent, {:clear_app_cache_command, remote_command})
+                 ""
+               end
+             )
+
+    assert_receive {:clear_app_cache_command, "printf 'y\\n' | apptainer cache clean"}
+  end
+
+  test "cancel_pending_waits(session) cancels only PD jobs without allocated nodes" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    jobs = [
+      %{
+        job_id: "3602014",
+        partition: "a100",
+        name: "hpc_connect_vllm",
+        user: "hpcusr01",
+        state: "PD",
+        time: "0:00",
+        time_limit: "2:00:00",
+        nodes: "1",
+        cpus: "16",
+        node_list: "(Priority)"
+      },
+      %{
+        job_id: "3601937",
+        partition: "a100",
+        name: "hpc_connect_vllm",
+        user: "hpcusr01",
+        state: "R",
+        time: "20:48",
+        time_limit: "2:00:00",
+        nodes: "1",
+        cpus: "16",
+        node_list: "a0805"
+      }
+    ]
+
+    canceled =
+      HpcConnect.cancel_pending_waits(session,
+        list_jobs_fun: fn _session -> jobs end,
+        cancel_job_fun: fn _session, job_id ->
+          send(parent, {:cancel_pending_job_called, job_id})
+          ""
+        end
+      )
+
+    assert canceled == 1
+    assert_receive {:cancel_pending_job_called, "3602014"}
+    refute_receive {:cancel_pending_job_called, "3601937"}
+  end
+
+  test "cancel_job accepts job id as string" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    output =
+      HpcConnect.cancel_job(session, "3585776",
+        run_fun: fn command, connect_opts ->
+          send(parent, {:cancel_job_command, command.remote_command, connect_opts})
+          {"", 0}
+        end
+      )
+
+    assert output == ""
+    assert_receive {:cancel_job_command, "scancel 3585776", []}
+  end
+
+  test "cancel_job accepts job id as integer" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    output =
+      HpcConnect.cancel_job(session, 3_585_776,
+        run_fun: fn command, connect_opts ->
+          send(parent, {:cancel_job_command, command.remote_command, connect_opts})
+          {"", 0}
+        end
+      )
+
+    assert output == ""
+    assert_receive {:cancel_job_command, "scancel 3585776", []}
   end
 
   test "parses remote model listing output" do
@@ -582,6 +1019,63 @@ defmodule HpcConnectTest do
     assert result.access_mode == :openssh_proxy
     assert result.base_url == "http://localhost:50502"
     assert result.native_error =~ "native bridge timeout"
+  end
+
+  test "reconnect with known node skips allocation wait text and prints reconnect message" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    output =
+      ExUnit.CaptureIO.capture_io(fn ->
+        result =
+          HpcConnect.reconnect(session, "3602014",
+            app: "vllm",
+            args: [port: 50_200],
+            list_jobs_fun: fn _session ->
+              [
+                %{
+                  job_id: "3602014",
+                  partition: "a100",
+                  time_limit: "02:00:00",
+                  node_list: "a0905"
+                }
+              ]
+            end,
+            open_proxy_fun: fn _session, node, proxy_opts ->
+              {
+                %{
+                  base_url: "http://localhost:50503",
+                  local_port: 50_503,
+                  remote_port: proxy_opts[:remote_port],
+                  node: node
+                },
+                make_ref()
+              }
+            end,
+            wait_for_app: false
+          )
+
+        send(parent, {:reconnect_result, result})
+      end)
+
+    assert_receive {:reconnect_result, result}
+    assert result.node == "a0905"
+    assert result.access_mode == :openssh_proxy
+    assert result.base_url == "http://localhost:50503"
+
+    assert output =~
+             "[HpcConnect] Reconnecting to existing vLLM job 3602014 on compute node a0905."
+
+    refute output =~ "Submitted app job 3602014. Waiting for GPU allocation ..."
+
+    refute output =~
+             "To cancel pending allocations from another process: HpcConnect.cancel_pending_waits(session)"
   end
 
   test "kill_proxy closes tracked proxy by session and node" do

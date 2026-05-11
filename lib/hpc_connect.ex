@@ -6,6 +6,8 @@ defmodule HpcConnect do
   across Windows, Linux, and macOS.
   """
 
+  import Kernel, except: [exit: 1]
+
   alias HpcConnect.{
     Cluster,
     Command,
@@ -60,6 +62,29 @@ defmodule HpcConnect do
   end
 
   @doc """
+  Renders a single Livebook setup form and returns bootstrap-ready options.
+
+  This keeps notebooks compact by collapsing cluster selection, username,
+  uploaded SSH key, and the common probe/path settings into one interactive
+  step:
+
+      boot =
+        HpcConnect.prepare_livebook_session(cluster: :alex, persist_form: true)
+        |> HpcConnect.bootstrap()
+
+  The Kino-based UI is only available inside Livebook. Outside Livebook, pass
+  the options directly (for example `mode: :local` with `:username` and
+  `:key_path`).
+
+  When `persist_form: true` is used, only non-secret defaults are persisted.
+  The uploaded private key itself is never persisted.
+  """
+  @spec prepare_livebook_session(keyword()) :: keyword()
+  def prepare_livebook_session(opts \\ []) do
+    Livebook.prepare_session(opts)
+  end
+
+  @doc """
   Unified one-call connection setup.
 
   Modes:
@@ -93,16 +118,20 @@ defmodule HpcConnect do
   def bootstrap(opts \\ []) do
     resolved_opts = resolve_setup_opts(opts)
 
-    if Keyword.get(resolved_opts, :key_just_created) do
-      IO.puts("")
+    try do
+      if Keyword.get(resolved_opts, :key_just_created) do
+        IO.puts("")
 
-      IO.puts(
-        "Bootstrap paused: new SSH key was created. Re-run bootstrap after uploading the key."
-      )
+        IO.puts(
+          "Bootstrap paused: new SSH key was created. Re-run bootstrap after uploading the key."
+        )
 
-      return_bootstrap_key_created(resolved_opts)
-    else
-      bootstrap_continue(resolved_opts)
+        return_bootstrap_key_created(resolved_opts)
+      else
+        bootstrap_continue(resolved_opts)
+      end
+    after
+      Livebook.clear_prepare_status(resolved_opts)
     end
   end
 
@@ -123,7 +152,11 @@ defmodule HpcConnect do
   end
 
   defp bootstrap_continue(resolved_opts) do
-    setup_opts = Keyword.put_new(resolved_opts, :native_ssh, false)
+    setup_opts =
+      resolved_opts
+      |> Keyword.put_new(:native_ssh, false)
+      |> Keyword.put(:clear_prepare_status, false)
+
     result = Livebook.connection_setup(setup_opts)
     reset_permission? = Keyword.get(resolved_opts, :reset_permission, false)
 
@@ -524,10 +557,26 @@ defmodule HpcConnect do
 
   @doc """
   Convenience cleanup for connection setup results or direct sessions.
+
+  For the common Livebook happy path, prefer `cleanup_livebook_session/2`.
   """
   @spec connection_cleanup(map() | Session.t(), keyword()) :: :ok
   def connection_cleanup(result_or_session, opts \\ []),
     do: Livebook.connection_cleanup(result_or_session, opts)
+
+  @doc """
+  Cleans up the current Livebook session, including the uploaded temp key by default.
+
+  This is the recommended cleanup command after a successful Livebook session.
+  It removes the generated credential directory, deletes the original uploaded
+  key file unless `delete_uploaded: false` is passed, and sweeps matching orphan
+  registry entries.
+  """
+  @spec cleanup_livebook_session(map() | Session.t(), keyword()) :: :ok
+  def cleanup_livebook_session(result_or_session, opts \\ []) do
+    result_or_session
+    |> Livebook.connection_cleanup(Keyword.put_new(opts, :delete_uploaded, true))
+  end
 
   @doc """
   Creates a model descriptor.
@@ -648,7 +697,9 @@ defmodule HpcConnect do
   Sweeps orphaned Livebook temp artifacts tracked by `hpc_connect`.
 
   Call this when reconnecting after an interrupted/paused notebook session and
-  you no longer have the original `session` variable.
+  you no longer have the original `session` or `boot` variable.
+
+  This is a recovery helper, not the normal end-of-session cleanup path.
   """
   @spec cleanup_livebook_orphans(keyword()) :: :ok
   def cleanup_livebook_orphans(opts \\ []), do: Livebook.cleanup_orphans(opts)
@@ -883,6 +934,145 @@ defmodule HpcConnect do
   @spec cancel_job(Session.t(), binary() | pos_integer(), keyword()) :: binary()
   def cancel_job(%Session{} = session, job_id, opts \\ []),
     do: Slurm.cancel_job(session, job_id, opts)
+
+  @doc """
+  Cancels every currently listed job for the session user on the current cluster.
+
+  Returns a list with one entry per canceled job, including the original job
+  metadata and the `scancel` output for that job.
+
+  Options:
+  - `:connect_opts` – keyword options forwarded to the underlying SSH commands
+
+  Internal/testing hooks:
+  - `:list_jobs_fun` – custom function `(session -> [job_map])`
+  - `:cancel_job_fun` – custom function `(session, job_id -> binary())`
+  """
+  @spec cancel_all_jobs(Session.t() | map(), keyword()) :: [map()]
+  def cancel_all_jobs(result_or_session, opts \\ [])
+
+  def cancel_all_jobs(%{session: %Session{} = session}, opts) do
+    cancel_all_jobs(session, opts)
+  end
+
+  def cancel_all_jobs(%Session{} = session, opts) do
+    connect_opts = Keyword.get(opts, :connect_opts, [])
+
+    list_jobs_fun =
+      Keyword.get(opts, :list_jobs_fun, fn inner_session ->
+        list_jobs_summary(inner_session, connect_opts: connect_opts)
+      end)
+
+    cancel_job_fun =
+      Keyword.get(opts, :cancel_job_fun, fn inner_session, job_id ->
+        cancel_job(inner_session, job_id, connect_opts: connect_opts)
+      end)
+
+    session
+    |> list_jobs_fun.()
+    |> Enum.map(fn job ->
+      job_id = Map.get(job, :job_id) || Map.get(job, "job_id")
+      output = cancel_job_fun.(session, job_id)
+      Map.put(job, :cancel_output, output)
+    end)
+  end
+
+  @doc """
+  Cancels user jobs and performs mode-aware cleanup.
+
+  Behavior:
+  - always clears Apptainer cache via `clear_app_cache/2`
+  - `mode: :livebook` (boot map): cancels jobs and then removes temporary
+    uploaded-key credentials via `cleanup_livebook_session/2`
+  - `mode: :local` (boot map): cancels jobs and clears cache only
+  - direct `%Session{}`: cancels jobs and clears cache only
+  """
+  @spec exit(map() | Session.t(), keyword()) :: :ok
+  def exit(result_or_session, opts \\ [])
+
+  def exit(%Session{} = session, opts) do
+    cancel_fun = Keyword.get(opts, :cancel_all_jobs_fun, &cancel_all_jobs/2)
+    clear_app_cache_fun = Keyword.get(opts, :clear_app_cache_fun, &clear_app_cache/2)
+
+    base_opts =
+      Keyword.drop(opts, [:cancel_all_jobs_fun, :cleanup_livebook_fun, :clear_app_cache_fun])
+
+    _ = cancel_fun.(session, base_opts)
+    _ = clear_app_cache_fun.(session, base_opts)
+    :ok
+  end
+
+  def exit(%{session: %Session{} = session} = result, opts) do
+    cancel_fun = Keyword.get(opts, :cancel_all_jobs_fun, &cancel_all_jobs/2)
+    cleanup_fun = Keyword.get(opts, :cleanup_livebook_fun, &cleanup_livebook_session/2)
+    clear_app_cache_fun = Keyword.get(opts, :clear_app_cache_fun, &clear_app_cache/2)
+
+    base_opts =
+      Keyword.drop(opts, [:cancel_all_jobs_fun, :cleanup_livebook_fun, :clear_app_cache_fun])
+
+    _ = cancel_fun.(session, base_opts)
+    _ = clear_app_cache_fun.(session, base_opts)
+
+    if livebook_mode_result?(result) do
+      _ = cleanup_fun.(result, Keyword.put_new(base_opts, :delete_uploaded, true))
+    end
+
+    :ok
+  end
+
+  @doc """
+  Removes remote `hpc_connect` runtime files and clears the remote Apptainer cache.
+
+  By default downloaded models are kept. Pass `remove_models: true` to remove
+  the entire vault-side `.cache/hpc_connect` directory including models.
+  """
+  @spec uninstall(map() | Session.t(), keyword()) :: :ok
+  def uninstall(result_or_session, opts \\ []) do
+    {session, _mode} = session_and_mode!(result_or_session)
+    remove_models? = Keyword.get(opts, :remove_models, false)
+    connect_opts = Keyword.get(opts, :connect_opts, [])
+
+    connect_fun =
+      Keyword.get(opts, :connect_fun, fn inner_session, remote_command, inner_connect_opts ->
+        connect!(inner_session, remote_command, inner_connect_opts)
+      end)
+
+    clear_app_cache_fun = Keyword.get(opts, :clear_app_cache_fun, &clear_app_cache/2)
+
+    remote_command =
+      uninstall_remote_cleanup_command(
+        session,
+        remove_models?
+      )
+
+    _ = connect_fun.(session, remote_command, connect_opts)
+
+    clear_app_cache_opts = Keyword.drop(opts, [:clear_app_cache_fun])
+    _ = clear_app_cache_fun.(session, clear_app_cache_opts)
+    :ok
+  end
+
+  @doc """
+  Clears the remote Apptainer cache.
+
+  Runs `apptainer cache clean` non-interactively by piping a `y` answer:
+  `printf 'y\\n' | apptainer cache clean`.
+  """
+  @spec clear_app_cache(map() | Session.t(), keyword()) :: :ok
+  def clear_app_cache(result_or_session, opts \\ []) do
+    {session, _mode} = session_and_mode!(result_or_session)
+    connect_opts = Keyword.get(opts, :connect_opts, [])
+
+    connect_fun =
+      Keyword.get(opts, :connect_fun, fn inner_session, remote_command, inner_connect_opts ->
+        connect!(inner_session, remote_command, inner_connect_opts)
+      end)
+
+    _ =
+      connect_fun.(session, "printf 'y\\n' | apptainer cache clean", connect_opts)
+
+    :ok
+  end
 
   @doc """
   Gathers the most relevant remote status information for a connected session.
@@ -1205,9 +1395,14 @@ defmodule HpcConnect do
       |> maybe_put(:walltime, Keyword.get(slurm_kw, :walltime))
       |> enrich_reconnect_submission(session, job_id, opts)
 
+    reconnect_opts =
+      opts
+      |> Keyword.put(:reconnect, true)
+      |> Keyword.put_new(:cancel_on_interrupt, false)
+
     submitted
-    |> maybe_wait_for_allocation(session, Keyword.put_new(opts, :cancel_on_interrupt, false))
-    |> maybe_attach_vllm_access(session, app, opts)
+    |> maybe_wait_for_allocation(session, reconnect_opts)
+    |> maybe_attach_vllm_access(session, app, reconnect_opts)
   end
 
   defp maybe_prepare_session_for_app(%Session{} = session, app, opts) do
@@ -1298,64 +1493,73 @@ defmodule HpcConnect do
   end
 
   defp maybe_wait_for_allocation(submitted, %Session{} = session, opts) do
-    if Keyword.get(opts, :wait_for_node, true) do
-      interval_ms = Keyword.get(opts, :node_poll_interval_ms, 10_000)
-      timeout_ms = Keyword.get(opts, :node_poll_timeout_ms, :infinity)
-      cancel_on_interrupt? = Keyword.get(opts, :cancel_on_interrupt, true)
+    reconnect? = Keyword.get(opts, :reconnect, false)
 
-      IO.puts("Submitted app job #{submitted.job_id}. Waiting for GPU allocation ...")
+    cond do
+      not is_nil(Map.get(submitted, :node)) ->
+        submitted
 
-      IO.puts(
-        "IEx stop: Ctrl+C then k. Manual cancel from another shell: HpcConnect.release_gpu(session, #{submitted.job_id})"
-      )
+      Keyword.get(opts, :wait_for_node, true) ->
+        interval_ms = Keyword.get(opts, :node_poll_interval_ms, 10_000)
+        timeout_ms = Keyword.get(opts, :node_poll_timeout_ms, :infinity)
+        cancel_on_interrupt? = Keyword.get(opts, :cancel_on_interrupt, true)
 
-      IO.puts(
-        "Or cancel all pending waits from another process in the same BEAM VM: HpcConnect.cancel_pending_waits()"
-      )
+        IO.puts(
+          if reconnect? do
+            "Reconnecting app job #{submitted.job_id}. Waiting for GPU allocation ..."
+          else
+            "Submitted app job #{submitted.job_id}. Waiting for GPU allocation ..."
+          end
+        )
 
-      register_pending_wait(self(), session, submitted.job_id)
+        IO.puts(
+          "To cancel pending allocations from another process: HpcConnect.cancel_pending_waits(session)"
+        )
 
-      interrupt_guard =
-        if cancel_on_interrupt? do
-          start_interrupt_guard(session, submitted.job_id)
-        else
-          nil
+        register_pending_wait(self(), session, submitted.job_id)
+
+        interrupt_guard =
+          if cancel_on_interrupt? do
+            start_interrupt_guard(session, submitted.job_id)
+          else
+            nil
+          end
+
+        try do
+          node =
+            wait_for_node_with_progress(session, submitted.job_id,
+              interval_ms: interval_ms,
+              timeout_ms: timeout_ms,
+              connect_opts: Keyword.get(opts, :connect_opts, [])
+            )
+
+          %{submitted | node: node}
+        rescue
+          e ->
+            if cancel_on_interrupt?, do: safe_release_gpu(session, submitted.job_id)
+            reraise e, __STACKTRACE__
+        catch
+          :throw, {:hpc_connect_cancel_wait, reason} ->
+            if cancel_on_interrupt?, do: safe_release_gpu(session, submitted.job_id)
+
+            raise RuntimeError,
+                  "GPU allocation wait canceled (#{reason}) for job #{submitted.job_id}"
+
+          kind, value ->
+            if cancel_on_interrupt?, do: safe_release_gpu(session, submitted.job_id)
+
+            case kind do
+              :exit -> Kernel.exit(value)
+              :throw -> throw(value)
+              :error -> :erlang.error(value)
+            end
+        after
+          stop_interrupt_guard(interrupt_guard)
+          unregister_pending_wait(self())
         end
 
-      try do
-        node =
-          wait_for_node_with_progress(session, submitted.job_id,
-            interval_ms: interval_ms,
-            timeout_ms: timeout_ms,
-            connect_opts: Keyword.get(opts, :connect_opts, [])
-          )
-
-        %{submitted | node: node}
-      rescue
-        e ->
-          if cancel_on_interrupt?, do: safe_release_gpu(session, submitted.job_id)
-          reraise e, __STACKTRACE__
-      catch
-        :throw, {:hpc_connect_cancel_wait, reason} ->
-          if cancel_on_interrupt?, do: safe_release_gpu(session, submitted.job_id)
-
-          raise RuntimeError,
-                "GPU allocation wait canceled (#{reason}) for job #{submitted.job_id}"
-
-        kind, value ->
-          if cancel_on_interrupt?, do: safe_release_gpu(session, submitted.job_id)
-
-          case kind do
-            :exit -> exit(value)
-            :throw -> throw(value)
-            :error -> :erlang.error(value)
-          end
-      after
-        stop_interrupt_guard(interrupt_guard)
-        unregister_pending_wait(self())
-      end
-    else
-      submitted
+      true ->
+        submitted
     end
   end
 
@@ -1380,7 +1584,13 @@ defmodule HpcConnect do
           submitted.node ||
             wait_for_access_node(session, submitted.job_id, opts)
 
-        IO.puts("[HpcConnect] vLLM compute node resolved: #{node}")
+        if Keyword.get(opts, :reconnect, false) do
+          IO.puts(
+            "[HpcConnect] Reconnecting to existing vLLM job #{submitted.job_id} on compute node #{node}."
+          )
+        else
+          IO.puts("[HpcConnect] vLLM compute node resolved: #{node}")
+        end
 
         IO.puts(
           "[HpcConnect] vLLM tunnel equivalent (diagnostic): " <>
@@ -1637,10 +1847,21 @@ defmodule HpcConnect do
   defp enrich_reconnect_submission(submitted, %Session{} = session, job_id, opts) do
     connect_opts = Keyword.get(opts, :connect_opts, [])
 
+    rows =
+      case Keyword.get(opts, :list_jobs_fun) do
+        fun when is_function(fun, 2) ->
+          fun.(session, connect_opts)
+
+        fun when is_function(fun, 1) ->
+          fun.(session)
+
+        _ ->
+          list_jobs_summary(session, connect_opts: connect_opts)
+      end
+
     job_entry =
-      session
-      |> list_jobs_summary(connect_opts: connect_opts)
-      |> Enum.find(fn row -> to_string(Map.get(row, :job_id)) == to_string(job_id) end)
+      rows
+      |> Enum.find(fn row -> to_string(map_get_job_field(row, :job_id)) == to_string(job_id) end)
 
     case job_entry do
       nil ->
@@ -1648,9 +1869,9 @@ defmodule HpcConnect do
 
       row ->
         submitted
-        |> Map.put_new(:partition, Map.get(row, :partition))
-        |> Map.put_new(:walltime, Map.get(row, :time_limit))
-        |> maybe_put(:node, normalize_squeue_node(Map.get(row, :node_list)))
+        |> Map.put_new(:partition, map_get_job_field(row, :partition))
+        |> Map.put_new(:walltime, map_get_job_field(row, :time_limit))
+        |> maybe_put(:node, normalize_squeue_node(map_get_job_field(row, :node_list)))
     end
   rescue
     _ -> submitted
@@ -1728,6 +1949,54 @@ defmodule HpcConnect do
   end
 
   @doc """
+  Cancels pending (not yet allocated) app jobs for a session user.
+
+  This queries `squeue` and cancels jobs that are still pending (`PD`) and do
+  not yet have a concrete compute node assigned (e.g. `node_list` is
+  `"(Priority)"`).
+
+  Returns the number of canceled jobs.
+
+  Internal/testing hooks:
+  - `:list_jobs_fun` – custom function `(session -> [job_map])`
+  - `:cancel_job_fun` – custom function `(session, job_id -> binary())`
+  """
+  @spec cancel_pending_waits(Session.t()) :: non_neg_integer()
+  def cancel_pending_waits(%Session{} = session), do: cancel_pending_waits(session, [])
+
+  @spec cancel_pending_waits(Session.t(), keyword()) :: non_neg_integer()
+  def cancel_pending_waits(%Session{} = session, opts) when is_list(opts) do
+    connect_opts = Keyword.get(opts, :connect_opts, [])
+
+    list_jobs_fun =
+      Keyword.get(opts, :list_jobs_fun, fn inner_session ->
+        list_jobs_summary(inner_session, connect_opts: connect_opts)
+      end)
+
+    cancel_job_fun =
+      Keyword.get(opts, :cancel_job_fun, fn inner_session, job_id ->
+        cancel_job(inner_session, job_id, connect_opts: connect_opts)
+      end)
+
+    session
+    |> list_jobs_fun.()
+    |> Enum.filter(&pending_unallocated_job?/1)
+    |> Enum.reduce(0, fn row, acc ->
+      case map_get_job_field(row, :job_id) do
+        nil ->
+          acc
+
+        "" ->
+          acc
+
+        job_id ->
+          _ = cancel_job_fun.(session, job_id)
+          acc + 1
+      end
+    end)
+  end
+
+  @doc """
   Cancels a specific pending allocation waiter process.
 
   Returns `:ok` when a waiter entry was found and signaled, otherwise `:not_found`.
@@ -1789,6 +2058,62 @@ defmodule HpcConnect do
     :ok
   rescue
     _ -> :ok
+  end
+
+  defp pending_unallocated_job?(row) when is_map(row) do
+    state =
+      row
+      |> map_get_job_field(:state)
+      |> to_string()
+      |> String.trim()
+      |> String.upcase()
+
+    node_list =
+      row
+      |> map_get_job_field(:node_list)
+      |> normalize_squeue_node()
+
+    String.starts_with?(state, "PD") and is_nil(node_list)
+  end
+
+  defp pending_unallocated_job?(_), do: false
+
+  defp map_get_job_field(row, key) when is_map(row) do
+    Map.get(row, key) || Map.get(row, Atom.to_string(key))
+  end
+
+  defp session_and_mode!(%Session{} = session), do: {session, :local}
+
+  defp session_and_mode!(%{session: %Session{} = session} = result) do
+    {session, result_mode(result)}
+  end
+
+  defp session_and_mode!(value) do
+    raise ArgumentError,
+          "expected a Session or result map with :session, got: #{inspect(value)}"
+  end
+
+  defp result_mode(%{mode: mode}) when mode in [:livebook, :local], do: mode
+
+  defp result_mode(%{session: %Session{} = session}) do
+    if is_binary(session.credential_dir), do: :livebook, else: :local
+  end
+
+  defp livebook_mode_result?(result), do: result_mode(result) == :livebook
+
+  defp uninstall_remote_cleanup_command(%Session{} = session, remove_models?) do
+    work_dir = Shell.escape(session.work_dir)
+    vault_cache = session |> vault_cache_root() |> Shell.escape()
+
+    if remove_models? do
+      "rm -rf #{work_dir} #{vault_cache}"
+    else
+      "rm -rf #{work_dir} && if [ -d #{vault_cache} ]; then find #{vault_cache} -mindepth 1 -maxdepth 1 ! -name models -exec rm -rf {} +; fi"
+    end
+  end
+
+  defp vault_cache_root(%Session{} = session) do
+    Path.join([session.vault_dir, ".cache", "hpc_connect"])
   end
 
   defp auto_proxy_enabled?(%Session{} = session, opts) do
@@ -2110,6 +2435,7 @@ defmodule HpcConnect do
 
   defp open_proxy_with_retry!(%Session{} = session, node, opts) do
     attempts = max(1, Keyword.get(opts, :attempts, 5))
+    retry_delay_ms = max(0, Keyword.get(opts, :retry_delay_ms, 1_000))
     requested_local_port = Keyword.get(opts, :local_port)
     remote_port = Keyword.get(opts, :remote_port, 8000)
 
@@ -2119,7 +2445,8 @@ defmodule HpcConnect do
       remote_port,
       requested_local_port,
       attempts,
-      MapSet.new()
+      MapSet.new(),
+      retry_delay_ms
     )
   end
 
@@ -2129,7 +2456,8 @@ defmodule HpcConnect do
          _remote_port,
          _requested_local_port,
          0,
-         _tried_ports
+         _tried_ports,
+         _retry_delay_ms
        ) do
     raise RuntimeError, "failed to open SSH proxy after multiple local port attempts"
   end
@@ -2140,7 +2468,8 @@ defmodule HpcConnect do
          remote_port,
          requested_local_port,
          attempts_left,
-         tried_ports
+         tried_ports,
+         retry_delay_ms
        ) do
     local_port = select_proxy_local_port(requested_local_port, tried_ports)
 
@@ -2159,7 +2488,7 @@ defmodule HpcConnect do
     rescue
       err in RuntimeError ->
         if attempts_left > 1 do
-          Process.sleep(150)
+          Process.sleep(retry_delay_ms)
 
           do_open_proxy_with_retry!(
             session,
@@ -2167,7 +2496,8 @@ defmodule HpcConnect do
             remote_port,
             nil,
             attempts_left - 1,
-            MapSet.put(tried_ports, local_port)
+            MapSet.put(tried_ports, local_port),
+            retry_delay_ms
           )
         else
           reraise err, __STACKTRACE__
@@ -2996,18 +3326,18 @@ defmodule HpcConnect do
   end
 
   # Returns true when STEADY_SSH_CONNECTION is enabled via opt, session env, or OS env.
-  defp steady_ssh_connection?(session, opts) do
-    truthy = fn v -> v in ["true", "1", "yes", true] end
+  # defp steady_ssh_connection?(session, opts) do
+  #   truthy = fn v -> v in ["true", "1", "yes", true] end
 
-    cond do
-      Keyword.has_key?(opts, :steady_ssh_connection) ->
-        truthy.(Keyword.get(opts, :steady_ssh_connection))
+  #   cond do
+  #     Keyword.has_key?(opts, :steady_ssh_connection) ->
+  #       truthy.(Keyword.get(opts, :steady_ssh_connection))
 
-      Map.has_key?(session.env, "STEADY_SSH_CONNECTION") ->
-        truthy.(session.env["STEADY_SSH_CONNECTION"])
+  #     Map.has_key?(session.env, "STEADY_SSH_CONNECTION") ->
+  #       truthy.(session.env["STEADY_SSH_CONNECTION"])
 
-      true ->
-        truthy.(System.get_env("STEADY_SSH_CONNECTION", "false"))
-    end
-  end
+  #     true ->
+  #       truthy.(System.get_env("STEADY_SSH_CONNECTION", "false"))
+  #   end
+  # end
 end
