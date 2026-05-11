@@ -1,0 +1,275 @@
+# HPC Connect test notebook
+
+```elixir
+Mix.install([
+	{:kino, "~> 0.19"},
+	{:table, "0.1.2"},
+	{:hpc_connect, github: "penthooose/hpc_connect", force: true}
+])
+```
+
+## Minimal Livebook flow
+
+`HpcConnect.prepare_livebook_session/1` helper wraps the Livebook-only
+`Kino.Input.*` UI into a single form. The text/select values can optionally be
+reused on the next notebook open via `persist_form: true`, but the uploaded SSH
+key must still be selected again each time, as it will be overwritten to not persist.
+
+```elixir
+boot =
+	HpcConnect.prepare_livebook_session(
+		cluster: :alex,
+		remote_command: "hostname && whoami",
+		work_dir: "$HOME/.cache/hpc_connect",
+		vault_dir: "$HOME/vault/hpc_connect",
+		persist_form: true,
+		submit_label: "Connect to HPC"
+	)
+	|> HpcConnect.bootstrap()
+
+session = boot.session
+boot
+```
+
+## Bootstrap quick summary
+
+```elixir
+%{
+	details: boot.details,
+	probe: boot.probe,
+	command_preview: boot.command_preview
+}
+```
+
+```elixir
+%{
+	gpus: boot.gpus,
+	models: boot.models,
+	quota: boot.quota,
+	jobs: boot.jobs
+}
+
+# or all together summarized:
+# boot.startup
+```
+
+```elixir
+boot.startup
+```
+
+```elixir
+# HpcConnect.cancel_all_jobs(session)
+```
+
+## vLLM test configuration
+
+```elixir
+vllm_args = [
+	partition: "a100",
+	gpus: 1,
+	walltime: "02:00:00",
+	model: "meta-llama/Llama-3.2-1B-Instruct",
+	port: 50200
+]
+```
+
+## Start vLLM
+
+```elixir
+vllm =
+	HpcConnect.start_app(session,
+		app: "vllm",
+		args: vllm_args
+	)
+```
+
+## Talk to the running app
+
+```elixir
+HpcConnect.vllm_chat(vllm, "Hello from Livebook")
+```
+
+```elixir
+answer =
+	HpcConnect.vllm_chat(
+		vllm,
+		"Can you solve: forall x in {a,b}: (P(x) -> Q(x)) and (Q(x) -> R(x))"
+	).answer
+
+answer
+|> String.split("\n")
+|> Enum.each(&IO.puts/1)
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Kill the Job and Delete Session
+
+```elixir
+HpcConnect.cancel_job(session, vllm.job_id)
+
+# or directly with the job ID:
+# HpcConnect.cancel_job(session, "JOBID")
+```
+
+if session was interrupted, or you want to cancel all jobs:
+
+```elixir
+HpcConnect.cancel_all_jobs(session)
+
+# to check if all jobs are gone:
+HpcConnect.list_jobs_summary(session)
+```
+
+Clean all session data (SSH key file):
+
+```elixir
+HpcConnect.cleanup_livebook_session(session)
+```
+
+---
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Manual status queries after the app test
+
+These are the explicit query commands that mostly duplicate the boot summaries,
+so they live down here now.
+
+```elixir
+HpcConnect.available_gpu_summary(session)
+```
+
+```elixir
+HpcConnect.list_downloaded_models(session)
+```
+
+```elixir
+HpcConnect.quota_summary(session)
+```
+
+```elixir
+HpcConnect.list_jobs_summary(session)
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Download a model from HuggingFace
+
+```elixir
+HpcConnect.download_model(session, "meta-llama/Llama-3.2-1B-Instruct")
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Build an Apptainer SIF image
+
+```elixir
+HpcConnect.build_sif(session, "vllm")
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Allocate GPU interactively without running an app
+
+```elixir
+alloc = HpcConnect.allocate_gpu(session, partition: "a100", walltime: "01:00:00")
+
+# Release GPU
+# HpcConnect.release_gpu(session, alloc)
+
+# or with job id directly:
+# HpcConnect.release_gpu(session, "JOBID")
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Reconnect to an existing vLLM job after notebook/runtime restart
+
+```elixir
+# get the Job ID
+[%{job_id: job_id} | _others] = HpcConnect.list_jobs_summary(session)
+job_id
+```
+
+```elixir
+reconnected_vllm =
+	HpcConnect.reconnect(session, job_id,
+		app: "vllm",
+		args: [port: 50200]
+	)
+```
+
+```elixir
+HpcConnect.vllm_chat(reconnected_vllm, "Hello from Livebook")
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Remote Apptainer paths and HPC_Connect files reupload
+
+`bootstrap/1` already installs the bundled helper scripts and uploads bundled
+definition files by default, so the next cells are mainly useful for reruns or
+debugging.
+
+```elixir
+HpcConnect.remote_def_path(session)
+```
+
+```elixir
+HpcConnect.remote_sif_path(session)
+```
+
+```elixir
+# reuploads any hpc_connect files needed for proper execution
+HpcConnect.install_remote_scripts!(session)
+```
+
+```elixir
+HpcConnect.upload_def_file(session)
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Cleanup
+
+Run this `exit` command to cancel all jobs and cleanup the session data (includes SSH file), and clear apptainer cache:
+
+```elixir
+HpcConnect.exit(boot)
+```
+
+Clear Apptainer cache to free up some space on the cluster:
+
+```elixir
+HpcConnect.clear_app_cache(boot)
+```
+
+Use this to only cleanup the session when you still have `boot` or `session`:
+
+```elixir
+HpcConnect.cleanup_livebook_session(boot)
+```
+
+Use this only as a recovery helper after an interrupted notebook/runtime where
+you no longer have the original `boot` or `session` value:
+
+```elixir
+HpcConnect.cleanup_livebook_orphans(delete_uploaded: true)
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Uninstall HPC_Connect from HPC
+
+Remove all files on the cluster file system connected to HPC_Connect
+
+```elixir
+HpcConnect.uninstall(boot)
+```
+
+Remove all files including downloaded models:
+
+```elixir
+HpcConnect.uninstall(boot, remove_models: true)
+```
