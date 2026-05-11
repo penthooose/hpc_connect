@@ -129,10 +129,10 @@ defmodule HpcConnect do
 
     session =
       result.session
-      |> maybe_prepare_bootstrap_native_key(resolved_opts)
+      |> maybe_prepare_bootstrap_native_key(setup_opts)
       |> merge_bootstrap_runtime_env(resolved_opts)
       |> maybe_apply_hf_token(resolved_opts)
-      |> maybe_open_bootstrap_native_connection(resolved_opts)
+      |> maybe_open_bootstrap_native_connection(setup_opts)
 
     setup_session =
       if Keyword.get(resolved_opts, :install_scripts, true) do
@@ -198,8 +198,9 @@ defmodule HpcConnect do
 
   defp maybe_prepare_local_native_key(opts) do
     mode = Keyword.get(opts, :mode, :livebook)
+    native_ssh? = Keyword.get(opts, :native_ssh, false)
 
-    if mode == :local do
+    if mode == :local and native_ssh? do
       key = Keyword.get(opts, :key_path) || Keyword.get(opts, :uploaded_key_path)
 
       case normalize_key_path(key) do
@@ -1119,13 +1120,15 @@ defmodule HpcConnect do
 
   vLLM convenience controls (`app: "vllm"` only):
   - `:native_ssh` (default: `false`) enables a persistent native `:ssh` session
+    (existing `session.ssh_conn` is used only when this is explicitly `true`)
   - `:native_ssh_fallback_to_os` (default: `false`) — when `true`, falls back
     to managed OpenSSH commands/tunnel if native `:ssh` cannot connect
   - `:proxy_jump_via_native` (default: `true`) enables native ProxyJump tunnel
     (`:ssh.tcpip_tunnel_to_server`) when direct connect is blocked
-  - `:proxy_jump_via_os` (default: `false`) —
-    enables managed OpenSSH ProxyJump tunnel fallback if native jump tunneling
-    cannot be established; set `false` for strict native-only behavior
+  - `:proxy_jump_via_os` (default: `true` when ProxyJump is required,
+    otherwise `false`) — enables managed OpenSSH ProxyJump tunnel fallback if
+    native jump tunneling cannot be established; set `false` for strict
+    native-only behavior
     - `:auto_proxy` (default depends on `:native_ssh`) where:
       - with `native_ssh: false` (default), managed OpenSSH proxy is enabled
       - with `native_ssh: true`, managed OpenSSH proxy is disabled unless enabled/fallback
@@ -1209,24 +1212,10 @@ defmodule HpcConnect do
 
   defp maybe_prepare_session_for_app(%Session{} = session, app, opts) do
     app_name = app |> to_string() |> String.downcase()
-
-    # Native Erlang :ssh requires a direct TCP connection to each SSH hop.
-    # For FAU NHR clusters (alex, fritz, etc.) alex.nhr.fau.de is NOT directly
-    # TCP-reachable — it requires the csnhr.nhr.fau.de ProxyJump. Worse: alex
-    # actively rejects SSH connections originating from csnhr (only external
-    # clients are allowed in), so a 2-hop Erlang SSH chain is also impossible.
-    #
-    # OS SSH handles this transparently via ProxyJump in ~/.ssh/config: it uses
-    # alex as a pure TCP forwarder without doing a full SSH handshake to it.
-    # Erlang :ssh always does a full handshake at each hop, so it cannot replicate
-    # this topology at all.
-    #
-    # Therefore: skip native SSH whenever the cluster has a proxy_jump configured.
-    # The OS SSH proxy (openssh_proxy access_mode) is always used instead.
     proxy_jump_required? = is_binary(session.proxy_jump) and session.proxy_jump != ""
 
     if app_name == "vllm" and Keyword.get(opts, :native_ssh, false) and
-         is_nil(session.ssh_conn) and not proxy_jump_required? do
+         is_nil(session.ssh_conn) do
       IO.puts(
         "[HpcConnect] Native stage 1/2: establish login-node SSH session to #{session.cluster.host} " <>
           "(alias: #{Session.target(session)})."
@@ -1240,6 +1229,13 @@ defmodule HpcConnect do
         "[HpcConnect] Native SSH equivalent (diagnostic): #{SSH.native_login_connect_preview(session)}"
       )
 
+      if proxy_jump_required? do
+        IO.puts(
+          "[HpcConnect] ProxyJump required via #{session.proxy_jump}; " <>
+            "using hybrid native strategy (native jump first, OpenSSH bridge fallback if needed)."
+        )
+      end
+
       native_ssh_fallback_to_os? = Keyword.get(opts, :native_ssh_fallback_to_os, false)
       open_connection_fun = Keyword.get(opts, :open_connection_fun, &open_connection!/2)
 
@@ -1250,23 +1246,19 @@ defmodule HpcConnect do
 
       if native_key_ok? do
         try do
-          # Connect DIRECTLY to the login node — only reached when proxy_jump is nil,
-          # meaning the cluster host is TCP-reachable without an intermediate hop.
-          login_session = %{session | proxy_jump: nil}
-
           open_opts = [
             timeout: Keyword.get(opts, :ssh_timeout_ms, 20_000),
             attempts: Keyword.get(opts, :ssh_attempts, 3),
-            proxy_jump_via_native: false,
-            proxy_jump_via_os: false
+            proxy_jump_via_native: Keyword.get(opts, :proxy_jump_via_native, true),
+            proxy_jump_via_os:
+              case Keyword.fetch(opts, :proxy_jump_via_os) do
+                {:ok, value} -> value
+                :error -> proxy_jump_required?
+              end
           ]
 
-          {updated, _tunnel} = open_connection_fun.(login_session, open_opts)
-
-          # Preserve the original proxy_jump on the returned session so that the
-          # rest of the pipeline (OS proxy commands, diagnostics) still sees the
-          # full cluster topology.
-          %{updated | proxy_jump: session.proxy_jump}
+          {updated, _tunnel} = open_connection_fun.(session, open_opts)
+          updated
         rescue
           e in RuntimeError ->
             key_hint = native_ssh_key_hint(session)
@@ -1296,16 +1288,6 @@ defmodule HpcConnect do
         end
       end
     else
-      if proxy_jump_required? and Keyword.get(opts, :native_ssh, false) and
-           is_nil(session.ssh_conn) do
-        IO.puts(
-          "[HpcConnect] Skipping native Erlang SSH for #{session.cluster.host}: " <>
-            "cluster requires ProxyJump via #{session.proxy_jump}. " <>
-            "Erlang :ssh cannot replicate the OS SSH transparent-proxy topology " <>
-            "(alex blocks SSH from #{session.proxy_jump}). Using OS SSH proxy instead."
-        )
-      end
-
       session
     end
   end
@@ -1427,7 +1409,9 @@ defmodule HpcConnect do
         # This is fully native — no OS process, no background port — the tunnel
         # lives inside the existing :ssh connection and stays open as long as
         # session.ssh_conn is alive.
-        native_conn = session.ssh_conn
+        # Keep OpenSSH proxy as the default access path unless the caller
+        # explicitly opts into native SSH for this app launch.
+        native_conn = if Keyword.get(opts, :native_ssh, false), do: session.ssh_conn, else: nil
 
         if not is_nil(native_conn) do
           local_port = Keyword.get(opts, :local_port, 0)
@@ -2129,20 +2113,36 @@ defmodule HpcConnect do
     requested_local_port = Keyword.get(opts, :local_port)
     remote_port = Keyword.get(opts, :remote_port, 8000)
 
-    do_open_proxy_with_retry!(session, node, remote_port, requested_local_port, attempts)
+    do_open_proxy_with_retry!(
+      session,
+      node,
+      remote_port,
+      requested_local_port,
+      attempts,
+      MapSet.new()
+    )
   end
 
-  defp do_open_proxy_with_retry!(_session, _node, _remote_port, _requested_local_port, 0) do
+  defp do_open_proxy_with_retry!(
+         _session,
+         _node,
+         _remote_port,
+         _requested_local_port,
+         0,
+         _tried_ports
+       ) do
     raise RuntimeError, "failed to open SSH proxy after multiple local port attempts"
   end
 
-  defp do_open_proxy_with_retry!(session, node, remote_port, requested_local_port, attempts_left) do
-    local_port =
-      if attempts_left == 1 and is_integer(requested_local_port) do
-        requested_local_port
-      else
-        requested_local_port || SSH.find_free_local_port()
-      end
+  defp do_open_proxy_with_retry!(
+         session,
+         node,
+         remote_port,
+         requested_local_port,
+         attempts_left,
+         tried_ports
+       ) do
+    local_port = select_proxy_local_port(requested_local_port, tried_ports)
 
     proxy = start_proxy(session, node, remote_port: remote_port, local_port: local_port)
 
@@ -2159,19 +2159,53 @@ defmodule HpcConnect do
     rescue
       err in RuntimeError ->
         if attempts_left > 1 do
-          do_open_proxy_with_retry!(session, node, remote_port, nil, attempts_left - 1)
+          Process.sleep(150)
+
+          do_open_proxy_with_retry!(
+            session,
+            node,
+            remote_port,
+            nil,
+            attempts_left - 1,
+            MapSet.put(tried_ports, local_port)
+          )
         else
           reraise err, __STACKTRACE__
         end
     end
   end
 
+  defp select_proxy_local_port(requested_local_port, tried_ports)
+       when is_integer(requested_local_port) and requested_local_port > 0 do
+    if MapSet.member?(tried_ports, requested_local_port) do
+      next_free_local_port(tried_ports)
+    else
+      requested_local_port
+    end
+  end
+
+  defp select_proxy_local_port(_requested_local_port, tried_ports) do
+    next_free_local_port(tried_ports)
+  end
+
+  defp next_free_local_port(tried_ports) do
+    port = SSH.find_free_local_port()
+
+    if MapSet.member?(tried_ports, port) do
+      next_free_local_port(tried_ports)
+    else
+      port
+    end
+  end
+
   defp wait_for_local_proxy_port!(port, local_port, timeout_ms, waited \\ 0)
 
-  defp wait_for_local_proxy_port!(_port, local_port, timeout_ms, waited)
+  defp wait_for_local_proxy_port!(port, local_port, timeout_ms, waited)
        when waited >= timeout_ms do
+    details = proxy_port_failure_details(port)
+
     raise RuntimeError,
-          "SSH proxy did not open localhost:#{local_port} within #{timeout_ms}ms"
+          "SSH proxy did not open localhost:#{local_port} within #{timeout_ms}ms#{details}"
   end
 
   defp wait_for_local_proxy_port!(port, local_port, timeout_ms, waited) do
@@ -2182,14 +2216,43 @@ defmodule HpcConnect do
 
       {:error, _reason} ->
         if Port.info(port) == nil do
+          details = proxy_port_failure_details(port)
+
           raise RuntimeError,
-                "SSH proxy process exited before localhost:#{local_port} became reachable"
+                "SSH proxy process exited before localhost:#{local_port} became reachable#{details}"
         else
           Process.sleep(200)
           wait_for_local_proxy_port!(port, local_port, timeout_ms, waited + 200)
         end
     end
   end
+
+  defp proxy_port_failure_details(port) when is_port(port) do
+    case TunnelManager.port_info(port) do
+      {:ok, %{output: output, exit_status: exit_status}} ->
+        output_part =
+          output
+          |> to_string()
+          |> String.trim()
+
+        status_part = if is_integer(exit_status), do: " (exit #{exit_status})", else: ""
+
+        case output_part do
+          "" ->
+            status_part
+
+          text ->
+            "#{status_part}: #{text}"
+        end
+
+      _ ->
+        ""
+    end
+  rescue
+    _ -> ""
+  end
+
+  defp proxy_port_failure_details(_), do: ""
 
   @doc """
   Sends a chat completion request to a running vLLM OpenAI-compatible endpoint.

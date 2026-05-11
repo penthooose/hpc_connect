@@ -396,12 +396,12 @@ defmodule HpcConnect.SSH do
   API calls — commands will run over the connection without spawning any new OS
   processes.
 
-  ## Why this is better than per-command `ssh.exe`
+  ## Why this is better than per-command OpenSSH
 
   - One TCP handshake and key exchange for the whole session
   - No external processes per command → no CMD windows, works in Livebook
   - Connection-drop is detectable (`:ssh` sends `{:EXIT, conn, reason}`)
-  - SCP upload goes over the same connection via SFTP — no `scp.exe`
+  - SCP upload goes over the same connection via SFTP — no external `scp` process
 
   ## ProxyJump handling
 
@@ -1103,7 +1103,7 @@ defmodule HpcConnect.SSH do
   Executes a remote command over a **persistent** `:ssh` connection.
 
   The session must have been updated by `open_connection!/1`. Falls back to
-  the OS `ssh.exe` path when `session.ssh_conn` is `nil`.
+  the OS OpenSSH (`ssh`) path when `session.ssh_conn` is `nil`.
 
   Returns `{output_binary, exit_status}` — same contract as `run/2`.
   """
@@ -1141,9 +1141,9 @@ defmodule HpcConnect.SSH do
 
   @doc """
   Uploads a local file or directory to the remote over the persistent SSH connection
-  using SFTP. No `scp.exe` needed.
+  using SFTP. No external `scp` process needed.
 
-  Falls back to OS `scp.exe` when `session.ssh_conn` is `nil`.
+  Falls back to OS `scp` when `session.ssh_conn` is `nil`.
   """
   @spec upload!(Session.t(), binary(), binary(), keyword()) :: :ok
   def upload!(%Session{ssh_conn: nil} = session, local_path, remote_path, opts) do

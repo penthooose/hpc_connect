@@ -204,6 +204,30 @@ defmodule HpcConnectTest do
     assert File.exists?(key_path)
   end
 
+  test "connection_setup local keeps original key when native_ssh is disabled" do
+    tmp_dir = Path.join(System.tmp_dir!(), "hpc_connect_local_key_mode")
+    File.mkdir_p!(tmp_dir)
+
+    key_path = Path.join(tmp_dir, "id_hpc_original")
+    fallback_path = key_path <> "_hpc_connect_pem"
+
+    File.write!(key_path, "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKE\n")
+    File.write!(fallback_path, "-----BEGIN RSA PRIVATE KEY-----\nFAKE\n")
+
+    result =
+      HpcConnect.connection_setup(
+        mode: :local,
+        cluster: :alex,
+        username: "hpcusr01",
+        key_path: key_path,
+        native_ssh: false,
+        connect_fun: fn _session, _command, _opts -> "LOCAL\n" end
+      )
+
+    assert result.session.identity_file == Path.expand(key_path)
+    refute result.session.identity_file == Path.expand(fallback_path)
+  end
+
   test "bootstrap loads env file into session and returns startup summary" do
     tmp_dir = Path.join(System.tmp_dir!(), "hpc_connect_bootstrap_test")
     File.mkdir_p!(tmp_dir)
@@ -426,6 +450,7 @@ defmodule HpcConnectTest do
         ssh_alias: "alex",
         identity_file: "/tmp/id_hpc_test"
       )
+      |> Map.put(:ssh_conn, make_ref())
 
     submit_fun = fn _session, _slurm_opts ->
       %{
@@ -461,10 +486,89 @@ defmodule HpcConnectTest do
       }
     end
 
+    open_native_tunnel_fun = fn _session,
+                                _native_conn,
+                                _node,
+                                _remote_port,
+                                _local_port,
+                                _timeout ->
+      send(parent, :native_tunnel_attempted)
+      {make_ref(), 50_599}
+    end
+
     result =
       HpcConnect.start_app(session,
         app: "vllm",
         args: [partition: "a40", gpus: 1, walltime: "02:00:00", port: 50_200],
+        submit_fun: submit_fun,
+        open_connection_fun: open_connection_fun,
+        open_native_tunnel_fun: open_native_tunnel_fun,
+        open_proxy_fun: open_proxy_fun,
+        wait_for_node: false,
+        wait_for_app: false
+      )
+
+    refute_receive :native_connect_attempted
+    refute_receive :native_tunnel_attempted
+    assert_receive {:proxy_opened_default, "a0999", 50_200}
+
+    assert result.access_mode == :openssh_proxy
+    assert result.base_url == "http://localhost:50501"
+    assert result.proxy.os_pid == 42
+  end
+
+  test "start_app attempts hybrid native ProxyJump first, then falls back to managed proxy" do
+    parent = self()
+
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test"
+      )
+
+    submit_fun = fn _session, _slurm_opts ->
+      %{
+        job_id: "12347",
+        node: "a0902",
+        partition: "a100",
+        gpus: 1,
+        walltime: "02:00:00",
+        port: 50_200,
+        sif_path: "/remote/vllm.sif",
+        logs_dir: "/remote/logs"
+      }
+    end
+
+    open_connection_fun = fn _session, open_opts ->
+      send(
+        parent,
+        {:native_connect_attempted, open_opts[:proxy_jump_via_native],
+         open_opts[:proxy_jump_via_os]}
+      )
+
+      raise RuntimeError, "native bridge timeout"
+    end
+
+    open_proxy_fun = fn _session, node, proxy_opts ->
+      send(parent, {:proxy_opened_proxy_jump, node, proxy_opts[:remote_port]})
+
+      {
+        %{
+          base_url: "http://localhost:50502",
+          local_port: 50_502,
+          remote_port: proxy_opts[:remote_port],
+          node: node
+        },
+        make_ref()
+      }
+    end
+
+    result =
+      HpcConnect.start_app(session,
+        app: "vllm",
+        native_ssh: true,
+        args: [partition: "a100", gpus: 1, walltime: "02:00:00", port: 50_200],
         submit_fun: submit_fun,
         open_connection_fun: open_connection_fun,
         open_proxy_fun: open_proxy_fun,
@@ -472,12 +576,12 @@ defmodule HpcConnectTest do
         wait_for_app: false
       )
 
-    refute_receive :native_connect_attempted
-    assert_receive {:proxy_opened_default, "a0999", 50_200}
+    assert_receive {:native_connect_attempted, true, true}
+    assert_receive {:proxy_opened_proxy_jump, "a0902", 50_200}
 
     assert result.access_mode == :openssh_proxy
-    assert result.base_url == "http://localhost:50501"
-    assert result.proxy.os_pid == 42
+    assert result.base_url == "http://localhost:50502"
+    assert result.native_error =~ "native bridge timeout"
   end
 
   test "kill_proxy closes tracked proxy by session and node" do
