@@ -223,10 +223,13 @@ defmodule HpcConnect.SSH do
   end
 
   defp ssh_option_args(session) do
+    proxy_jump =
+      if include_explicit_proxy_jump?(session), do: proxy_jump_target(session), else: nil
+
     base =
       []
       |> maybe_append_option("-F", session.ssh_config_file)
-      |> maybe_append_option("-J", proxy_jump_target(session))
+      |> maybe_append_option("-J", proxy_jump)
       |> maybe_append_option("-i", session.identity_file)
 
     base =
@@ -251,10 +254,13 @@ defmodule HpcConnect.SSH do
   end
 
   defp scp_option_args(session) do
+    proxy_jump =
+      if include_explicit_proxy_jump?(session), do: proxy_jump_target(session), else: nil
+
     base =
       []
       |> maybe_append_option("-F", session.ssh_config_file)
-      |> maybe_append_option("-J", proxy_jump_target(session))
+      |> maybe_append_option("-J", proxy_jump)
       |> maybe_append_option("-i", session.identity_file)
 
     base =
@@ -367,6 +373,19 @@ defmodule HpcConnect.SSH do
     |> Enum.map(&preview_arg(to_string(&1)))
     |> Enum.join(" ")
   end
+
+  # Livebook sessions use generated ssh_config files that already define
+  # ProxyJump per host. Avoid appending an extra `-J` in that case.
+  defp include_explicit_proxy_jump?(%Session{
+         ssh_config_file: config,
+         credential_dir: credential_dir
+       })
+       when is_binary(config) and config != "" and is_binary(credential_dir) and
+              credential_dir != "" do
+    false
+  end
+
+  defp include_explicit_proxy_jump?(_session), do: true
 
   defp proxy_jump_target(%Session{} = session) do
     cond do

@@ -8,7 +8,7 @@ Mix.install([
 ])
 ```
 
-## Minimal Livebook flow
+## Setup and bootstrap
 
 `HpcConnect.prepare_livebook_session/1` helper wraps the Livebook-only
 `Kino.Input.*` UI into a single form. The text/select values can optionally be

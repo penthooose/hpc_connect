@@ -120,6 +120,7 @@ defmodule HpcConnectTest do
     assert preview =~ "-F"
     assert preview =~ session.ssh_config_file
     assert preview =~ "fritz"
+    refute preview =~ " -J "
 
     config = File.read!(session.ssh_config_file)
     assert config =~ "Host fritz.nhr.fau.de fritz"
