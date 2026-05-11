@@ -671,14 +671,164 @@ defmodule HpcConnect do
   def connect!(session, remote_command \\ "hostname", opts \\ [])
 
   def connect!(%Session{ssh_conn: nil} = session, remote_command, opts) do
-    session
-    |> connect_command(remote_command)
-    |> run_command!(opts)
+    run_fun = Keyword.get(opts, :run_fun, &run_command!/2)
+    run_opts = Keyword.drop(opts, [:run_fun])
+
+    command = connect_command(session, remote_command)
+
+    try do
+      run_fun.(command, run_opts)
+    rescue
+      e in RuntimeError ->
+        maybe_retry_livebook_connect_with_proxy_variants!(
+          session,
+          command,
+          run_opts,
+          run_fun,
+          e,
+          __STACKTRACE__
+        )
+    end
   end
 
   def connect!(%Session{} = session, remote_command, opts) do
     SSH.exec!(session, remote_command, opts)
   end
+
+  defp maybe_retry_livebook_connect_with_proxy_variants!(
+         %Session{} = session,
+         %Command{} = command,
+         run_opts,
+         run_fun,
+         %RuntimeError{} = error,
+         stacktrace
+       ) do
+    if retry_livebook_proxy_variants?(session, error) do
+      case run_first_successful_command(
+             livebook_proxy_fallback_commands(session, command),
+             run_fun,
+             run_opts
+           ) do
+        {:ok, output} -> output
+        :error -> reraise error, stacktrace
+      end
+    else
+      reraise error, stacktrace
+    end
+  end
+
+  defp retry_livebook_proxy_variants?(%Session{} = session, %RuntimeError{} = error) do
+    is_binary(session.credential_dir) and session.credential_dir != "" and
+      is_binary(session.ssh_config_file) and session.ssh_config_file != "" and
+      recoverable_ssh_connect_error?(Exception.message(error))
+  end
+
+  defp recoverable_ssh_connect_error?(message) when is_binary(message) do
+    String.contains?(message, "exit status 255") and
+      Enum.any?(
+        [
+          "UNKNOWN port 65535",
+          "banner exchange",
+          "Connection timed out",
+          "Connection refused",
+          "Connection closed",
+          "No route to host",
+          "Could not resolve hostname",
+          "Name or service not known"
+        ],
+        &String.contains?(message, &1)
+      )
+  end
+
+  defp recoverable_ssh_connect_error?(_), do: false
+
+  defp run_first_successful_command(commands, run_fun, run_opts) do
+    Enum.reduce_while(commands, :error, fn candidate, _acc ->
+      try do
+        {:halt, {:ok, run_fun.(candidate, run_opts)}}
+      rescue
+        _ in RuntimeError -> {:cont, :error}
+      end
+    end)
+  end
+
+  defp livebook_proxy_fallback_commands(%Session{} = session, %Command{} = command) do
+    jump_value =
+      session
+      |> proxy_jump_source()
+      |> format_proxy_jump_value(session.username)
+
+    []
+    |> maybe_add_explicit_proxy_jump_fallback(command, jump_value)
+    |> maybe_add_no_proxy_jump_fallback(command)
+    |> Enum.uniq_by(&command_preview/1)
+  end
+
+  defp proxy_jump_source(%Session{} = session),
+    do: session.proxy_jump || session.cluster.proxy_jump
+
+  defp format_proxy_jump_value(nil, _username), do: nil
+  defp format_proxy_jump_value("", _username), do: nil
+
+  defp format_proxy_jump_value(proxy_jump, username)
+       when is_binary(proxy_jump) and is_binary(username) and username != "" do
+    if String.contains?(proxy_jump, "@") do
+      proxy_jump
+    else
+      "#{username}@#{proxy_jump}"
+    end
+  end
+
+  defp format_proxy_jump_value(proxy_jump, _username) when is_binary(proxy_jump), do: proxy_jump
+  defp format_proxy_jump_value(proxy_jump, _username), do: proxy_jump
+
+  defp maybe_add_explicit_proxy_jump_fallback(commands, _command, nil), do: commands
+
+  defp maybe_add_explicit_proxy_jump_fallback(commands, command, jump_value) do
+    commands ++ [override_proxy_jump_option(command, "ProxyJump=#{jump_value}")]
+  end
+
+  defp maybe_add_no_proxy_jump_fallback(commands, command) do
+    commands ++ [override_proxy_jump_option(command, "ProxyJump=none")]
+  end
+
+  defp override_proxy_jump_option(%Command{args: args} = command, proxy_jump_option)
+       when is_list(args) and is_binary(proxy_jump_option) do
+    {prefix, suffix} = split_ssh_target_suffix(args)
+
+    cleaned_prefix =
+      prefix
+      |> strip_flag_with_value("-J")
+      |> strip_proxy_jump_o_option()
+
+    %{command | args: cleaned_prefix ++ ["-o", proxy_jump_option] ++ suffix}
+  end
+
+  defp split_ssh_target_suffix(args) when is_list(args) and length(args) >= 2 do
+    Enum.split(args, length(args) - 2)
+  end
+
+  defp split_ssh_target_suffix(args), do: {args, []}
+
+  defp strip_flag_with_value([], _flag), do: []
+
+  defp strip_flag_with_value([flag, _value | rest], flag),
+    do: strip_flag_with_value(rest, flag)
+
+  defp strip_flag_with_value([head | rest], flag),
+    do: [head | strip_flag_with_value(rest, flag)]
+
+  defp strip_proxy_jump_o_option([]), do: []
+
+  defp strip_proxy_jump_o_option(["-o", option | rest]) when is_binary(option) do
+    if String.starts_with?(String.downcase(option), "proxyjump=") do
+      strip_proxy_jump_o_option(rest)
+    else
+      ["-o", option | strip_proxy_jump_o_option(rest)]
+    end
+  end
+
+  defp strip_proxy_jump_o_option([head | rest]), do: [head | strip_proxy_jump_o_option(rest)]
 
   @doc """
   Removes temporary credential material created for a Livebook session.

@@ -177,6 +177,96 @@ defmodule HpcConnectTest do
     refute File.exists?(uploaded_key_path)
   end
 
+  test "connect! retries livebook probe with explicit ProxyJump override on recoverable ssh error" do
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test",
+        credential_dir: "/tmp/hpc_connect/livebook_test",
+        ssh_config_file: "/tmp/hpc_connect/livebook_test/config",
+        proxy_jump: nil
+      )
+
+    parent = self()
+    key = make_ref()
+
+    run_fun = fn command, _opts ->
+      attempt = Process.get(key, 0) + 1
+      Process.put(key, attempt)
+
+      preview = HpcConnect.command_preview(command)
+      send(parent, {:livebook_connect_attempt, attempt, preview})
+
+      if attempt == 1 do
+        raise RuntimeError,
+              "command failed with exit status 255: #{preview}\n" <>
+                "Connection timed out during banner exchange\n" <>
+                "Connection to UNKNOWN port 65535 timed out"
+      end
+
+      "OK"
+    end
+
+    assert HpcConnect.connect!(session, "hostname", run_fun: run_fun) == "OK"
+
+    assert_receive {:livebook_connect_attempt, 1, first_preview}
+    refute first_preview =~ "ProxyJump="
+
+    assert_receive {:livebook_connect_attempt, 2, second_preview}
+    assert second_preview =~ "ProxyJump=hpcusr01@csnhr.nhr.fau.de"
+  end
+
+  test "connect! falls back to ProxyJump=none for livebook probe when jump override also fails" do
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test",
+        credential_dir: "/tmp/hpc_connect/livebook_test_none",
+        ssh_config_file: "/tmp/hpc_connect/livebook_test_none/config",
+        proxy_jump: nil
+      )
+
+    parent = self()
+    key = make_ref()
+
+    run_fun = fn command, _opts ->
+      attempt = Process.get(key, 0) + 1
+      Process.put(key, attempt)
+
+      preview = HpcConnect.command_preview(command)
+      send(parent, {:livebook_connect_none_attempt, attempt, preview})
+
+      case attempt do
+        1 ->
+          raise RuntimeError,
+                "command failed with exit status 255: #{preview}\n" <>
+                  "Connection timed out during banner exchange\n" <>
+                  "Connection to UNKNOWN port 65535 timed out"
+
+        2 ->
+          raise RuntimeError,
+                "command failed with exit status 255: #{preview}\n" <>
+                  "Connection refused"
+
+        3 ->
+          "OK-NONE"
+      end
+    end
+
+    assert HpcConnect.connect!(session, "hostname", run_fun: run_fun) == "OK-NONE"
+
+    assert_receive {:livebook_connect_none_attempt, 1, first_preview}
+    refute first_preview =~ "ProxyJump="
+
+    assert_receive {:livebook_connect_none_attempt, 2, second_preview}
+    assert second_preview =~ "ProxyJump=hpcusr01@csnhr.nhr.fau.de"
+
+    assert_receive {:livebook_connect_none_attempt, 3, third_preview}
+    assert third_preview =~ "ProxyJump=none"
+  end
+
   test "command_preview uses generic executable name instead of absolute path" do
     command = %HpcConnect.Command{
       binary: "c:/Windows/System32/OpenSSH/ssh.exe",
