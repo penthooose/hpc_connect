@@ -613,7 +613,7 @@ defmodule HpcConnectTest do
     refute File.exists?(uploaded_key_path)
   end
 
-  test "livebook proxy tunnel command uses full explicit jump chain without generated ssh config recursion" do
+  test "livebook proxy tunnel command uses generated ssh config and cluster-alias jump" do
     tmp_dir =
       Path.join([
         System.tmp_dir!(),
@@ -631,13 +631,13 @@ defmodule HpcConnectTest do
     proxy = HpcConnect.start_proxy(session, "a0705", local_port: 55_000, remote_port: 50_200)
     preview = HpcConnect.command_preview(proxy.command)
 
-    refute preview =~ " -F "
-    refute preview =~ session.ssh_config_file
+    assert preview =~ " -F "
+    assert preview =~ session.ssh_config_file
     assert preview =~ session.known_hosts_file
     assert preview =~ "UserKnownHostsFile=#{session.known_hosts_file}"
     assert preview =~ "-J"
-    assert preview =~ "hpcusr01@csnhr.nhr.fau.de,hpcusr01@alex.nhr.fau.de"
-    assert preview =~ "hpcusr01@alex.nhr.fau.de"
+    assert preview =~ "-J alex"
+    refute preview =~ "hpcusr01@csnhr.nhr.fau.de,hpcusr01@alex.nhr.fau.de"
     assert preview =~ "hpcusr01@a0705"
 
     assert :ok == HpcConnect.cleanup_session(session, delete_uploaded: true)

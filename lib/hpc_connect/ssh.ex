@@ -167,7 +167,7 @@ defmodule HpcConnect.SSH do
   @spec native_compute_tunnel_preview(Session.t(), binary(), pos_integer(), pos_integer() | nil) ::
           binary()
   def native_compute_tunnel_preview(%Session{} = session, node, remote_port, local_port \\ nil) do
-    jump_chain_target = compute_jump_target(session)
+    jump_chain_target = port_forward_jump_target(session)
 
     compute_target =
       case session.username do
@@ -180,6 +180,7 @@ defmodule HpcConnect.SSH do
 
     args =
       []
+      |> maybe_append_option("-F", session.ssh_config_file)
       |> maybe_append_option("-i", session.identity_file)
       |> maybe_append_option("-J", jump_chain_target)
       |> Kernel.++(maybe_user_known_hosts_args(session))
@@ -227,10 +228,11 @@ defmodule HpcConnect.SSH do
   """
   @spec port_forward_command(Session.t(), binary(), pos_integer(), pos_integer()) :: Command.t()
   def port_forward_command(%Session{} = session, node, local_port, remote_port) do
-    # Use an explicit jump chain so port forwarding works without depending on
-    # any generated ssh_config file. For FAU clusters this may be:
-    #   user@csnhr,user@alex
-    jump_chain_target = compute_jump_target(session)
+    # Livebook sessions carry a generated ssh_config with cluster aliases and
+    # ProxyJump entries. Prefer that config-aware path because OpenSSH `-J`
+    # proxy subprocesses may otherwise ignore key/host options from the parent
+    # command. For non-Livebook usage we keep the explicit user@host chain.
+    jump_chain_target = port_forward_jump_target(session)
 
     compute_target =
       case session.username do
@@ -240,6 +242,7 @@ defmodule HpcConnect.SSH do
 
     args =
       []
+      |> maybe_append_option("-F", session.ssh_config_file)
       |> maybe_append_option("-i", session.identity_file)
       |> maybe_append_option("-J", jump_chain_target)
       |> Kernel.++(maybe_user_known_hosts_args(session))
@@ -268,6 +271,14 @@ defmodule HpcConnect.SSH do
         "Tunnel localhost:#{local_port} -> #{node}:#{remote_port} via jump #{jump_chain_target}",
       remote_command: nil
     }
+  end
+
+  defp port_forward_jump_target(%Session{} = session) do
+    if include_explicit_proxy_jump?(session) do
+      compute_jump_target(session)
+    else
+      Session.target(session)
+    end
   end
 
   @doc """
@@ -1393,9 +1404,15 @@ defmodule HpcConnect.SSH do
   # start_proxy/open_proxy flow:
   #   ssh -N -L <local_port>:127.0.0.1:22 <target> [-J <proxy>]
   defp build_proxy_tunnel_args(session, local_port) do
+    jump_target =
+      if include_explicit_proxy_jump?(session),
+        do: proxy_jump_target(session),
+        else: Session.target(session)
+
     []
+    |> maybe_append_option("-F", session.ssh_config_file)
     |> maybe_append_option("-i", session.identity_file)
-    |> maybe_append_option("-J", proxy_jump_target(session))
+    |> maybe_append_option("-J", jump_target)
     |> Kernel.++(maybe_user_known_hosts_args(session))
     |> Kernel.++([
       "-N",

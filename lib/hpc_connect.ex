@@ -2706,8 +2706,11 @@ defmodule HpcConnect do
   end
 
   defp open_proxy_with_retry!(%Session{} = session, node, opts) do
-    attempts = max(1, Keyword.get(opts, :attempts, 5))
-    retry_delay_ms = max(0, Keyword.get(opts, :retry_delay_ms, 1_000))
+    attempts_default = if livebook_session?(session), do: 10, else: 5
+    retry_delay_default = if livebook_session?(session), do: 2_000, else: 1_000
+
+    attempts = max(1, Keyword.get(opts, :attempts, attempts_default))
+    retry_delay_ms = max(0, Keyword.get(opts, :retry_delay_ms, retry_delay_default))
     requested_local_port = Keyword.get(opts, :local_port)
     remote_port = Keyword.get(opts, :remote_port, 8000)
 
