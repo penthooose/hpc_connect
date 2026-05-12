@@ -935,7 +935,11 @@ defmodule HpcConnect.Slurm do
     "connect to host",
     "status 255",
     "timed out during banner exchange",
-    "Connection timed out"
+    "Connection timed out",
+    "No route to host",
+    "Network is unreachable",
+    "UNKNOWN port 65535",
+    "kex_exchange_identification"
   ]
 
   # Runs an SSH command, retrying on transient errors. Raises on non-zero exit.

@@ -41,8 +41,59 @@ defmodule HpcConnect.SSH do
 
   @spec run(Command.t(), keyword()) :: {binary(), non_neg_integer()}
   def run(%Command{binary: binary, args: args}, opts \\ []) do
-    cmd_opts = [stderr_to_stdout: true] ++ opts
-    System.cmd(binary, args, cmd_opts)
+    retries = Keyword.get(opts, :retries, 1)
+    delay_ms = Keyword.get(opts, :retry_delay_ms, 2_000)
+    cmd_opts = [stderr_to_stdout: true] ++ Keyword.drop(opts, [:retries, :retry_delay_ms])
+
+    run_with_retry(binary, args, cmd_opts, retries, delay_ms)
+  end
+
+  @transient_openssh_errors [
+    "connection refused",
+    "connection closed",
+    "connection timed out",
+    "timed out during banner exchange",
+    "connect to host",
+    "no route to host",
+    "network is unreachable",
+    "kex_exchange_identification",
+    "unknown port 65535",
+    "connection reset by peer",
+    "temporary failure in name resolution",
+    "could not resolve hostname"
+  ]
+
+  defp run_with_retry(binary, args, cmd_opts, retries_left, delay_ms) do
+    {output, status} = System.cmd(binary, args, cmd_opts)
+
+    if retries_left > 0 and retryable_openssh_failure?(binary, status, output) do
+      Process.sleep(delay_ms)
+      run_with_retry(binary, args, cmd_opts, retries_left - 1, delay_ms)
+    else
+      {output, status}
+    end
+  end
+
+  defp retryable_openssh_failure?(binary, status, output)
+       when is_binary(binary) and is_integer(status) and is_binary(output) do
+    status == 255 and openssh_binary?(binary) and transient_openssh_error?(output)
+  end
+
+  defp retryable_openssh_failure?(_, _, _), do: false
+
+  defp openssh_binary?(binary) do
+    case binary |> Path.basename() |> String.downcase() do
+      "ssh" -> true
+      "ssh.exe" -> true
+      "scp" -> true
+      "scp.exe" -> true
+      _ -> false
+    end
+  end
+
+  defp transient_openssh_error?(message) when is_binary(message) do
+    down = String.downcase(message)
+    Enum.any?(@transient_openssh_errors, &String.contains?(down, &1))
   end
 
   @spec preview_arg(binary()) :: binary()
@@ -1250,7 +1301,7 @@ defmodule HpcConnect.SSH do
   ]
 
   defp run_scp_with_retry!(%Command{} = cmd, retries_left, delay_ms) do
-    {output, status} = run(cmd)
+    {output, status} = run(cmd, retries: 0)
 
     if status == 0 do
       :ok
