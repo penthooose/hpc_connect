@@ -1,126 +1,157 @@
-## HpcConnect
+# HpcConnect
 
-Minimal Elixir API for FAU/NHR HPC workflows:
+HpcConnect is an Elixir library for FAU/NHR HPC workflows across **Livebook** and **local shell** usage on **Linux** and **Windows**.
 
-- connect via SSH
-- upload/run helper scripts
-- download HF models to vault
-- query SLURM resources
-- allocate GPU nodes
+It standardizes:
 
----
+- SSH-based session setup
+- Livebook uploaded-key handling
+- model download to HPC storage
+- SLURM inspection and job control
+- vLLM job start / reconnect
+- Apptainer/SIF build helpers
+- cleanup and crash recovery
 
-## Command quick map
+## Documentation
 
-### Local mode (IEx)
-
-| Goal                                            | Command                                                                                                                                          |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Build session + startup info                    | `boot = HpcConnect.bootstrap(mode: :local, username: "your_username", key_path: Path.expand("~/.ssh/id_hpc"), cluster: :alex, env_file: ".env")` |
-| Get session                                     | `session = boot.session`                                                                                                                         |
-| Download model                                  | `HpcConnect.download_model(session, "meta-llama/Llama-3.2-1B-Instruct")`                                                                         |
-| List downloaded models                          | `HpcConnect.list_downloaded_models(session)`                                                                                                     |
-| GPU availability summary                        | `HpcConnect.available_gpu_summary(session)`                                                                                                      |
-| Quota summary                                   | `HpcConnect.quota_summary(session)`                                                                                                              |
-| Job summary                                     | `HpcConnect.list_jobs_summary(session)`                                                                                                          |
-| Allocate GPU (only required params: GPU + time) | `alloc = HpcConnect.allocate_gpu(session, partition: "a100", walltime: "02:00:00")`                                                              |
-| Cancel SLURM job                                | `HpcConnect.cancel_job(session, "<job_id>")`                                                                                                     |
-| Re-upload helper scripts (manual)               | `HpcConnect.install_remote_scripts!(session)`                                                                                                    |
-
-### Livebook mode
-
-| Goal                     | Command                                                                                       |
-| ------------------------ | --------------------------------------------------------------------------------------------- |
-| Build session + probe    | `result = HpcConnect.connection_setup(mode: :livebook, remote_command: "hostname && whoami")` |
-| Get session              | `session = result.session`                                                                    |
-| Preview SSH command      | `result.command_preview`                                                                      |
-| Download model           | `HpcConnect.download_model(session, "meta-llama/Llama-3.2-1B-Instruct")`                      |
-| Cleanup temp credentials | `HpcConnect.connection_cleanup(result, delete_uploaded: true)`                                |
-| Cleanup orphan temp dirs | `HpcConnect.cleanup_livebook_orphans(delete_uploaded: true)`                                  |
-
-### Raw API commands
-
-| Function                            | Example                                                                                       |
-| ----------------------------------- | --------------------------------------------------------------------------------------------- |
-| `HpcConnect.connect!/3`             | `HpcConnect.connect!(session, "hostname && whoami")`                                          |
-| `HpcConnect.connect_command/2`      | `cmd = HpcConnect.connect_command(session, "squeue -u $USER")`                                |
-| `HpcConnect.run_command!/2`         | `HpcConnect.run_command!(cmd)`                                                                |
-| `HpcConnect.command_preview/1`      | `HpcConnect.command_preview(cmd)`                                                             |
-| `HpcConnect.module_load_preamble/1` | `HpcConnect.module_load_preamble(modules: HpcConnect.default_modules(), conda_env: "elixir")` |
-| `HpcConnect.new_model/2`            | `model = HpcConnect.new_model("Qwen/Qwen3-0.6B")`                                             |
-| `HpcConnect.new_job/2`              | `job = HpcConnect.new_job(session, port_range: {8000, 8999}, conda_env: "elixir")`            |
-| `HpcConnect.plan/3`                 | `plan = HpcConnect.plan(session, model, job)`                                                 |
+- [Command cheat sheet](docs/commands_cheat_sheet.md)
+- [Manual and troubleshooting](docs/hpc_connect_manual.md)
+- [Livebook example notebook](examples/hpc_connect_tutorial.livemd)
 
 ---
 
-## Allocation and inference flow
+## Two setup workflows
 
-### Option A — persistent allocation (`hold_gpu`)
+### 1. Livebook Session Bootstrap
 
-Holds the SLURM allocation alive as a background Port. Release or let it die with the process.
-
-| Step                                | Command                                                                         |
-| ----------------------------------- | ------------------------------------------------------------------------------- |
-| 1. Hold GPU node (returns on ready) | `alloc = HpcConnect.hold_gpu(session, partition: "a100", walltime: "01:00:00")` |
-| 2. Inspect                          | `alloc.job_id`, `alloc.node`                                                    |
-| 3. Open SSH tunnel to node          | `proxy = HpcConnect.start_proxy(session, alloc.node, remote_port: 8000)`        |
-| 4. Open tunnel port                 | `tunnel = HpcConnect.open_proxy!(proxy)`                                        |
-| 5. Inference base URL               | `proxy.base_url  # => "http://localhost:<port>"`                                |
-| 6. Release                          | `HpcConnect.release_gpu(alloc) ; Port.close(tunnel)`                            |
-
-### Option B — sbatch job (`submit_vllm`)
-
-Submits a self-contained vLLM sbatch script; better for long runs that outlive the Elixir session.
-
-| Step                             | Command                                                                                                                                   |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| 1. Submit vLLM sbatch job        | `job = HpcConnect.submit_vllm(session, "meta-llama/Llama-3.2-1B-Instruct", partition: "a100", walltime: "02:00:00", conda_env: "elixir")` |
-| 2. Wait for compute node         | `node = HpcConnect.wait_for_job_node(session, job.job_id)`                                                                                |
-| 3. Build SSH tunnel info         | `proxy = HpcConnect.start_proxy(session, node, remote_port: job.port)`                                                                    |
-| 4. Open tunnel (background port) | `tunnel = HpcConnect.open_proxy!(proxy)`                                                                                                  |
-| 5. Inference base URL            | `proxy.base_url  # => "http://localhost:<port>"`                                                                                          |
-| 6. Close tunnel + cancel job     | `Port.close(tunnel) ; HpcConnect.cancel_job(session, job.job_id)`                                                                         |
-
-`submit_vllm` options: `:partition`, `:gpus`, `:walltime` (HH:MM:SS), `:port` (default 8000), `:cpus_per_task`, `:modules`, `:conda_env`.
-
----
-
-## Speed up repeated commands: ControlMaster
-
-Each SSH command normally pays ~1–2 s for TCP + key exchange. Open a persistent master once:
+Use this on a shared or local Livebook runtime when the SSH key is uploaded through the notebook UI.
 
 ```elixir
-{session, master} = HpcConnect.open_master!(session)
-# all subsequent commands using session are near-instant
-HpcConnect.connect!(session, "squeue -u $USER")
-HpcConnect.list_downloaded_models(session)
-Port.close(master)  # close when done
+boot =
+  HpcConnect.prepare_livebook_session(
+    cluster: :alex,
+    remote_command: "hostname && whoami",
+    persist_form: true,
+    submit_label: "Connect to HPC"
+  )
+  |> HpcConnect.bootstrap()
+
+session = boot.session
 ```
 
-Requires OpenSSH ≥ 6.7. Windows: build 1803+ for AF_UNIX socket support.
+Notes:
+
+- the form collects **cluster**, **username**, **SSH private key**, and optional **HF token**
+- the uploaded SSH key is copied into a temporary credential directory
+- the optional HF token is used for gated Hugging Face models and is **not persisted**
+- `boot.startup` summarizes GPUs, models, quota, and jobs
+
+Most important Livebook cleanup commands:
+
+```elixir
+HpcConnect.cleanup_livebook_session(boot)
+HpcConnect.cleanup_livebook_orphans(delete_uploaded: true)
+HpcConnect.exit(boot)
+```
+
+Use `cleanup_livebook_orphans/1` only for crash/restart recovery when you no longer have the original `boot` or `session` value.
+
+### 2. Local Bootstrap Workflow
+
+Use this in IEx, scripts, or local automation when the key already exists on disk.
+
+```elixir
+boot =
+  HpcConnect.bootstrap(
+    mode: :local,
+    cluster: :alex,
+    username: "v135ca12",
+    key_path: Path.expand("~/.ssh/id_fau_hpc_connect_pem"),
+    remote_command: "hostname && whoami",
+    env_file: ".env"
+  )
+
+session = boot.session
+```
+
+You can also pass the Hugging Face token explicitly during bootstrap:
+
+```elixir
+boot =
+  HpcConnect.bootstrap(
+    mode: :local,
+    cluster: :alex,
+    username: "v135ca12",
+    key_path: Path.expand("~/.ssh/id_fau_hpc_connect_pem"),
+    hf_token: System.get_env("HF_TOKEN")
+  )
+```
 
 ---
 
-## Default directory behavior
+## Most important commands
 
-| Purpose            | Path                                          |
-| ------------------ | --------------------------------------------- |
-| Work scripts/cache | `/home/hpc/<group>/<user>/.cache/hpc_connect` |
-| Models vault root  | `/home/vault/<group>/<user>/models`           |
+These are the main commands used in the tutorial notebook.
 
-Examples:
+### Status and inspection
 
-- `hpcusr12 -> /home/hpc/hpcusr/hpcusr12/.cache/hpc_connect`
-- `barz123h -> /home/hpc/barz/barz123h/.cache/hpc_connect`
+```elixir
+HpcConnect.available_gpu_summary(session)
+HpcConnect.list_downloaded_models(session)
+HpcConnect.list_jobs_summary(session)
+HpcConnect.quota_summary(session)
+```
+
+### Model and image preparation
+
+```elixir
+HpcConnect.download_model(session, "meta-llama/Llama-3.2-1B-Instruct")
+HpcConnect.build_sif(session, "vllm")
+```
+
+### Start or reconnect a vLLM app
+
+```elixir
+vllm =
+  HpcConnect.start_app(session,
+    app: "vllm",
+    args: [partition: "a40", gpus: 1, walltime: "02:00:00", port: 50200]
+  )
+
+HpcConnect.vllm_chat(vllm, "Hello from Livebook")
+```
+
+```elixir
+reconnected =
+  HpcConnect.reconnect(session, "JOBID",
+    app: "vllm",
+    args: [port: 50200]
+  )
+```
+
+### Job control and cleanup
+
+```elixir
+HpcConnect.cancel_job(session, "JOBID")
+HpcConnect.cancel_all_jobs(session)
+HpcConnect.cleanup_livebook_session(session)
+HpcConnect.exit(boot)
+```
 
 ---
 
-## Troubleshooting
+## Platform support
 
-| Symptom                                 | Action                                                               |
-| --------------------------------------- | -------------------------------------------------------------------- |
-| `connect to host csnhr... refused`      | Connect VPN, retry SSH                                               |
-| Model saved under literal `'$HOME'` dir | `recompile()` and rebuild session (`bootstrap` / `connection_setup`) |
-| `huggingface_hub is not installed`      | retry `download_model` (auto-installs)                               |
-| Python too old on cluster               | ensure `module load python/3.12-conda` works                         |
-| Remote scripts missing or corrupted     | run `HpcConnect.install_remote_scripts!(session)`                    |
+HpcConnect is designed so that:
+
+- **Livebook mode** works on Linux and Windows runtimes that can execute `ssh`/`scp`
+- **local mode** works on Linux and Windows
+- HPC access uses the system OpenSSH tools for maximum portability
+
+Practical requirements:
+
+- `ssh` and `scp` must be available in `PATH`
+- outbound **TCP port 22** to the first reachable jump/login host must be allowed
+- in shared Linux environments, **IPv4 connectivity** to the jump host is often required
+
+For setup details and troubleshooting, see the [manual](docs/hpc_connect_manual.md).

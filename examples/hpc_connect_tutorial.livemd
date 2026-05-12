@@ -19,6 +19,8 @@ key must still be selected again each time, as it will be overwritten to not per
 boot =
 	HpcConnect.prepare_livebook_session(
 		cluster: :alex,
+		# optional for gated HF models:
+		# hf_token: System.get_env("HF_TOKEN"),
 		remote_command: "hostname && whoami",
 		persist_form: true,
 		submit_label: "Connect to HPC"
@@ -46,24 +48,19 @@ boot
 	quota: boot.quota,
 	jobs: boot.jobs
 }
-
-# or all together summarized:
-# boot.startup
 ```
+
+## or all together summarized:
 
 ```elixir
 boot.startup
-```
-
-```elixir
-# HpcConnect.cancel_all_jobs(session)
 ```
 
 ## vLLM test configuration
 
 ```elixir
 vllm_args = [
-	partition: "a100",
+	partition: "a40",
 	gpus: 1,
 	walltime: "02:00:00",
 	model: "meta-llama/Llama-3.2-1B-Instruct",
@@ -104,10 +101,10 @@ answer
 ## Kill the Job and Delete Session
 
 ```elixir
-HpcConnect.cancel_job(session, vllm.job_id)
+# HpcConnect.cancel_job(session, vllm.job_id)
 
 # or directly with the job ID:
-# HpcConnect.cancel_job(session, "JOBID")
+# HpcConnect.cancel_job(session, "3604228")
 ```
 
 if session was interrupted, or you want to cancel all jobs:
@@ -143,19 +140,13 @@ HpcConnect.list_downloaded_models(session)
 ```
 
 ```elixir
-HpcConnect.quota_summary(session)
-```
-
-```elixir
 HpcConnect.list_jobs_summary(session)
 ```
 
-<!-- livebook:{"branch_parent_index":2} -->
-
-## Download a model from HuggingFace
-
 ```elixir
-HpcConnect.download_model(session, "meta-llama/Llama-3.2-1B-Instruct")
+HpcConnect.quota_summary(session)
+bs_summary(session)
+ama-3.2-1B-Instruct")
 ```
 
 <!-- livebook:{"branch_parent_index":2} -->
