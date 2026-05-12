@@ -910,7 +910,7 @@ defmodule HpcConnectTest do
         identity_file: "/tmp/id_hpc_test"
       )
 
-    output =
+    result =
       HpcConnect.cancel_job(session, "3585776",
         run_fun: fn command, connect_opts ->
           send(parent, {:cancel_job_command, command.remote_command, connect_opts})
@@ -918,7 +918,7 @@ defmodule HpcConnectTest do
         end
       )
 
-    assert output == ""
+    assert result == :ok
     assert_receive {:cancel_job_command, "scancel 3585776", []}
   end
 
@@ -932,7 +932,7 @@ defmodule HpcConnectTest do
         identity_file: "/tmp/id_hpc_test"
       )
 
-    output =
+    result =
       HpcConnect.cancel_job(session, 3_585_776,
         run_fun: fn command, connect_opts ->
           send(parent, {:cancel_job_command, command.remote_command, connect_opts})
@@ -940,7 +940,7 @@ defmodule HpcConnectTest do
         end
       )
 
-    assert output == ""
+    assert result == :ok
     assert_receive {:cancel_job_command, "scancel 3585776", []}
   end
 

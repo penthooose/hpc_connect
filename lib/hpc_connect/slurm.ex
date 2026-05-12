@@ -358,10 +358,13 @@ defmodule HpcConnect.Slurm do
     connect_opts = Keyword.get(opts, :connect_opts, [])
     run_fun = Keyword.get(opts, :run_fun, &SSH.run/2)
 
-    {output, _} =
+    {output, status} =
       session
       |> SSH.ssh_command("scancel #{job_id}", "scancel #{job_id}")
       |> run_fun.(connect_opts)
+
+    if status != 0,
+      do: raise(RuntimeError, "scancel failed (exit #{status}): #{output}")
 
     output
   end

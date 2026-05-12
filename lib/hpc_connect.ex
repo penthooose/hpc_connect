@@ -1175,9 +1175,11 @@ defmodule HpcConnect do
   @doc """
   Cancels a SLURM job by ID.
   """
-  @spec cancel_job(Session.t(), binary() | pos_integer(), keyword()) :: binary()
-  def cancel_job(%Session{} = session, job_id, opts \\ []),
-    do: Slurm.cancel_job(session, job_id, opts)
+  @spec cancel_job(Session.t(), binary() | pos_integer(), keyword()) :: :ok
+  def cancel_job(%Session{} = session, job_id, opts \\ []) do
+    _ = Slurm.cancel_job(session, job_id, opts)
+    :ok
+  end
 
   @doc """
   Cancels every currently listed job for the session user on the current cluster.
@@ -1201,6 +1203,9 @@ defmodule HpcConnect do
 
   def cancel_all_jobs(%Session{} = session, opts) do
     connect_opts = Keyword.get(opts, :connect_opts, [])
+    cleanup_livebook? = Keyword.get(opts, :cleanup_livebook, false)
+    delete_uploaded? = Keyword.get(opts, :delete_uploaded, false)
+    force_uploaded_delete? = Keyword.get(opts, :force_uploaded_delete, false)
 
     list_jobs_fun =
       Keyword.get(opts, :list_jobs_fun, fn inner_session ->
@@ -1212,13 +1217,24 @@ defmodule HpcConnect do
         cancel_job(inner_session, job_id, connect_opts: connect_opts)
       end)
 
-    session
-    |> list_jobs_fun.()
-    |> Enum.map(fn job ->
-      job_id = Map.get(job, :job_id) || Map.get(job, "job_id")
-      output = cancel_job_fun.(session, job_id)
-      Map.put(job, :cancel_output, output)
-    end)
+    canceled =
+      session
+      |> list_jobs_fun.()
+      |> Enum.map(fn job ->
+        job_id = Map.get(job, :job_id) || Map.get(job, "job_id")
+        output = cancel_job_fun.(session, job_id)
+        Map.put(job, :cancel_output, output)
+      end)
+
+    if cleanup_livebook? and livebook_session?(session) do
+      _ =
+        cleanup_livebook_session(session,
+          delete_uploaded: delete_uploaded?,
+          force_uploaded_delete: force_uploaded_delete?
+        )
+    end
+
+    canceled
   end
 
   @doc """
@@ -1632,10 +1648,61 @@ defmodule HpcConnect do
 
     submitted = submit_app_job(session, slurm_opts, opts)
 
-    submitted
-    |> maybe_wait_for_allocation(session, opts)
-    |> maybe_attach_vllm_access(session, app, opts)
+    submitted =
+      submitted
+      |> maybe_wait_for_allocation(session, opts)
+
+    maybe_attach_vllm_access_with_start_fallback(submitted, session, app, opts)
   end
+
+  defp maybe_attach_vllm_access_with_start_fallback(submitted, %Session{} = session, app, opts) do
+    app_name = app |> to_string() |> String.downcase()
+
+    if app_name == "vllm" and not Keyword.get(opts, :reconnect, false) and
+         Keyword.get(opts, :start_app_reconnect_fallback, true) do
+      try do
+        maybe_attach_vllm_access(submitted, session, app, opts)
+      rescue
+        e in RuntimeError ->
+          message = Exception.message(e)
+
+          if proxy_attach_retryable_error?(message) and submitted[:job_id] not in [nil, ""] do
+            IO.puts(
+              "[HpcConnect] start_app vLLM attach failed; retrying via reconnect pipeline: #{message}"
+            )
+
+            reconnect(session, submitted.job_id, Keyword.put(opts, :app, app))
+          else
+            reraise e, __STACKTRACE__
+          end
+      end
+    else
+      maybe_attach_vllm_access(submitted, session, app, opts)
+    end
+  end
+
+  defp proxy_attach_retryable_error?(message) when is_binary(message) do
+    down = String.downcase(message)
+
+    Enum.any?(
+      [
+        "ssh proxy process exited before localhost",
+        "ssh proxy did not open localhost",
+        "failed to open ssh proxy process",
+        "connect to host",
+        "network is unreachable",
+        "no route to host",
+        "unknown port 65535",
+        "kex_exchange_identification",
+        "connection timed out",
+        "status 255",
+        "exit 255"
+      ],
+      &String.contains?(down, &1)
+    )
+  end
+
+  defp proxy_attach_retryable_error?(_), do: false
 
   @doc """
   Reconnects to an already submitted/running app job without submitting a new one.
@@ -2009,10 +2076,14 @@ defmodule HpcConnect do
   end
 
   defp open_vllm_proxy!(%Session{} = session, node, remote_port, opts) do
+    attempts_default = if livebook_session?(session), do: 20, else: 5
+    retry_delay_default = if livebook_session?(session), do: 3_000, else: 1_000
+
     proxy_opts = [
       remote_port: remote_port,
       local_port: opts[:local_port],
-      attempts: Keyword.get(opts, :proxy_open_attempts, 5)
+      attempts: Keyword.get(opts, :proxy_open_attempts, attempts_default),
+      retry_delay_ms: Keyword.get(opts, :proxy_open_retry_delay_ms, retry_delay_default)
     ]
 
     case Keyword.get(opts, :open_proxy_fun) do
