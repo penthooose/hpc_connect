@@ -963,7 +963,15 @@ defmodule HpcConnect do
     end
   end
 
-  @transient_errors ["Connection refused", "Connection closed", "connect to host"]
+  @transient_errors [
+    "Connection refused",
+    "Connection closed",
+    "connect to host",
+    "Connection timed out",
+    "No route to host",
+    "Network is unreachable",
+    "UNKNOWN port 65535"
+  ]
 
   @doc """
   Like `run_command!/2` but retries up to `retries` times (default 3) with a

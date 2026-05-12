@@ -1199,6 +1199,8 @@ defmodule HpcConnect.SSH do
   @spec upload!(Session.t(), binary(), binary(), keyword()) :: :ok
   def upload!(%Session{ssh_conn: nil} = session, local_path, remote_path, opts) do
     recursive? = Keyword.get(opts, :recursive, false)
+    retries = Keyword.get(opts, :retries, 3)
+    delay_ms = Keyword.get(opts, :retry_delay_ms, 3_000)
 
     {upload_path, cleanup_dir} = prepare_upload_source(local_path, recursive?, opts)
 
@@ -1208,13 +1210,7 @@ defmodule HpcConnect.SSH do
           recursive: recursive?
         )
 
-      {output, status} = run(cmd)
-
-      if status == 0 do
-        :ok
-      else
-        raise RuntimeError, "scp failed (status #{status}): #{String.trim(output)}"
-      end
+      run_scp_with_retry!(cmd, retries, delay_ms)
     after
       cleanup_upload_source(cleanup_dir)
     end
@@ -1237,6 +1233,42 @@ defmodule HpcConnect.SSH do
     end
 
     :ok
+  end
+
+  @transient_scp_errors [
+    "Connection refused",
+    "Connection closed",
+    "Connection timed out",
+    "timed out during banner exchange",
+    "connect to host",
+    "No route to host",
+    "Network is unreachable",
+    "kex_exchange_identification",
+    "UNKNOWN port 65535",
+    "Connection reset by peer",
+    "Temporary failure in name resolution"
+  ]
+
+  defp run_scp_with_retry!(%Command{} = cmd, retries_left, delay_ms) do
+    {output, status} = run(cmd)
+
+    if status == 0 do
+      :ok
+    else
+      message = String.trim(output)
+      retryable? = scp_retryable_failure?(status, message)
+
+      if retryable? and retries_left > 0 do
+        Process.sleep(delay_ms)
+        run_scp_with_retry!(cmd, retries_left - 1, delay_ms)
+      else
+        raise RuntimeError, "scp failed (status #{status}): #{message}"
+      end
+    end
+  end
+
+  defp scp_retryable_failure?(status, message) when is_integer(status) and is_binary(message) do
+    status == 255 and Enum.any?(@transient_scp_errors, &String.contains?(message, &1))
   end
 
   # Recursively uploads a directory tree via SFTP.
