@@ -672,27 +672,113 @@ defmodule HpcConnect do
 
   def connect!(%Session{ssh_conn: nil} = session, remote_command, opts) do
     run_fun = Keyword.get(opts, :run_fun, &run_command!/2)
-    run_opts = Keyword.drop(opts, [:run_fun])
+    connect_preflight_fun = Keyword.get(opts, :connect_preflight_fun, &preflight_connectivity/1)
+    run_opts = Keyword.drop(opts, [:run_fun, :connect_preflight_fun])
 
     command = connect_command(session, remote_command)
 
-    try do
-      run_fun.(command, run_opts)
-    rescue
-      e in RuntimeError ->
-        maybe_retry_livebook_connect_with_proxy_variants!(
-          session,
-          command,
-          run_opts,
-          run_fun,
-          e,
-          __STACKTRACE__
-        )
+    with :ok <- maybe_preflight_connectivity(session, connect_preflight_fun) do
+      try do
+        run_fun.(command, run_opts)
+      rescue
+        e in RuntimeError ->
+          maybe_retry_livebook_connect_with_proxy_variants!(
+            session,
+            command,
+            run_opts,
+            run_fun,
+            e,
+            __STACKTRACE__
+          )
+      end
+    else
+      {:error, message} -> raise RuntimeError, message
     end
   end
 
   def connect!(%Session{} = session, remote_command, opts) do
     SSH.exec!(session, remote_command, opts)
+  end
+
+  defp maybe_preflight_connectivity(%Session{} = session, connect_preflight_fun) do
+    if livebook_session?(session) and is_function(connect_preflight_fun, 1) do
+      connect_preflight_fun.(session)
+    else
+      :ok
+    end
+  end
+
+  defp livebook_session?(%Session{credential_dir: dir, ssh_config_file: config}) do
+    is_binary(dir) and dir != "" and is_binary(config) and config != ""
+  end
+
+  defp preflight_connectivity(%Session{} = session) do
+    host = preflight_host(session)
+    timeout_ms = 3_000
+
+    case resolve_and_connect_host(host, 22, timeout_ms) do
+      :ok ->
+        :ok
+
+      {:error, {:dns, reason}} ->
+        {:error,
+         "Livebook SSH preflight failed: the runtime cannot resolve #{host} " <>
+           "for cluster #{session.cluster.name} (#{inspect(reason)}). " <>
+           "This is a network/DNS issue on the Livebook host, not an SSH key problem."}
+
+      {:error, {:tcp, reason}} ->
+        {:error,
+         "Livebook SSH preflight failed: the runtime can resolve #{host} but cannot open TCP port 22 " <>
+           "for cluster #{session.cluster.name} (#{inspect(reason)}). " <>
+           "This usually means outbound SSH is blocked from the shared Livebook server. " <>
+           "Try running Livebook locally or on a VPN-enabled machine, or ask the Livebook administrator " <>
+           "to allow egress to #{host}:22."}
+    end
+  end
+
+  defp preflight_host(%Session{} = session) do
+    session
+    |> proxy_jump_source()
+    |> normalize_jump_host()
+    |> case do
+      nil -> session.cluster.host
+      host -> host
+    end
+  end
+
+  defp normalize_jump_host(nil), do: nil
+  defp normalize_jump_host(""), do: nil
+
+  defp normalize_jump_host(jump) when is_binary(jump) do
+    jump
+    |> String.split(",", parts: 2)
+    |> hd()
+    |> String.trim()
+    |> String.split("@", parts: 2)
+    |> List.last()
+  end
+
+  defp resolve_and_connect_host(host, port, timeout_ms)
+       when is_binary(host) and host != "" and is_integer(port) do
+    case :inet.gethostbyname(String.to_charlist(host)) do
+      {:ok, _hostent} ->
+        case :gen_tcp.connect(
+               String.to_charlist(host),
+               port,
+               [:binary, active: false],
+               timeout_ms
+             ) do
+          {:ok, socket} ->
+            :gen_tcp.close(socket)
+            :ok
+
+          {:error, reason} ->
+            {:error, {:tcp, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:dns, reason}}
+    end
   end
 
   defp maybe_retry_livebook_connect_with_proxy_variants!(

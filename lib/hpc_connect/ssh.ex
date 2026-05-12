@@ -375,15 +375,11 @@ defmodule HpcConnect.SSH do
   defp include_explicit_proxy_jump?(_session), do: true
 
   defp compute_jump_target(%Session{} = session) do
-    if is_binary(session.credential_dir) and session.credential_dir != "" do
-      direct_login_target(session)
-    else
-      login_target = direct_login_target(session)
+    login_target = direct_login_target(session)
 
-      case proxy_jump_target(session) do
-        nil -> login_target
-        jump -> "#{jump},#{login_target}"
-      end
+    case proxy_jump_target(session) do
+      nil -> login_target
+      jump -> "#{jump},#{login_target}"
     end
   end
 

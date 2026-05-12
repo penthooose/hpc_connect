@@ -267,6 +267,49 @@ defmodule HpcConnectTest do
     assert third_preview =~ "ProxyJump=none"
   end
 
+  test "connect! raises clear livebook preflight error when runtime cannot reach ssh port" do
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test",
+        credential_dir: "/tmp/hpc_connect/livebook_preflight",
+        ssh_config_file: "/tmp/hpc_connect/livebook_preflight/config",
+        proxy_jump: nil
+      )
+
+    assert_raise RuntimeError,
+                 ~r/Livebook SSH preflight failed: the runtime can resolve csnhr\.nhr\.fau\.de but cannot open TCP port 22/,
+                 fn ->
+                   HpcConnect.connect!(session, "hostname",
+                     connect_preflight_fun: fn _session ->
+                       {:error,
+                        "Livebook SSH preflight failed: the runtime can resolve csnhr.nhr.fau.de but cannot open TCP port 22 for cluster alex (:timeout). This usually means outbound SSH is blocked from the shared Livebook server. Try running Livebook locally or on a VPN-enabled machine, or ask the Livebook administrator to allow egress to csnhr.nhr.fau.de:22."}
+                     end,
+                     run_fun: fn _command, _opts ->
+                       flunk("run_fun should not be called when preflight fails")
+                     end
+                   )
+                 end
+  end
+
+  test "connect! continues normally for livebook session when preflight succeeds" do
+    session =
+      HpcConnect.new_session(:alex,
+        username: "hpcusr01",
+        ssh_alias: "alex",
+        identity_file: "/tmp/id_hpc_test",
+        credential_dir: "/tmp/hpc_connect/livebook_preflight_ok",
+        ssh_config_file: "/tmp/hpc_connect/livebook_preflight_ok/config",
+        proxy_jump: nil
+      )
+
+    assert HpcConnect.connect!(session, "hostname",
+             connect_preflight_fun: fn _session -> :ok end,
+             run_fun: fn _command, _opts -> "READY" end
+           ) == "READY"
+  end
+
   test "command_preview uses generic executable name instead of absolute path" do
     command = %HpcConnect.Command{
       binary: "c:/Windows/System32/OpenSSH/ssh.exe",
@@ -570,7 +613,7 @@ defmodule HpcConnectTest do
     refute File.exists?(uploaded_key_path)
   end
 
-  test "livebook proxy tunnel command uses direct login jump without generated ssh config recursion" do
+  test "livebook proxy tunnel command uses full explicit jump chain without generated ssh config recursion" do
     tmp_dir =
       Path.join([
         System.tmp_dir!(),
@@ -593,6 +636,7 @@ defmodule HpcConnectTest do
     assert preview =~ session.known_hosts_file
     assert preview =~ "UserKnownHostsFile=#{session.known_hosts_file}"
     assert preview =~ "-J"
+    assert preview =~ "hpcusr01@csnhr.nhr.fau.de,hpcusr01@alex.nhr.fau.de"
     assert preview =~ "hpcusr01@alex.nhr.fau.de"
     assert preview =~ "hpcusr01@a0705"
 
