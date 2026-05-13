@@ -294,7 +294,7 @@ defmodule HpcConnect.Livebook do
     remote_command = Keyword.get(opts, :remote_command, "hostname && whoami")
 
     connect_opts = Keyword.get(opts, :connect_opts, [])
-    native_ssh? = Keyword.get(opts, :native_ssh, true)
+    native_ssh? = Keyword.get(opts, :native_ssh, false)
     native_ssh_fallback_to_os? = Keyword.get(opts, :native_ssh_fallback_to_os, false)
     open_connection_opts = Keyword.get(opts, :open_connection_opts, [])
 

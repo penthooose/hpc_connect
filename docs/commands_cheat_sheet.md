@@ -44,12 +44,14 @@ boot =
 		mode: :local,
 		cluster: :alex,
 		username: "v135ca12",
-		key_path: Path.expand("~/.ssh/id_fau_hpc_connect_pem"),
+		key_path: Path.expand("~/.ssh/id_fau"),
 		env_file: ".env"
 	)
 
 session = boot.session
 ```
+
+Native SSH is optional. The default local bootstrap flow uses the normal OS SSH path.
 
 ---
 

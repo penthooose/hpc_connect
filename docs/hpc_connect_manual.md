@@ -85,12 +85,13 @@ boot =
 		mode: :local,
 		cluster: :alex,
 		username: "v135ca12",
-		key_path: Path.expand("~/.ssh/id_fau_hpc_connect_pem"),
+		key_path: Path.expand("~/.ssh/id_fau"),
 		env_file: ".env"
 	)
 ```
 
 In local mode the key is used directly from disk; it is not copied into a Livebook temp directory.
+Native SSH is **not** enabled by default in the standard local bootstrap flow.
 
 ### Optional `.env` support
 
@@ -119,6 +120,7 @@ OpenSSH tools (`ssh` / `scp`). That means a separate PEM key is **not always req
 ### When a PEM key is not required
 
 - the default `bootstrap/1` flow uses `native_ssh: false`
+- the default `connection_setup(mode: :local)` flow now also uses `native_ssh: false`
 - standard Livebook bootstrap therefore usually works with your normal SSH key
 - if you keep using the OS SSH path, HpcConnect can continue to use the same
   key that already works with `ssh` / `scp`
@@ -131,7 +133,7 @@ This matters in particular when:
 
 - you enable `native_ssh: true` explicitly
 - you want native vLLM access/tunneling instead of the OS SSH proxy path
-- you use `connection_setup(mode: :local)`, where native SSH is enabled by default
+- you explicitly turn on native SSH in local setup or later app access
 
 ### Which key format is needed
 
@@ -205,6 +207,10 @@ The public key is a single line starting with something like `ssh-rsa ...`.
 If native SSH is requested and the current key is in OpenSSH private-key format,
 HpcConnect automatically tries to create a compatible PEM fallback key next to it.
 
+This compatibility check and auto-creation step are **not part of the default**
+Livebook or local bootstrap workflow. They only run when native SSH is explicitly
+requested during bootstrap/setup.
+
 The generated key name is:
 
 ```text
@@ -226,6 +232,10 @@ When that happens, HpcConnect prints:
 
 If bootstrap had to create a new fallback key first, upload the new `.pub` key,
 wait for activation on the cluster, and then rerun bootstrap.
+
+If you enable native SSH later for commands such as `start_app/2` or `reconnect/3`,
+prepare a compatible PEM key in advance, or run bootstrap/setup once with
+`native_ssh: true` so HpcConnect can perform the compatibility preparation there.
 
 ### If you want to avoid native SSH entirely
 

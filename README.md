@@ -66,7 +66,7 @@ boot =
     mode: :local,
     cluster: :alex,
     username: "v135ca12",
-    key_path: Path.expand("~/.ssh/id_fau_hpc_connect_pem"),
+    key_path: Path.expand("~/.ssh/id_fau"),
     remote_command: "hostname && whoami",
     env_file: ".env"
   )
@@ -82,7 +82,7 @@ boot =
     mode: :local,
     cluster: :alex,
     username: "v135ca12",
-    key_path: Path.expand("~/.ssh/id_fau_hpc_connect_pem"),
+    key_path: Path.expand("~/.ssh/id_fau"),
     hf_token: System.get_env("HF_TOKEN")
   )
 ```
@@ -153,5 +153,8 @@ Practical requirements:
 - `ssh` and `scp` must be available in `PATH`
 - outbound **TCP port 22** to the first reachable jump/login host must be allowed
 - in shared Linux environments, **IPv4 connectivity** to the jump host is often required
+
+The default Livebook and local bootstrap flows use the OS SSH path. A separate
+PEM key is only needed when native Erlang SSH is enabled explicitly.
 
 For setup details and troubleshooting, see the [manual](docs/hpc_connect_manual.md).

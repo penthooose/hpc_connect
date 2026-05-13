@@ -263,7 +263,7 @@ defmodule HpcConnect do
   end
 
   defp maybe_prepare_bootstrap_native_key(%Session{} = session, opts) do
-    if Keyword.get(opts, :native_ssh, true) do
+    if Keyword.get(opts, :native_ssh, false) do
       mode = Keyword.get(opts, :mode, :livebook)
 
       case session.identity_file do
@@ -444,7 +444,7 @@ defmodule HpcConnect do
   end
 
   defp maybe_open_bootstrap_native_connection(%Session{} = session, opts) do
-    native_ssh? = Keyword.get(opts, :native_ssh, true)
+    native_ssh? = Keyword.get(opts, :native_ssh, false)
     bootstrap_open_connection? = Keyword.get(opts, :bootstrap_open_connection, false)
     fallback_to_os? = Keyword.get(opts, :native_ssh_fallback_to_os, false)
     open_opts = Keyword.get(opts, :open_connection_opts, [])

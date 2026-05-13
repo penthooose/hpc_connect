@@ -451,6 +451,41 @@ defmodule HpcConnectTest do
     assert :ok == HpcConnect.connection_cleanup(result, delete_uploaded: true)
   end
 
+  test "bootstrap local keeps original OpenSSH key unless native_ssh is requested" do
+    tmp_dir = Path.join(System.tmp_dir!(), "hpc_connect_bootstrap_local_default_key")
+    File.mkdir_p!(tmp_dir)
+
+    key_path = Path.join(tmp_dir, "id_bootstrap_openssh")
+    fallback_path = key_path <> "_hpc_connect_pem"
+
+    cluster = %HpcConnect.Cluster{
+      name: :dummy,
+      host: "invalid.invalid",
+      ssh_alias: "dummy",
+      vault_dir: "/tmp/hpc_connect_test_vault",
+      default_work_dir: "/tmp/hpc_connect_test_work"
+    }
+
+    File.write!(key_path, "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKE\n")
+    File.rm(fallback_path)
+    File.rm(fallback_path <> ".pub")
+
+    result =
+      HpcConnect.bootstrap(
+        mode: :local,
+        cluster: cluster,
+        username: "hpcusr01",
+        key_path: key_path,
+        install_scripts: false,
+        install_def_files: false,
+        connect_fun: fn _session, _command, _opts -> "BOOT\n" end
+      )
+
+    assert result.session.identity_file == Path.expand(key_path)
+    refute File.exists?(fallback_path)
+    refute result[:key_just_created]
+  end
+
   test "connection_setup supports livebook mode with pre-provided values" do
     tmp_dir =
       Path.join([
