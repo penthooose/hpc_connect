@@ -1941,8 +1941,7 @@ defmodule HpcConnect do
             )
         )
 
-        # Important: prepare native SSH only after we know the compute node.
-        # This avoids early proxy-jump attempts during start/reconnect pre-phase.
+        # Delay native SSH preparation until the compute node is known.
         {session, native_error} = maybe_prepare_session_for_app_after_node(session, app, opts)
 
         native_enriched =
@@ -1953,13 +1952,7 @@ defmodule HpcConnect do
           |> Map.put(:base_url, "http://#{node}:#{submitted.port}")
           |> Map.put(:access_mode, :native_ssh)
 
-        # When we have a native SSH connection to the login node, open a
-        # tcpip_tunnel_to_server channel from it to the compute node's app port.
-        # This is fully native — no OS process, no background port — the tunnel
-        # lives inside the existing :ssh connection and stays open as long as
-        # session.ssh_conn is alive.
-        # Keep OpenSSH proxy as the default access path unless the caller
-        # explicitly opts into native SSH for this app launch.
+        # Native app access keeps the tunnel inside the existing SSH session.
         native_conn = if Keyword.get(opts, :native_ssh, false), do: session.ssh_conn, else: nil
 
         if not is_nil(native_conn) do
@@ -1968,7 +1961,7 @@ defmodule HpcConnect do
           {compute_conn, actual_port} =
             open_vllm_native_tunnel!(session, native_conn, node, submitted.port, local_port, opts)
 
-          # Store compute_conn in the session so it stays alive and can be closed via close_connection/1.
+          # Keep the compute-side connection in the session for later cleanup.
           session_with_compute = %{session | compute_ssh_conn: compute_conn}
 
           IO.puts(
@@ -2156,8 +2149,7 @@ defmodule HpcConnect do
           :ok
 
         {:DOWN, ^ref, :process, ^owner, reason} ->
-          # If the caller process gets killed from the IEx break menu (`k`),
-          # ensure we still attempt to clean up the pending allocation.
+          # Attempt cleanup if the owner process terminates unexpectedly.
           if reason not in [:normal, :shutdown] do
             safe_release_gpu(session, job_id)
           end
@@ -2462,9 +2454,7 @@ defmodule HpcConnect do
   defp auto_proxy_enabled?(%Session{} = session, opts) do
     native_requested? = Keyword.get(opts, :native_ssh, false)
 
-    # Defaults:
-    # - Native mode requested -> proxy only when fallback is explicitly allowed.
-    # - Native mode not requested -> managed OS proxy is the default path.
+    # Native mode stays proxy-free unless OS fallback is explicitly allowed.
     default =
       if native_requested? do
         Keyword.get(opts, :native_ssh_fallback_to_os, false) and is_nil(session.ssh_conn)
@@ -3670,20 +3660,4 @@ defmodule HpcConnect do
         %{ok?: false, error: msg}
       end
   end
-
-  # Returns true when STEADY_SSH_CONNECTION is enabled via opt, session env, or OS env.
-  # defp steady_ssh_connection?(session, opts) do
-  #   truthy = fn v -> v in ["true", "1", "yes", true] end
-
-  #   cond do
-  #     Keyword.has_key?(opts, :steady_ssh_connection) ->
-  #       truthy.(Keyword.get(opts, :steady_ssh_connection))
-
-  #     Map.has_key?(session.env, "STEADY_SSH_CONNECTION") ->
-  #       truthy.(session.env["STEADY_SSH_CONNECTION"])
-
-  #     true ->
-  #       truthy.(System.get_env("STEADY_SSH_CONNECTION", "false"))
-  #   end
-  # end
 end

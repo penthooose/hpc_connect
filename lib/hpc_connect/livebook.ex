@@ -51,13 +51,14 @@ defmodule HpcConnect.Livebook do
   - `:username` – optional pre-filled username
   - `:uploaded_key_path` – optional direct uploaded-key path to skip UI
   - `:uploaded_filename` – optional display name for the uploaded key
+  - `:hf_token` – optional Hugging Face token for gated model access
   - `:remote_command` – probe command (default: `"hostname && whoami"`)
   - `:submit_label` – submit button label for the form
   - `:persist_form` – when `true`, persist non-secret form defaults for reuse
   - `:persist_path` – custom path for persisted defaults
 
   Persisted defaults include cluster, username, and remote command.
-  The uploaded SSH key itself is intentionally never persisted.
+  The uploaded SSH key and optional Hugging Face token are intentionally never persisted.
   """
   @spec prepare_session(keyword()) :: keyword()
   def prepare_session(opts \\ []) do
@@ -75,6 +76,7 @@ defmodule HpcConnect.Livebook do
             cluster: direct_cluster,
             uploaded_key_path: direct_key_path,
             uploaded_filename: direct_uploaded_filename,
+            hf_token: Keyword.get(opts, :hf_token),
             remote_command: Keyword.get(opts, :remote_command)
           },
           false
@@ -277,9 +279,7 @@ defmodule HpcConnect.Livebook do
             "SSH private key not found: #{key_path}. Aborting before opening any SSH/proxy connection."
     end
 
-    # In local mode we do NOT copy the key to a temp dir.
-    # The user's ~/.ssh/config already handles ProxyJump etc. We just reference
-    # the key directly, avoiding stale-temp-file failures across IEx restarts.
+    # Local mode references the key in place instead of copying it to a temp dir.
     session_opts =
       compact_opts(
         username: username,
@@ -376,6 +376,11 @@ defmodule HpcConnect.Livebook do
         accept: :any
       )
 
+    hf_token_input =
+      kino_input_text("HF token (optional)",
+        default: Keyword.get(opts, :hf_token, "")
+      )
+
     remote_command_input =
       kino_input_text("Probe command",
         default:
@@ -389,6 +394,7 @@ defmodule HpcConnect.Livebook do
           cluster: cluster_input,
           username: username_input,
           ssh_key: upload_input,
+          hf_token: hf_token_input,
           remote_command: remote_command_input
         ],
         submit: Keyword.get(opts, :submit_label, @default_submit_label)
@@ -407,7 +413,8 @@ defmodule HpcConnect.Livebook do
 
           Non-secret defaults can be persisted for the next notebook run when
           `persist_form: true` is enabled. The uploaded SSH key is **never**
-          persisted and must be selected again.
+          persisted and must be selected again. The optional HF token is used
+          for the current session only.
           """),
           form,
           status_frame,
@@ -442,6 +449,7 @@ defmodule HpcConnect.Livebook do
         cluster: Map.get(data, :cluster),
         uploaded_key_path: uploaded_key_path_from_form!(Map.get(data, :ssh_key)),
         uploaded_filename: uploaded_filename_from_form(Map.get(data, :ssh_key)),
+        hf_token: Map.get(data, :hf_token),
         remote_command: Map.get(data, :remote_command)
       },
       true
@@ -472,9 +480,15 @@ defmodule HpcConnect.Livebook do
       |> Map.get(:remote_command, Keyword.get(opts, :remote_command))
       |> default_if_blank(@default_remote_command)
 
+    hf_token =
+      values
+      |> Map.get(:hf_token, Keyword.get(opts, :hf_token))
+      |> normalize_optional_text()
+
     opts
     |> Keyword.delete(:work_dir)
     |> Keyword.delete(:vault_dir)
+    |> Keyword.delete(:hf_token)
     |> Keyword.put(:mode, :livebook)
     |> Keyword.put(:cluster, cluster)
     |> Keyword.put(:username, username)
@@ -482,6 +496,7 @@ defmodule HpcConnect.Livebook do
     |> Keyword.put(:uploaded_filename, uploaded_filename)
     |> Keyword.put(:remote_command, remote_command)
     |> Keyword.put(:ui_rendered?, ui_rendered?)
+    |> maybe_put_opt(:hf_token, hf_token)
   end
 
   defp validate_prepared_session_opts!(prepared_opts) do
@@ -537,6 +552,10 @@ defmodule HpcConnect.Livebook do
     |> Keyword.put(:ui_status_frame, status_frame)
     |> maybe_put_status_origin(Map.get(event, :origin))
   end
+
+  defp maybe_put_opt(opts, _key, nil), do: opts
+  defp maybe_put_opt(opts, _key, ""), do: opts
+  defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp maybe_put_status_origin(opts, nil), do: opts
   defp maybe_put_status_origin(opts, origin), do: Keyword.put(opts, :ui_status_origin, origin)

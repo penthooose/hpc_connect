@@ -945,8 +945,6 @@ defmodule HpcConnect.Slurm do
     "kex_exchange_identification"
   ]
 
-  # Runs an SSH command, retrying on transient errors. Raises on non-zero exit.
-  # Uses the persistent Erlang :ssh connection when available (no new OS process).
   defp ssh_with_retry!(session, cmd, summary, retries \\ 3, delay_ms \\ 3_000) do
     case SSH.exec(session, cmd, []) do
       {_, 0} ->
@@ -964,8 +962,6 @@ defmodule HpcConnect.Slurm do
     end
   end
 
-  # Like ssh_with_retry! but also returns output on success (for commands with stdout).
-  # Uses the persistent Erlang :ssh connection when available (no new OS process).
   defp ssh_run_with_retry!(session, cmd, summary, retries \\ 3, delay_ms \\ 3_000) do
     case SSH.exec(session, cmd, []) do
       {output, 0} ->
@@ -1027,9 +1023,7 @@ defmodule HpcConnect.Slurm do
         opts when is_list(opts) -> {Keyword.get(opts, :name, "vllm"), opts}
       end
 
-    # Default to :woody — AlmaLinux login nodes support user namespaces for apptainer build.
-    # Ubuntu-based systems (TinyX, Testcluster) do not. Pass `build_cluster: nil` to
-    # disable the redirect and build on the session's own cluster.
+    # Default to a build-capable cluster unless the caller disables redirection.
     build_cluster = Keyword.get(opts, :build_cluster, :woody)
 
     build_session =
@@ -1081,11 +1075,7 @@ defmodule HpcConnect.Slurm do
     end
   end
 
-  # Clones a session's credentials onto a different cluster.
-  # Used to run apptainer builds on a cluster that supports user namespaces
-  # (e.g. woody) while the primary session targets another cluster (e.g. tinyx).
-  # Because all NHR FAU clusters share the same home/vault filesystem, the resulting
-  # SIF will be visible from the original session without any extra copying.
+  # Reuse the current credentials on a different cluster for the build step.
   defp clone_session_for_cluster(%Session{} = session, cluster_name) do
     target_cluster = HpcConnect.Cluster.fetch!(cluster_name)
 
@@ -1102,9 +1092,7 @@ defmodule HpcConnect.Slurm do
     }
   end
 
-  # Runs `apptainer build` directly on the login node via a background nohup process.
-  # Returns immediately with a log_file path. No SLURM job — no internet issues.
-  # build_sif_blocking polls remote_file_exists? to detect completion.
+  # Start a background login-node build and return the log path immediately.
   defp build_sif_direct(session, name, def_path, sif_path, force_env) do
     script_dir = Scripts.remote_script_dir(session)
     logs_dir = Path.join(session.work_dir, "sbatch_logs")
@@ -1135,16 +1123,13 @@ defmodule HpcConnect.Slurm do
     %{job_id: nil, sif_path: sif_path, def_path: def_path, name: name, log_file: log_file}
   end
 
-  # Returns proxy export statements if the cluster has an http_proxy configured.
   defp proxy_env_exports(%{cluster: %{http_proxy: nil}}), do: ""
 
   defp proxy_env_exports(%{cluster: %{http_proxy: proxy}}) do
     "export http_proxy=#{proxy} && export https_proxy=#{proxy} && "
   end
 
-  # Submits `build_sif.sh` as an sbatch job and returns the job ID immediately.
-  # Requires internet access from the compute node (not available on all clusters).
-  # Use `use_slurm: true` to opt in.
+  # Submit `build_sif.sh` as an sbatch job.
   defp build_sif_via_slurm(session, name, def_path, sif_path, force_env, opts) do
     partition = Keyword.get(opts, :partition)
     walltime = Keyword.get(opts, :walltime, "02:00:00")
@@ -1287,9 +1272,7 @@ defmodule HpcConnect.Slurm do
     end
   end
 
-  # Automatic fallback for the default build cluster path:
-  # woody -> alex -> helma.
-  # Only enabled when caller did not explicitly set :build_cluster.
+  # Fallback order for the default build-cluster path: woody -> alex -> helma.
   defp build_sif_blocking_with_fallbacks(session, _opts, [], errors) do
     attempted =
       errors
@@ -1377,7 +1360,7 @@ defmodule HpcConnect.Slurm do
       Logger.info("[HpcConnect] SIF ready: #{sif_path}")
       sif_path
     else
-      # Tail recent build log lines so errors surface in IEx
+      # Surface recent log output while polling.
       log_dir = Path.join(session.work_dir, "sbatch_logs")
       log_glob = Path.join(log_dir, "build_sif_*_direct.log")
 
@@ -1439,7 +1422,6 @@ defmodule HpcConnect.Slurm do
     {output, _} =
       SSH.exec(
         session,
-        # Strip ANSI escape codes, skip quota warning lines, take the first real state line
         "sacct -j #{job_id} --noheader --format=State --parsable2 2>/dev/null " <>
           "| sed 's/\\x1b\\[[0-9;]*m//g' | grep -v '^$' | grep -v 'WARNING' | grep -v 'Path' | grep -v '!!!' " <>
           "| head -1 || true",

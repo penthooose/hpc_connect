@@ -128,8 +128,7 @@ defmodule HpcConnect.SSH do
   """
   @spec native_login_connect_preview(Session.t()) :: binary()
   def native_login_connect_preview(%Session{} = session) do
-    # Native Erlang :ssh connects DIRECTLY to the login node (no -J / no proxy).
-    # The ~/.ssh/config ProxyJump is an OS-level convenience that :ssh does not use.
+    # Native Erlang :ssh connects directly to the login host.
     direct_target =
       case session.username do
         u when is_binary(u) and u != "" -> "#{u}@#{session.cluster.host}"
@@ -228,10 +227,7 @@ defmodule HpcConnect.SSH do
   """
   @spec port_forward_command(Session.t(), binary(), pos_integer(), pos_integer()) :: Command.t()
   def port_forward_command(%Session{} = session, node, local_port, remote_port) do
-    # Livebook sessions carry a generated ssh_config with cluster aliases and
-    # ProxyJump entries. Prefer that config-aware path because OpenSSH `-J`
-    # proxy subprocesses may otherwise ignore key/host options from the parent
-    # command. For non-Livebook usage we keep the explicit user@host chain.
+    # Livebook sessions already carry a generated ssh_config with ProxyJump data.
     jump_chain_target = port_forward_jump_target(session)
 
     compute_target =
@@ -502,25 +498,13 @@ defmodule HpcConnect.SSH do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Opens a **persistent native SSH connection** using Erlang's built-in `:ssh` application.
+  Opens a persistent Erlang `:ssh` connection.
 
-  Returns `{updated_session, tunnel_port_or_nil}`. `updated_session` carries
-  `ssh_conn` and (when ProxyJump is needed) `tunnel_port`. Pass it to all subsequent
-  API calls — commands will run over the connection without spawning any new OS
-  processes.
+  Returns `{updated_session, tunnel_port_or_nil}`. The returned session carries
+  `ssh_conn` and, when OS proxy fallback is used, `tunnel_port`.
 
-  ## Why this is better than per-command OpenSSH
-
-  - One TCP handshake and key exchange for the whole session
-  - No external processes per command → no CMD windows, works in Livebook
-  - Connection-drop is detectable (`:ssh` sends `{:EXIT, conn, reason}`)
-  - SCP upload goes over the same connection via SFTP — no external `scp` process
-
-  ## ProxyJump handling
-
-  By default, native mode does **not** open any OS OpenSSH process for proxying.
-  If direct native connect fails and a proxy jump is required, set
-  `proxy_jump_via_os: true` explicitly to allow the managed OpenSSH tunnel.
+  By default this uses native jump tunneling only. Set `proxy_jump_via_os: true`
+  to allow a managed OpenSSH proxy tunnel when native jump setup is not possible.
 
   Close with `close_connection/1`.
 
@@ -536,11 +520,7 @@ defmodule HpcConnect.SSH do
     proxy_jump_via_native = Keyword.get(opts, :proxy_jump_via_native, true)
     proxy_jump_via_os = Keyword.get(opts, :proxy_jump_via_os, false)
 
-    # Suppress :ssh application logger output during connection attempts.
-    # Erlang :ssh emits [notice]/[debug] messages on auth failures which are
-    # confusing when a retry immediately succeeds. We restore the original
-    # level (or remove the filter) after the final attempt, whether it
-    # succeeds or raises.
+    # Silence transient :ssh logger noise while retries are in progress.
     filter_id = :hpc_connect_ssh_silence
     :logger.add_primary_filter(filter_id, {&suppress_ssh_logs/2, []})
 
@@ -551,9 +531,7 @@ defmodule HpcConnect.SSH do
     end
   end
 
-  # Logger primary filter: drops all log events from the :ssh OTP application.
-  # Matches on application: :ssh (covers all domains and log levels emitted by
-  # Erlang SSH, including the disconnect notice and KEX debug messages).
+  # Drop OTP :ssh log events while the connection attempt is running.
   defp suppress_ssh_logs(%{meta: %{application: :ssh}} = _event, _extra), do: :stop
   defp suppress_ssh_logs(_event, _extra), do: :ignore
 
@@ -750,23 +728,19 @@ defmodule HpcConnect.SSH do
             "using :gen_tcp then :ssh.connect/3 to avoid Erlang SSH self-connect deadlock"
         )
 
-        # Use :gen_tcp for the TCP hop — avoids a deadlock where the Erlang :ssh
-        # application would be on both sides of the loopback tunnel simultaneously.
-        # Then use :ssh.connect/3 (socket form) to do SSH over the raw TCP socket.
+        # Use a raw TCP socket for the loopback hop, then start SSH over that socket.
         case :gen_tcp.connect(~c"127.0.0.1", local_tunnel_port, [:binary, active: false], timeout) do
           {:ok, tcp_sock} ->
             Logger.debug(
               "[HpcConnect] native proxy-jump: TCP connected to tunnel, starting SSH handshake to #{target}..."
             )
 
-            # The socket form :ssh.connect/3 does NOT accept connect_timeout — only
-            # the host/port form :ssh.connect/4 does. Including it causes the SSH FSM
-            # to stall or crash. Strip it before handing opts to the socket form.
+            # The socket form of :ssh.connect/3 does not accept :connect_timeout.
             handshake_opts = Keyword.delete(ssh_opts, :connect_timeout)
 
             Logger.debug("[HpcConnect] ssh_opts for handshake: #{inspect(handshake_opts)}")
 
-            # Put the socket into the exact mode Erlang's SSH FSM expects.
+            # Match the socket mode expected by the SSH FSM.
             :inet.setopts(tcp_sock, active: false, packet: :raw, mode: :binary)
 
             case :ssh.connect(tcp_sock, handshake_opts, timeout) do
@@ -1042,7 +1016,7 @@ defmodule HpcConnect.SSH do
       "[HpcConnect] native compute tunnel: opening TCP channel via login_conn to #{compute_node}:22"
     )
 
-    # Step 1: tunnel local TCP port → compute_node:22, through the login-node SSH connection
+    # Tunnel the compute node's SSH port through the login-node connection.
     ssh_tunnel_port =
       case :ssh.tcpip_tunnel_to_server(
              login_conn,
@@ -1064,7 +1038,6 @@ defmodule HpcConnect.SSH do
                 "native compute tunnel: failed to open TCP channel to #{compute_node}:22 via login node: #{inspect(reason)}"
       end
 
-    # Step 2: TCP-connect locally to that tunnel port
     tcp_sock =
       case :gen_tcp.connect(~c"127.0.0.1", ssh_tunnel_port, [:binary, active: false], timeout) do
         {:ok, s} ->
@@ -1075,14 +1048,11 @@ defmodule HpcConnect.SSH do
                 "native compute tunnel: TCP connect to tunnel port #{ssh_tunnel_port} failed: #{inspect(r)}"
       end
 
-    # Step 3: SSH handshake to the compute node through the TCP tunnel
-    # Strip connect_timeout — the socket form :ssh.connect/3 does not accept it
-    # and it causes the SSH FSM to stall.
+    # Establish SSH over the local tunnel; the socket form does not accept :connect_timeout.
     ssh_opts = session |> build_erlang_ssh_opts(timeout) |> Keyword.delete(:connect_timeout)
 
     Logger.debug("[HpcConnect] compute tunnel ssh_opts for handshake: #{inspect(ssh_opts)}")
 
-    # Ensure socket is in the correct mode for Erlang's SSH FSM.
     :inet.setopts(tcp_sock, active: false, packet: :raw, mode: :binary)
 
     compute_conn =
@@ -1101,7 +1071,7 @@ defmodule HpcConnect.SSH do
                 "native compute tunnel: SSH handshake to #{compute_node} failed: #{inspect(reason)}"
       end
 
-    # Step 4: port-forward on the compute-node connection: localhost:local_port → localhost:remote_port
+    # Forward localhost:local_port to the app port on the compute node.
     actual_port =
       case :ssh.tcpip_tunnel_to_server(
              compute_conn,
@@ -1129,7 +1099,7 @@ defmodule HpcConnect.SSH do
   end
 
   defp retryable_connect_error?(reason) do
-    # Auth failures are not retryable — only transient network errors are.
+    # Retry transient network errors only.
     auth_failure? =
       is_list(reason) and
         :lists.member(:unable_to_connect_using_available_authentication_methods, reason)

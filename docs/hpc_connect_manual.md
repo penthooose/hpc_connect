@@ -111,7 +111,136 @@ Important behavior:
 
 ---
 
-## 4. Hugging Face token handling
+## 4. SSH key format and native SSH
+
+In the common workflow, HpcConnect can still work entirely through the system
+OpenSSH tools (`ssh` / `scp`). That means a separate PEM key is **not always required**.
+
+### When a PEM key is not required
+
+- the default `bootstrap/1` flow uses `native_ssh: false`
+- standard Livebook bootstrap therefore usually works with your normal SSH key
+- if you keep using the OS SSH path, HpcConnect can continue to use the same
+  key that already works with `ssh` / `scp`
+
+### When a PEM key is required
+
+A PEM-compatible private key is needed when HpcConnect uses **native Erlang SSH**.
+
+This matters in particular when:
+
+- you enable `native_ssh: true` explicitly
+- you want native vLLM access/tunneling instead of the OS SSH proxy path
+- you use `connection_setup(mode: :local)`, where native SSH is enabled by default
+
+### Which key format is needed
+
+The current native SSH callback does **not** accept private keys in OpenSSH's newer format:
+
+```text
+-----BEGIN OPENSSH PRIVATE KEY-----
+```
+
+For native SSH, use a PEM-encoded private key instead.
+
+The safest documented choice is an RSA key in PEM format, for example:
+
+```text
+-----BEGIN RSA PRIVATE KEY-----
+```
+
+### Recommended manual creation command
+
+Linux / macOS:
+
+```bash
+ssh-keygen -t rsa -b 4096 -m PEM -f ~/.ssh/id_fau_hpc_connect_pem -N ''
+```
+
+Windows PowerShell:
+
+```powershell
+ssh-keygen -t rsa -b 4096 -m PEM -f "$HOME\.ssh\id_fau_hpc_connect_pem" -N ""
+```
+
+This creates:
+
+- the private key: `id_fau_hpc_connect_pem`
+- the public key: `id_fau_hpc_connect_pem.pub`
+
+### What to upload to the HPC portal
+
+Upload the **public** key only, never the private key.
+
+That means:
+
+- upload the contents of the `.pub` file
+- or upload the `.pub` file itself if the portal supports file upload
+- do **not** upload the private key file
+
+For FAU/NHR, the upload target is:
+
+```text
+https://portal.hpc.fau.de/ui/user
+```
+
+To view the public key contents:
+
+Linux / macOS:
+
+```bash
+cat ~/.ssh/id_fau_hpc_connect_pem.pub
+```
+
+Windows PowerShell:
+
+```powershell
+Get-Content "$HOME\.ssh\id_fau_hpc_connect_pem.pub"
+```
+
+The public key is a single line starting with something like `ssh-rsa ...`.
+
+### Automatic PEM fallback creation
+
+If native SSH is requested and the current key is in OpenSSH private-key format,
+HpcConnect automatically tries to create a compatible PEM fallback key next to it.
+
+The generated key name is:
+
+```text
+<original_key_path>_hpc_connect_pem
+```
+
+and the matching public key is:
+
+```text
+<original_key_path>_hpc_connect_pem.pub
+```
+
+When that happens, HpcConnect prints:
+
+- the generated PEM key path
+- the public key contents or `.pub` path
+- the portal URL
+- the instruction to upload the public key and wait for propagation
+
+If bootstrap had to create a new fallback key first, upload the new `.pub` key,
+wait for activation on the cluster, and then rerun bootstrap.
+
+### If you want to avoid native SSH entirely
+
+Use the OS SSH path and disable native SSH explicitly where needed:
+
+```elixir
+HpcConnect.bootstrap(mode: :local, native_ssh: false, ...)
+```
+
+This is a good fallback when your regular OpenSSH key works, but native Erlang
+SSH has trouble with key format or proxy handling.
+
+---
+
+## 5. Hugging Face token handling
 
 For gated models such as `meta-llama/*`, provide a Hugging Face token.
 
@@ -141,7 +270,7 @@ If `hf_token:` is not passed explicitly, `bootstrap/1` also checks `.env` values
 
 ---
 
-## 5. Custom definition files and startup scripts
+## 6. Custom definition files and startup scripts
 
 HpcConnect supports the built-in `vllm` flow, but the app launcher is intentionally more general.
 
@@ -250,7 +379,7 @@ The app name is therefore the shared stem used across:
 
 ---
 
-## 6. Recommended app workflow
+## 7. Recommended app workflow
 
 ### Start a vLLM job
 
@@ -282,7 +411,7 @@ HpcConnect.vllm_chat(vllm, "Hello from Livebook")
 
 ---
 
-## 7. Cleanup model
+## 8. Cleanup model
 
 ### Normal end of a Livebook session
 
@@ -322,7 +451,7 @@ HpcConnect.cancel_all_jobs(session)
 
 ---
 
-## 8. Uninstall
+## 9. Uninstall
 
 If you want to remove HpcConnect-managed files from the remote side, use:
 
@@ -342,7 +471,7 @@ Use the `remove_models: true` variant carefully, because it removes the model ca
 
 ---
 
-## 9. SSH and network troubleshooting
+## 10. SSH and network troubleshooting
 
 ### Outbound SSH must be possible
 
@@ -385,11 +514,11 @@ HpcConnect.cleanup_livebook_orphans(delete_uploaded: true)
 
 ### If a key works locally but not in native Erlang SSH mode
 
-Some OTP builds cannot use OpenSSH private-key format directly for native SSH. In that case, keep OS fallback enabled or use a PEM key.
+Some OTP builds cannot use OpenSSH private-key format directly for native SSH. In that case, keep OS fallback enabled or use a PEM key as described in section 4.
 
 ---
 
-## 10. Windows and Linux portability notes
+## 11. Windows and Linux portability notes
 
 HpcConnect is intended to work in these combinations:
 
@@ -408,7 +537,7 @@ If a shared Livebook server blocks outbound SSH, the same notebook may still wor
 
 ---
 
-## 11. Where to look next
+## 12. Where to look next
 
 - [README](../README.md) for the short overview
 - [Command cheat sheet](./commands_cheat_sheet.md) for copy/paste commands

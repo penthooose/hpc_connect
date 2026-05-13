@@ -145,8 +145,14 @@ HpcConnect.list_jobs_summary(session)
 
 ```elixir
 HpcConnect.quota_summary(session)
-bs_summary(session)
-ama-3.2-1B-Instruct")
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Download a model from HuggingFace
+
+```elixir
+HpcConnect.download_model(session, "meta-llama/Llama-3.2-1B-Instruct")
 ```
 
 <!-- livebook:{"branch_parent_index":2} -->

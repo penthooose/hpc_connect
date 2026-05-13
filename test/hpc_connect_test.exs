@@ -504,6 +504,7 @@ defmodule HpcConnectTest do
         cluster: :alex,
         username: "  hpcusr01  ",
         uploaded_key_path: uploaded_key_path,
+        hf_token: "hf_test_token",
         remote_command: "",
         work_dir: "$HOME/.cache/hpc_connect",
         vault_dir: "$HOME/vault/hpc_connect"
@@ -514,6 +515,7 @@ defmodule HpcConnectTest do
     assert opts[:username] == "hpcusr01"
     assert opts[:uploaded_key_path] == Path.expand(uploaded_key_path)
     assert opts[:uploaded_filename] == "id_team_prepare_livebook"
+    assert opts[:hf_token] == "hf_test_token"
     assert opts[:remote_command] == "hostname && whoami"
     refute Keyword.has_key?(opts, :work_dir)
     refute Keyword.has_key?(opts, :vault_dir)

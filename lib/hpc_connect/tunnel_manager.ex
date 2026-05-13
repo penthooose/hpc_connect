@@ -1,8 +1,9 @@
 defmodule HpcConnect.TunnelManager do
   @moduledoc """
-  A global GenServer to keep OS ports alive and unlinked from the calling process.
-  This is extremely important for Livebook or scripts where the evaluating process
-  (and any linked Ports) dies immediately after the cell completes.
+  Keeps managed OS ports alive independently of the calling process.
+
+  This allows SSH proxy processes started from Livebook cells or short-lived
+  scripts to survive after the evaluator process exits.
   """
   use GenServer
 
@@ -60,7 +61,6 @@ defmodule HpcConnect.TunnelManager do
 
   @impl true
   def init(state) do
-    # Trap exits so we can handle Port terminations gracefully.
     Process.flag(:trap_exit, true)
     {:ok, state}
   end

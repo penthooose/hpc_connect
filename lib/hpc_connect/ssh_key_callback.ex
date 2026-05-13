@@ -1,11 +1,6 @@
 defmodule HpcConnect.SSHKeyCallback do
   @moduledoc false
-  # Minimal ssh_client_key_api implementation that loads the private key from an
-  # explicit file path. Erlang's :ssh passes the `:key_cb_private` option list to every
-  # callback, so we stash the path there.
-  #
-  # Usage:
-  #   key_cb: {HpcConnect.SSHKeyCallback, [identity_file: "/path/to/id_rsa"]}
+  # Load a private key from the explicit `identity_file` path passed in `:key_cb_private`.
 
   @behaviour :ssh_client_key_api
 
@@ -29,7 +24,7 @@ defmodule HpcConnect.SSHKeyCallback do
         {:error,
          "unsupported OPENSSH PRIVATE KEY format for native Erlang :ssh key callback (use PEM key)"}
       else
-        # Try every PEM entry in the file until one decodes to a supported key type.
+        # Use the first supported PEM entry in the file.
         result =
           pem
           |> :public_key.pem_decode()
