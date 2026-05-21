@@ -7,6 +7,7 @@ See also:
 - [README](../README.md)
 - [Manual](./hpc_connect_manual.md)
 - [Tutorial notebook](../examples/hpc_connect_tutorial.livemd)
+- [Local shell example](../examples/hpc_connect_local_example.exs)
 
 ---
 
@@ -43,7 +44,7 @@ boot =
 	HpcConnect.bootstrap(
 		mode: :local,
 		cluster: :alex,
-		username: "v135ca12",
+		username: "your_hpc_username",
 		key_path: Path.expand("~/.ssh/id_fau"),
 		env_file: ".env"
 	)

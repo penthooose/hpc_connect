@@ -56,17 +56,21 @@ boot
 boot.startup
 ```
 
+<!-- livebook:{"branch_parent_index":1} -->
+
 ## vLLM test configuration
 
 ```elixir
 vllm_args = [
-	partition: "a40",
+	partition: "a100",
 	gpus: 1,
 	walltime: "02:00:00",
 	model: "meta-llama/Llama-3.2-1B-Instruct",
 	port: 50200
 ]
 ```
+
+<!-- livebook:{"branch_parent_index":1} -->
 
 ## Start vLLM
 
@@ -177,7 +181,7 @@ alloc = HpcConnect.allocate_gpu(session, partition: "a100", walltime: "01:00:00"
 # HpcConnect.release_gpu(session, "JOBID")
 ```
 
-<!-- livebook:{"branch_parent_index":2} -->
+<!-- livebook:{"branch_parent_index":1} -->
 
 ## Reconnect to an existing vLLM job after notebook/runtime restart
 
@@ -197,6 +201,18 @@ reconnected_vllm =
 
 ```elixir
 HpcConnect.vllm_chat(reconnected_vllm, "Hello from Livebook")
+```
+
+```elixir
+answer =
+	HpcConnect.vllm_chat(
+		reconnected_vllm,
+		"Can you solve: forall x in {a,b}: (P(x) -> Q(x)) and (Q(x) -> R(x))"
+	).answer
+
+answer
+|> String.split("\n")
+|> Enum.each(&IO.puts/1)
 ```
 
 <!-- livebook:{"branch_parent_index":2} -->

@@ -17,6 +17,7 @@ It standardizes:
 - [Command cheat sheet](docs/commands_cheat_sheet.md)
 - [Manual and troubleshooting](docs/hpc_connect_manual.md)
 - [Livebook example notebook](examples/hpc_connect_tutorial.livemd)
+- [Local shell example](examples/hpc_connect_local_example.exs)
 
 ---
 
@@ -65,7 +66,7 @@ boot =
   HpcConnect.bootstrap(
     mode: :local,
     cluster: :alex,
-    username: "v135ca12",
+    username: "your_hpc_username",
     key_path: Path.expand("~/.ssh/id_fau"),
     remote_command: "hostname && whoami",
     env_file: ".env"
@@ -81,7 +82,7 @@ boot =
   HpcConnect.bootstrap(
     mode: :local,
     cluster: :alex,
-    username: "v135ca12",
+    username: "your_hpc_username",
     key_path: Path.expand("~/.ssh/id_fau"),
     hf_token: System.get_env("HF_TOKEN")
   )

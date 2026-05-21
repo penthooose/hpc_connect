@@ -3,6 +3,7 @@
 This manual summarizes the current HpcConnect workflow for **Livebook** and **local** usage on **Linux** and **Windows**.
 
 For a shorter command list, see the [command cheat sheet](./commands_cheat_sheet.md).
+For runnable walkthroughs, see the [Livebook example](../examples/hpc_connect_tutorial.livemd) and the [local shell example](../examples/hpc_connect_local_example.exs).
 
 ---
 
@@ -84,7 +85,7 @@ boot =
 	HpcConnect.bootstrap(
 		mode: :local,
 		cluster: :alex,
-		username: "v135ca12",
+		username: "your_hpc_username",
 		key_path: Path.expand("~/.ssh/id_fau"),
 		env_file: ".env"
 	)
@@ -552,3 +553,4 @@ If a shared Livebook server blocks outbound SSH, the same notebook may still wor
 - [README](../README.md) for the short overview
 - [Command cheat sheet](./commands_cheat_sheet.md) for copy/paste commands
 - [Tutorial notebook](../examples/hpc_connect_tutorial.livemd) for the end-to-end Livebook flow
+- [Local shell example](../examples/hpc_connect_local_example.exs) for the same core commands in `mode: :local`
