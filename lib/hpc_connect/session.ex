@@ -60,6 +60,42 @@ defmodule HpcConnect.Session do
   def new(%Cluster{} = cluster, opts), do: build(cluster, opts)
   def new(cluster_name, opts), do: cluster_name |> Cluster.fetch!() |> build(opts)
 
+  @doc """
+  Builds a local-session config from `.env` / OS env defaults.
+
+  This is the lightweight counterpart to `HpcConnect.connection_setup(mode: :local)`.
+  It does not open any SSH connection; it only resolves session settings.
+  """
+  @spec local(keyword()) :: t()
+  def local(opts \\ []) do
+    env_map =
+      case Keyword.get(opts, :env_file, ".env") do
+        false -> %{}
+        nil -> %{}
+        path when is_binary(path) and path != "" -> EnvFile.load(path)
+        _ -> %{}
+      end
+
+    cluster =
+      Keyword.get(opts, :cluster) ||
+        Map.get(env_map, "HPC_CONNECT_CLUSTER") ||
+        Map.get(env_map, "HPC_CONNECT_SSH_ALIAS") ||
+        env("HPC_CONNECT_CLUSTER") ||
+        env("HPC_CONNECT_SSH_ALIAS") || :alex
+
+    opts =
+      opts
+      |> Keyword.put_new(:username, Map.get(env_map, "HPC_CONNECT_USERNAME"))
+      |> Keyword.put_new(:ssh_alias, Map.get(env_map, "HPC_CONNECT_SSH_ALIAS"))
+      |> Keyword.put_new(:identity_file, Map.get(env_map, "HPC_CONNECT_IDENTITY_FILE"))
+      |> Keyword.put_new(:proxy_jump, Map.get(env_map, "HPC_CONNECT_PROXY_JUMP"))
+      |> Keyword.put_new(:work_dir, Map.get(env_map, "HPC_CONNECT_WORK_DIR"))
+      |> Keyword.put_new(:vault_dir, Map.get(env_map, "HPC_CONNECT_VAULT_DIR"))
+      |> put_port_range_from_env(env_map)
+
+    new(cluster, opts)
+  end
+
   @spec target(t()) :: binary()
   def target(%__MODULE__{ssh_alias: alias}) when is_binary(alias) and alias != "", do: alias
 
@@ -281,5 +317,12 @@ defmodule HpcConnect.Session do
     end
   rescue
     ArgumentError -> nil
+  end
+
+  defp put_port_range_from_env(opts, env_map) do
+    case parse_port_range(Map.get(env_map, "HPC_CONNECT_PORT_RANGE")) do
+      nil -> opts
+      port_range -> Keyword.put_new(opts, :port_range, port_range)
+    end
   end
 end

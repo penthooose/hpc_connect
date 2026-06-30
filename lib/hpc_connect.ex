@@ -671,7 +671,7 @@ defmodule HpcConnect do
   def connect!(session, remote_command \\ "hostname", opts \\ [])
 
   def connect!(%Session{ssh_conn: nil} = session, remote_command, opts) do
-    run_fun = Keyword.get(opts, :run_fun, &run_command!/2)
+    run_fun = Keyword.get(opts, :run_fun, &run_command_with_retry!/2)
     connect_preflight_fun = Keyword.get(opts, :connect_preflight_fun, &preflight_connectivity/1)
     run_opts = Keyword.drop(opts, [:run_fun, :connect_preflight_fun])
 
@@ -1553,11 +1553,16 @@ defmodule HpcConnect do
 
   Options:
   - `:app`           – application name (required; used to find start_<app>.sh)
-  - `:partition`     – GPU partition (default: cluster default or `"a100"`)
-  - `:gpus`          – number of GPUs (default: `1`)
+  - `:partition`     – target partition (default: cluster default or `"a100"`)
+  - `:gpus`          – number of GPUs (default: `1`); set `0` for CPU-only jobs
   - `:walltime`      – time limit (default: `"02:00:00"`)
   - `:port`          – app port (default: `8000`)
   - `:cpus`          – cpus-per-task (default: `8`)
+  - `:nodes`         – number of nodes (optional)
+  - `:ntasks`        – number of tasks (optional)
+  - `:constraint`    – SLURM constraint (optional)
+  - `:mem`           – memory request (optional)
+  - `:exclusive`     – exclusive node access (default: `false`)
   - `:sif_name`      – stem name of the .sif (default: app name)
   - `:sif_path`      – override full remote sif path
   - `:app_env`       – extra environment variables (map, default: `%{}`)
@@ -1574,7 +1579,7 @@ defmodule HpcConnect do
   High-level app launcher. Submits a `start_<app>.sh` script via sbatch.
 
   All arguments can be passed as a flat `args:` list. SLURM scheduling keys
-  (`partition`, `gpus`, `walltime`, `cpus`, `sif_name`, `sif_path`) are forwarded
+  (`partition`, `gpus`, `walltime`, `cpus`, `nodes`, `ntasks`, `constraint`, `mem`, `exclusive`, `sif_name`, `sif_path`) are forwarded
   to sbatch; all remaining keys become `<APP_UPPER>_<KEY_UPPER>` environment
   variables inside the job script (e.g. `model:` → `VLLM_MODEL`). The `port`
   value is also passed as `APP_PORT` for the generic fallback in scripts.
@@ -1625,7 +1630,19 @@ defmodule HpcConnect do
                model: "meta-llama/Llama-3.2-1B-Instruct", port: 50200]
       )
   """
-  @slurm_keys [:partition, :gpus, :walltime, :cpus, :sif_name, :sif_path]
+  @slurm_keys [
+    :partition,
+    :gpus,
+    :walltime,
+    :cpus,
+    :nodes,
+    :ntasks,
+    :constraint,
+    :mem,
+    :exclusive,
+    :sif_name,
+    :sif_path
+  ]
   @pending_wait_table :hpc_connect_pending_waits
   @proxy_table :hpc_connect_open_proxies
 
@@ -3621,6 +3638,12 @@ defmodule HpcConnect do
   """
   @spec open_master!(Session.t(), keyword()) :: {Session.t(), port()}
   def open_master!(%Session{} = session, opts \\ []), do: SSH.open_master!(session, opts)
+
+  @doc """
+  Closes an OpenSSH ControlMaster port opened by `open_master!/2`.
+  """
+  @spec close_master(port()) :: :ok
+  def close_master(master_port) when is_port(master_port), do: SSH.close_master(master_port)
 
   defp script_missing?(output, script_name) do
     String.contains?(output, [script_name, "No such file or directory", "cannot execute"])

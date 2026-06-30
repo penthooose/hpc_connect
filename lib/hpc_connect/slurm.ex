@@ -706,15 +706,19 @@ defmodule HpcConnect.Slurm do
   end
 
   defp gres_cmd_option(%Session{} = session, opts, partition, gpus) do
-    gpu_type =
-      Keyword.get(opts, :gpu_type) ||
-        infer_gpu_type_from_partition(partition) ||
-        session.cluster.gpu_type
-
-    if gpu_type do
-      "--gres=gpu:#{gpu_type}:#{gpus}"
+    if gpus in [nil, 0] do
+      ""
     else
-      "--gres=gpu:#{gpus}"
+      gpu_type =
+        Keyword.get(opts, :gpu_type) ||
+          infer_gpu_type_from_partition(partition) ||
+          session.cluster.gpu_type
+
+      if gpu_type do
+        "--gres=gpu:#{gpu_type}:#{gpus}"
+      else
+        "--gres=gpu:#{gpus}"
+      end
     end
   end
 
@@ -1226,10 +1230,22 @@ defmodule HpcConnect.Slurm do
 
   def build_sif_blocking(%Session{} = session, opts) do
     if use_default_build_cluster_fallbacks?(opts) do
-      build_sif_blocking_with_fallbacks(session, opts, [:woody, :alex, :helma], [])
+      build_sif_blocking_with_fallbacks(session, opts, default_build_cluster_fallbacks(opts), [])
     else
       do_build_sif_blocking(session, opts)
     end
+  end
+
+  defp default_build_cluster_fallbacks(opts) do
+    if cpu_only_slurm_build?(opts) do
+      [:woody, :fritz, :helma]
+    else
+      [:woody, :alex, :helma]
+    end
+  end
+
+  defp cpu_only_slurm_build?(opts) do
+    Keyword.get(opts, :use_slurm, false) and not Keyword.has_key?(opts, :gres)
   end
 
   defp do_build_sif_blocking(%Session{} = session, opts) do
@@ -1348,6 +1364,26 @@ defmodule HpcConnect.Slurm do
 
   defp build_cluster_connectivity_error?(_), do: false
 
+  defp direct_build_failed_log?(message) when is_binary(message) do
+    down = String.downcase(message)
+
+    Enum.any?(
+      [
+        "fatal:",
+        "[error] build failed",
+        "sub-process http returned an error code",
+        "while performing build",
+        "operation not permitted",
+        "invalid 400 uri failure",
+        "apptainer not found",
+        "definition file not found"
+      ],
+      &String.contains?(down, &1)
+    )
+  end
+
+  defp direct_build_failed_log?(_), do: false
+
   defp wait_for_sif_direct!(_session, _sif_path, timeout, _interval) when timeout <= 0 do
     raise RuntimeError, "Timed out waiting for direct apptainer build to complete"
   end
@@ -1378,6 +1414,11 @@ defmodule HpcConnect.Slurm do
       if build_cluster_connectivity_error?(trimmed) do
         raise RuntimeError,
               "Apptainer build failed with remote SSH connectivity/access error while tailing direct build log: #{trimmed}"
+      end
+
+      if direct_build_failed_log?(trimmed) do
+        raise RuntimeError,
+              "Apptainer direct build failed. Tail of remote build log:\n#{trimmed}"
       end
 
       wait_for_sif_direct!(session, sif_path, timeout - interval, interval)
@@ -1442,11 +1483,16 @@ defmodule HpcConnect.Slurm do
   the job is waiting for resource availability.
 
   Options:
-  - `:partition`     – GPU partition (default: cluster default or `"a100"`)
-  - `:gpus`          – number of GPUs (default: `1`)
+  - `:partition`     – target partition (default: cluster default or `"a100"`)
+  - `:gpus`          – number of GPUs (default: `1`); set `0` for CPU-only jobs
   - `:walltime`      – time limit (default: `"02:00:00"`)
   - `:port`          – app port (default: `8000`)
   - `:cpus`          – cpus-per-task (default: `8`)
+  - `:nodes`         – number of nodes (optional)
+  - `:ntasks`        – number of tasks (optional)
+  - `:constraint`    – SLURM constraint (optional)
+  - `:mem`           – memory request (optional)
+  - `:exclusive`     – whether to request exclusive node access (default: `false`)
   - `:sif_name`      – stem name of the .sif (default: app name)
   - `:sif_path`      – override full remote sif path
   - `:app_env`       – extra env vars to pass (map, default: `%{}`)
@@ -1462,10 +1508,23 @@ defmodule HpcConnect.Slurm do
     walltime = Keyword.get(opts, :walltime, "02:00:00")
     port = Keyword.get(opts, :port, 8000)
     cpus = Keyword.get(opts, :cpus)
+    nodes = Keyword.get(opts, :nodes)
+    ntasks = Keyword.get(opts, :ntasks)
+    constraint = Keyword.get(opts, :constraint)
+    mem = Keyword.get(opts, :mem)
+    exclusive = Keyword.get(opts, :exclusive, false)
     sif_name = Keyword.get(opts, :sif_name, app)
     sif_path = Keyword.get(opts, :sif_path) || remote_sif_path(session, sif_name)
     app_env = Keyword.get(opts, :app_env, %{})
     args = Keyword.get(opts, :args, [])
+
+    {nodes, ntasks, cpus} =
+      normalize_apptainer_cpu_shape(session, partition,
+        gpus: gpus,
+        nodes: nodes,
+        ntasks: ntasks,
+        cpus: cpus
+      )
 
     logs_dir = Path.join(session.work_dir, "sbatch_logs")
     run_script = Path.join(Scripts.remote_script_dir(session), "start_#{app}.sh")
@@ -1489,7 +1548,12 @@ defmodule HpcConnect.Slurm do
         " --job-name=hpc_connect_#{app}" <>
         " --partition=#{partition}" <>
         " #{gres_cmd_option(session, opts, partition, gpus)}" <>
+        if(nodes, do: " --nodes=#{nodes}", else: "") <>
+        if(ntasks, do: " --ntasks=#{ntasks}", else: "") <>
         if(cpus, do: " --cpus-per-task=#{cpus}", else: "") <>
+        if(constraint, do: " --constraint=#{constraint}", else: "") <>
+        if(mem, do: " --mem=#{mem}", else: "") <>
+        if(exclusive, do: " --exclusive", else: "") <>
         " --time=#{walltime}" <>
         " --output=#{Shell.escape(logs_dir)}/#{app}_%j.out" <>
         " --error=#{Shell.escape(logs_dir)}/#{app}_%j.err" <>
@@ -1519,6 +1583,41 @@ defmodule HpcConnect.Slurm do
       sif_path: sif_path,
       logs_dir: logs_dir
     }
+  end
+
+  defp normalize_apptainer_cpu_shape(%Session{} = session, partition, opts) do
+    nodes = Keyword.get(opts, :nodes)
+    ntasks = Keyword.get(opts, :ntasks)
+    cpus = Keyword.get(opts, :cpus)
+    gpus = Keyword.get(opts, :gpus, 0)
+
+    if helma_single_node_cpu_job?(session, partition, gpus, nodes) do
+      total_cores = max((ntasks || 1) * max(cpus || 1, 1), 1)
+
+      if rem(total_cores, 48) == 0 and (ntasks || 1) == 1 do
+        {nodes, ntasks, cpus}
+      else
+        normalized_cpus = round_up_to_multiple(total_cores, 48)
+
+        Logger.info(
+          "[HpcConnect] Normalizing Helma CPU single-node job to #{normalized_cpus} cores " <>
+            "(requested ntasks=#{inspect(ntasks || 1)}, cpus-per-task=#{inspect(cpus || 1)})"
+        )
+
+        {nodes || 1, 1, normalized_cpus}
+      end
+    else
+      {nodes, ntasks, cpus}
+    end
+  end
+
+  defp helma_single_node_cpu_job?(%Session{} = session, partition, gpus, nodes) do
+    session.cluster.name == :helma and String.downcase(to_string(partition)) == "cpu" and
+      (is_nil(gpus) or gpus == 0) and (is_nil(nodes) or nodes == 1)
+  end
+
+  defp round_up_to_multiple(value, multiple) when is_integer(value) and is_integer(multiple) do
+    div(value + multiple - 1, multiple) * multiple
   end
 
   defp get_job_node_quick(session, job_id, opts) do

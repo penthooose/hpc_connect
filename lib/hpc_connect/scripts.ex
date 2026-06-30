@@ -10,6 +10,7 @@ defmodule HpcConnect.Scripts do
     "download_model.sh",
     "export_model_env.sh",
     "find_free_port.sh",
+    "start_atp_benchmark_runner.sh",
     "start_vllm.sh"
   ]
 
