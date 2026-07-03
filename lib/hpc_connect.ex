@@ -2132,9 +2132,18 @@ defmodule HpcConnect do
     case get_job_node(session, job_id, connect_opts: connect_opts) do
       nil ->
         if deadline == :infinity or System.monotonic_time(:millisecond) < deadline do
-          IO.puts("Waiting for GPU allocation ...")
-          interruptible_sleep(interval_ms)
-          do_wait_for_node_with_progress(session, job_id, interval_ms, deadline, connect_opts)
+          # Check if job already reached a terminal state (completed before first poll).
+          # This prevents hanging forever when a fast job finishes before squeue sees it.
+          case job_terminal_state(session, job_id) do
+            nil ->
+              IO.puts("Waiting for GPU allocation ...")
+              interruptible_sleep(interval_ms)
+              do_wait_for_node_with_progress(session, job_id, interval_ms, deadline, connect_opts)
+
+            state ->
+              IO.puts("Job #{job_id} already reached terminal state: #{state}")
+              nil
+          end
         else
           raise RuntimeError,
                 "Job #{job_id} did not receive a compute node within the configured timeout"
@@ -2142,6 +2151,46 @@ defmodule HpcConnect do
 
       node ->
         node
+    end
+  end
+
+  @terminal_states MapSet.new([
+                     "BOOT_FAIL",
+                     "CANCELLED",
+                     "COMPLETED",
+                     "DEADLINE",
+                     "FAILED",
+                     "NODE_FAIL",
+                     "OUT_OF_MEMORY",
+                     "PREEMPTED",
+                     "REVOKED",
+                     "SPECIAL_EXIT",
+                     "STOPPED",
+                     "SUSPENDED",
+                     "TIMEOUT"
+                   ])
+
+  defp job_terminal_state(%Session{} = session, job_id) do
+    {output, status} =
+      SSH.exec(
+        session,
+        "sacct -j #{job_id} -X --format=State --noheader -P 2>/dev/null | head -1 || true",
+        timeout: 15_000
+      )
+
+    if status != 0 do
+      nil
+    else
+      state =
+        output
+        |> String.trim()
+        |> String.upcase()
+
+      if state != "" and MapSet.member?(@terminal_states, state) do
+        state
+      else
+        nil
+      end
     end
   end
 

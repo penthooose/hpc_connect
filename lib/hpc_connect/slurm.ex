@@ -1238,7 +1238,7 @@ defmodule HpcConnect.Slurm do
 
   defp default_build_cluster_fallbacks(opts) do
     if cpu_only_slurm_build?(opts) do
-      [:woody, :fritz, :helma]
+      [:fritz, :alex, :helma, :woody]
     else
       [:woody, :alex, :helma]
     end

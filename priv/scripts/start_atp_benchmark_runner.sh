@@ -62,11 +62,27 @@ run_task() {
   mkdir -p "$result_dir"
   command=$(printf '%s' "$command_b64" | base64 -d)
 
+  # Extract the SIF path from the command (apptainer exec <sif_path> ...)
+  sif_path=""
+  if [[ "$command" == apptainer\ exec\ * ]]; then
+    sif_path=$(echo "$command" | awk '{print $3}')
+  fi
+
   export PROBLEM_PATH="$problem_path"
   export OUT_FILE="$out_file"
   export META_FILE="$meta_file"
   export RESOURCE_FILE="$resource_file"
   export TIMEOUT_SECONDS="$ATP_BENCHMARK_RUNNER_TIMEOUT_SECONDS"
+
+  # Check if the .sif file exists before attempting to run
+  if [ -n "$sif_path" ] && [ ! -f "$sif_path" ]; then
+    echo "% SZS status ProverNotAvailable for ${problem_id}" > "$out_file"
+    echo "% SIF image not found at: ${sif_path}" >> "$out_file"
+
+    printf '{"problem_id":"%s","prover":"%s","exit_status":%s,"wall_time_ms":%s,"memory_kb":%s,"output_path":"%s","resource_path":"%s"}\n' \
+      "$problem_id" "$prover" 255 0 null "$out_file" "$resource_file" > "$meta_file"
+    return 0
+  fi
 
   start_epoch_ms=$(date +%s%3N)
 
