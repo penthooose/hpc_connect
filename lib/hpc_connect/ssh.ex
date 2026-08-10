@@ -4,7 +4,7 @@ defmodule HpcConnect.SSH do
   """
 
   require Logger
-  alias HpcConnect.{Command, Session, Shell, TunnelManager}
+  alias HpcConnect.{Backoff, Command, Session, Shell, SteadyConnection, TunnelManager}
 
   @spec ssh_command(Session.t(), binary(), binary()) :: Command.t()
   def ssh_command(%Session{} = session, remote_command, summary) do
@@ -20,8 +20,13 @@ defmodule HpcConnect.SSH do
         ssh_option_args(session) ++
           [Session.target(session), "bash -lc #{Shell.escape(remote_command)}"],
       summary: summary,
-      remote_command: remote_command
+      remote_command: remote_command,
+      session_key: steady_session_key(session)
     }
+  end
+
+  defp steady_session_key(%Session{} = session) do
+    if SteadyConnection.enabled?(session), do: SteadyConnection.session_key(session), else: nil
   end
 
   @spec scp_to_command(Session.t(), binary(), binary(), binary(), keyword()) :: Command.t()
@@ -40,12 +45,40 @@ defmodule HpcConnect.SSH do
   end
 
   @spec run(Command.t(), keyword()) :: {binary(), non_neg_integer()}
-  def run(%Command{binary: binary, args: args}, opts \\ []) do
-    retries = Keyword.get(opts, :retries, 1)
-    delay_ms = Keyword.get(opts, :retry_delay_ms, 2_000)
-    cmd_opts = [stderr_to_stdout: true] ++ Keyword.drop(opts, [:retries, :retry_delay_ms])
+  def run(command, opts \\ [])
 
-    run_with_retry(binary, args, cmd_opts, retries, delay_ms)
+  def run(%Command{session_key: key, remote_command: remote} = command, opts)
+      when is_binary(key) and is_binary(remote) do
+    # Steady path: route through the persistent OS SSH shell when a server is
+    # registered; otherwise fall back to a one-shot OS ssh process.
+    case SteadyConnection.lookup_server(key) do
+      nil -> run_system_cmd(command, opts)
+      _pid -> SteadyConnection.run_remote(key, remote, opts)
+    end
+  end
+
+  def run(%Command{} = command, opts) do
+    run_system_cmd(command, opts)
+  end
+
+  defp run_system_cmd(%Command{binary: binary, args: args}, opts) do
+    retries = Keyword.get(opts, :retries, 1)
+
+    cmd_opts =
+      [stderr_to_stdout: true] ++
+        Keyword.drop(opts, [
+          :retries,
+          :retry_delay_ms,
+          :retry_backoff_base_ms,
+          :retry_backoff_factor,
+          :retry_backoff_max_ms,
+          :retry_backoff_jitter,
+          # System.cmd/3 rejects :timeout; SSH connect timeout is handled via
+          # the `-o ConnectTimeout` argument in the command args.
+          :timeout
+        ])
+
+    run_with_retry(binary, args, cmd_opts, retries, retries, opts)
   end
 
   @transient_openssh_errors [
@@ -63,15 +96,37 @@ defmodule HpcConnect.SSH do
     "could not resolve hostname"
   ]
 
-  defp run_with_retry(binary, args, cmd_opts, retries_left, delay_ms) do
+  defp run_with_retry(binary, args, cmd_opts, retries_left, total_retries, opts) do
     {output, status} = System.cmd(binary, args, cmd_opts)
 
     if retries_left > 0 and retryable_openssh_failure?(binary, status, output) do
-      Process.sleep(delay_ms)
-      run_with_retry(binary, args, cmd_opts, retries_left - 1, delay_ms)
+      Process.sleep(retry_delay(opts, total_retries, retries_left))
+      run_with_retry(binary, args, cmd_opts, retries_left - 1, total_retries, opts)
     else
       {output, status}
     end
+  end
+
+  # Fixed delay when :retry_delay_ms is provided (backward compat), otherwise
+  # exponential backoff via HpcConnect.Backoff.
+  defp retry_delay(opts, total_retries, retries_left) do
+    case Keyword.fetch(opts, :retry_delay_ms) do
+      {:ok, delay_ms} when is_integer(delay_ms) and delay_ms >= 0 ->
+        delay_ms
+
+      _ ->
+        attempt = total_retries - retries_left
+        Backoff.delay(attempt, Backoff.options(opts))
+    end
+  end
+
+  @doc """
+  Returns `true` when the given message looks like a transient OpenSSH
+  connection failure (dropped connection, timeout, refused, DNS, banner, etc.).
+  """
+  @spec transient_failure?(binary()) :: boolean()
+  def transient_failure?(message) when is_binary(message) do
+    transient_openssh_error?(message)
   end
 
   defp retryable_openssh_failure?(binary, status, output)
@@ -313,10 +368,7 @@ defmodule HpcConnect.SSH do
           "ConnectTimeout=30"
         ]
 
-    case session.master_socket do
-      nil -> base
-      socket -> base ++ ["-o", "ControlPath=#{socket}"]
-    end
+    append_control_args(session, base)
   end
 
   defp scp_option_args(session) do
@@ -344,9 +396,22 @@ defmodule HpcConnect.SSH do
           "ConnectTimeout=30"
         ]
 
+    append_control_args(session, base)
+  end
+
+  # Explicit ControlMaster socket wins; otherwise steady sessions add keepalive
+  # options to one-shot ssh/scp fallbacks (the persistent shell sets its own).
+  defp append_control_args(%Session{} = session, base) do
     case session.master_socket do
-      nil -> base
-      socket -> base ++ ["-o", "ControlPath=#{socket}"]
+      nil ->
+        if SteadyConnection.enabled?(session) do
+          base ++ ["-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3"]
+        else
+          base
+        end
+
+      socket ->
+        base ++ ["-o", "ControlPath=#{socket}"]
     end
   end
 

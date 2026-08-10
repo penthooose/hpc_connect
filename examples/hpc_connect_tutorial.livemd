@@ -19,6 +19,7 @@ key must still be selected again each time, as it will be overwritten to not per
 boot =
 	HpcConnect.prepare_livebook_session(
 		cluster: :alex,
+    steady_connection: false,
 		# optional for gated HF models:
 		# hf_token: System.get_env("HF_TOKEN"),
 		remote_command: "hostname && whoami",

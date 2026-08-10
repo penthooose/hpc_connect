@@ -5,7 +5,7 @@ defmodule HpcConnect.Slurm do
   """
 
   require Logger
-  alias HpcConnect.{Model, Scripts, Session, Shell, SSH}
+  alias HpcConnect.{Backoff, Model, Scripts, Session, Shell, SSH}
 
   # Node states considered usable (idle = fully free, mix = partially free)
   @free_states ~w(idle mix)
@@ -949,7 +949,7 @@ defmodule HpcConnect.Slurm do
     "kex_exchange_identification"
   ]
 
-  defp ssh_with_retry!(session, cmd, summary, retries \\ 3, delay_ms \\ 3_000) do
+  defp ssh_with_retry!(session, cmd, summary, retries \\ 3, attempt \\ 0) do
     case SSH.exec(session, cmd, []) do
       {_, 0} ->
         :ok
@@ -958,15 +958,15 @@ defmodule HpcConnect.Slurm do
         transient? = Enum.any?(@transient_upload_errors, &String.contains?(output, &1))
 
         if transient? and retries > 0 do
-          Process.sleep(delay_ms)
-          ssh_with_retry!(session, cmd, summary, retries - 1, delay_ms)
+          Process.sleep(Backoff.delay(attempt))
+          ssh_with_retry!(session, cmd, summary, retries - 1, attempt + 1)
         else
           raise RuntimeError, "#{summary} failed (exit #{status}): #{output}"
         end
     end
   end
 
-  defp ssh_run_with_retry!(session, cmd, summary, retries \\ 3, delay_ms \\ 3_000) do
+  defp ssh_run_with_retry!(session, cmd, summary, retries \\ 3, attempt \\ 0) do
     case SSH.exec(session, cmd, []) do
       {output, 0} ->
         output
@@ -975,15 +975,15 @@ defmodule HpcConnect.Slurm do
         transient? = Enum.any?(@transient_upload_errors, &String.contains?(output, &1))
 
         if transient? and retries > 0 do
-          Process.sleep(delay_ms)
-          ssh_run_with_retry!(session, cmd, summary, retries - 1, delay_ms)
+          Process.sleep(Backoff.delay(attempt))
+          ssh_run_with_retry!(session, cmd, summary, retries - 1, attempt + 1)
         else
           raise RuntimeError, "#{summary} failed (exit #{status}): #{output}"
         end
     end
   end
 
-  defp upload_with_retry!(session, local, remote, opts, retries \\ 3, delay_ms \\ 3_000) do
+  defp upload_with_retry!(session, local, remote, opts, retries \\ 3, attempt \\ 0) do
     SSH.upload!(session, local, remote, opts)
   rescue
     e in RuntimeError ->
@@ -991,8 +991,8 @@ defmodule HpcConnect.Slurm do
       transient? = Enum.any?(@transient_upload_errors, &String.contains?(msg, &1))
 
       if transient? and retries > 0 do
-        Process.sleep(delay_ms)
-        upload_with_retry!(session, local, remote, opts, retries - 1, delay_ms)
+        Process.sleep(Backoff.delay(attempt))
+        upload_with_retry!(session, local, remote, opts, retries - 1, attempt + 1)
       else
         reraise e, __STACKTRACE__
       end
@@ -1210,6 +1210,48 @@ defmodule HpcConnect.Slurm do
       )
 
     String.trim(output) == "ok"
+  end
+
+  @doc """
+  Lists files matching a glob pattern on the remote cluster with a single SSH
+  call. Returns a list of basenames (not full paths).
+
+  The glob is applied via `ls -1 <glob_pattern> 2>/dev/null || true`, so it
+  handles missing directories gracefully (returns `[]`).
+
+  ## Examples
+
+      # List all .sif files in singularity_images/
+      HpcConnect.list_remote_files(session,
+        Path.join(session.work_dir, "singularity_images/*.sif")
+      )
+      # => ["vampire.sif", "cvc5.sif", ...]
+
+      # List all .def files
+      HpcConnect.list_remote_files(session,
+        Path.join(session.work_dir, "singularity_def_files/*.def")
+      )
+  """
+  @spec list_remote_files(Session.t(), binary()) :: [binary()]
+  def list_remote_files(%Session{} = session, remote_glob) when is_binary(remote_glob) do
+    escaped = Shell.escape(remote_glob)
+
+    output =
+      ssh_run_with_retry!(
+        session,
+        "ls -1 #{escaped} 2>/dev/null || true",
+        "List remote files: #{remote_glob}"
+      )
+
+    case output do
+      "" ->
+        []
+
+      result when is_binary(result) ->
+        result
+        |> String.split("\n", trim: true)
+        |> Enum.map(&Path.basename/1)
+    end
   end
 
   @doc """

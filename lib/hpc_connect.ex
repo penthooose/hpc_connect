@@ -9,6 +9,8 @@ defmodule HpcConnect do
   import Kernel, except: [exit: 1]
 
   alias HpcConnect.{
+    Backoff,
+    Batch,
     Cluster,
     Command,
     EnvFile,
@@ -20,6 +22,7 @@ defmodule HpcConnect do
     Shell,
     Slurm,
     SSH,
+    SteadyConnection,
     TunnelManager
   }
 
@@ -166,6 +169,7 @@ defmodule HpcConnect do
       |> merge_bootstrap_runtime_env(resolved_opts)
       |> maybe_apply_hf_token(resolved_opts)
       |> maybe_open_bootstrap_native_connection(setup_opts)
+      |> maybe_open_bootstrap_steady_connection(setup_opts)
 
     setup_session =
       if Keyword.get(resolved_opts, :install_scripts, true) do
@@ -225,8 +229,20 @@ defmodule HpcConnect do
     |> put_default_opt(:proxy_jump, Map.get(env_map, "HPC_CONNECT_PROXY_JUMP"))
     |> put_default_opt(:port_range, parse_port_range(Map.get(env_map, "HPC_CONNECT_PORT_RANGE")))
     |> put_default_opt(:remote_command, Map.get(env_map, "HPC_CONNECT_REMOTE_COMMAND"))
+    |> put_default_opt(:steady_connection, steady_env_value(env_map))
     |> put_default_opt(:hf_token, env_hf_token(env_map))
     |> maybe_prepare_local_native_key()
+  end
+
+  defp steady_env_value(env_map) do
+    case Map.get(env_map, "HPC_CONNECT_STEADY_CONNECTION") ||
+           Map.get(env_map, "STEADY_SSH_CONNECTION") do
+      nil ->
+        nil
+
+      value ->
+        value |> String.trim() |> String.downcase() |> then(&(&1 in ["1", "true", "yes", "on"]))
+    end
   end
 
   defp maybe_prepare_local_native_key(opts) do
@@ -436,7 +452,7 @@ defmodule HpcConnect do
       opts
       |> bootstrap_env_map()
       |> Enum.reject(fn {key, _value} ->
-        String.starts_with?(key, "HPC_CONNECT_") or key == "STEADY_SSH_CONNECTION"
+        String.starts_with?(key, "HPC_CONNECT_") or String.starts_with?(key, "STEADY_SSH_")
       end)
       |> Map.new()
 
@@ -479,6 +495,33 @@ defmodule HpcConnect do
               reraise e, __STACKTRACE__
             end
         end
+    end
+  end
+
+  # Pre-warms the steady OS SSH master connection at bootstrap (OS path only).
+  # Native :ssh connections are already persistent, so steady mode is skipped
+  # when `session.ssh_conn` is set.
+  defp maybe_open_bootstrap_steady_connection(%Session{} = session, opts) do
+    if not is_nil(session.ssh_conn) do
+      session
+    else
+      open_steady? = Keyword.get(opts, :open_steady_connection, true)
+
+      if open_steady? and SteadyConnection.enabled?(session) do
+        try do
+          SteadyConnection.ensure_connected!(session)
+        rescue
+          e ->
+            IO.puts(
+              "Steady SSH connection probe failed; continuing with plain OS SSH: " <>
+                "#{Exception.message(e)}"
+            )
+
+            session
+        end
+      else
+        session
+      end
     end
   end
 
@@ -674,6 +717,11 @@ defmodule HpcConnect do
     run_fun = Keyword.get(opts, :run_fun, &run_command_with_retry!/2)
     connect_preflight_fun = Keyword.get(opts, :connect_preflight_fun, &preflight_connectivity/1)
     run_opts = Keyword.drop(opts, [:run_fun, :connect_preflight_fun])
+
+    # Pre-warm the steady OS SSH shell so commands multiplex over it.
+    if SteadyConnection.enabled?(session) do
+      SteadyConnection.ensure_server(session)
+    end
 
     command = connect_command(session, remote_command)
 
@@ -974,19 +1022,35 @@ defmodule HpcConnect do
   ]
 
   @doc """
-  Like `run_command!/2` but retries up to `retries` times (default 3) with a
-  delay between attempts when a transient SSH/SCP connection error is detected.
-  Useful for commands that go through a jump host that occasionally drops connections.
+  Like `run_command!/2` but retries up to `retries` times (default 3) with an
+  exponential backoff delay between attempts when a transient SSH/SCP connection
+  error is detected. Useful for commands that go through a jump host that
+  occasionally drops connections.
+
+  Options:
+    * `:retries` – max attempts (default `3`)
+    * `:retry_delay_ms` – fixed delay when provided (backward compat)
+    * `:retry_backoff_base_ms`, `:retry_backoff_factor`, `:retry_backoff_max_ms`,
+      `:retry_backoff_jitter` – exponential backoff tuning
   """
   @spec run_command_with_retry!(Command.t(), keyword()) :: binary()
   def run_command_with_retry!(%Command{} = command, opts \\ []) do
     retries = Keyword.get(opts, :retries, 3)
-    delay_ms = Keyword.get(opts, :retry_delay_ms, 3_000)
-    opts_clean = Keyword.drop(opts, [:retries, :retry_delay_ms])
-    do_run_with_retry!(command, opts_clean, retries, delay_ms)
+
+    opts_clean =
+      Keyword.drop(opts, [
+        :retries,
+        :retry_delay_ms,
+        :retry_backoff_base_ms,
+        :retry_backoff_factor,
+        :retry_backoff_max_ms,
+        :retry_backoff_jitter
+      ])
+
+    do_run_with_retry!(command, opts_clean, retries, opts)
   end
 
-  defp do_run_with_retry!(command, opts, retries_left, delay_ms) do
+  defp do_run_with_retry!(command, opts, retries_left, retry_opts) do
     run_command!(command, opts)
   rescue
     e in RuntimeError ->
@@ -994,11 +1058,20 @@ defmodule HpcConnect do
       transient? = Enum.any?(@transient_errors, &String.contains?(msg, &1))
 
       if transient? and retries_left > 0 do
-        Process.sleep(delay_ms)
-        do_run_with_retry!(command, opts, retries_left - 1, delay_ms)
+        Process.sleep(retry_delay(retry_opts, retries_left - 1))
+        do_run_with_retry!(command, opts, retries_left - 1, retry_opts)
       else
         reraise e, __STACKTRACE__
       end
+  end
+
+  # Fixed delay when :retry_delay_ms is provided (backward compat), otherwise
+  # exponential backoff via HpcConnect.Backoff.
+  defp retry_delay(opts, attempt) when is_integer(attempt) and attempt >= 0 do
+    case Keyword.fetch(opts, :retry_delay_ms) do
+      {:ok, delay_ms} when is_integer(delay_ms) and delay_ms >= 0 -> delay_ms
+      _ -> Backoff.delay(attempt, Backoff.options(opts))
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -1336,16 +1409,82 @@ defmodule HpcConnect do
 
   @doc """
   Gathers the most relevant remote status information for a connected session.
+
+  The four remote queries (quota, free GPUs/nodes, downloaded models, running
+  jobs) are combined into a **single SSH round-trip** via `HpcConnect.Batch` and
+  parsed independently. A failing sub-query yields `%{ok?: false}` for that
+  segment without affecting the others.
   """
   @spec startup_summary(Session.t(), keyword()) :: map()
   def startup_summary(%Session{} = session, opts \\ []) do
+    commands = startup_commands(session, opts)
+
+    batch_result =
+      safe_call(fn -> Batch.run(session, commands, Keyword.get(opts, :batch_opts, [])) end)
+
+    base = %{models_dir: models_root(session)}
+
+    case batch_result do
+      %{ok?: true, value: results} ->
+        Map.merge(base, parse_startup_segments(results))
+
+      %{ok?: false} = err ->
+        Map.merge(base, %{
+          quota: err,
+          available_gpus: err,
+          downloaded_models: err,
+          jobs: err
+        })
+    end
+  end
+
+  defp startup_commands(%Session{} = session, _opts) do
+    jobs_cmd =
+      case session.username do
+        user when is_binary(user) and user != "" ->
+          "squeue -u #{user} -o '%i %P %j %u %t %M %l %D %C %R'"
+
+        _ ->
+          "echo no-username"
+      end
+
+    [
+      {:quota, "shownicerquota.pl"},
+      {:available_gpus, "sinfo"},
+      {:downloaded_models, Model.list_remote_command(session).remote_command},
+      {:jobs, jobs_cmd}
+    ]
+  end
+
+  defp parse_startup_segments(results) do
+    by_label = Map.new(results, fn %{label: label} = result -> {label, result} end)
+
     %{
-      models_dir: models_root(session),
-      quota: safe_call(fn -> quota_summary(session, opts) end),
-      available_gpus: safe_call(fn -> available_gpu_summary(session, opts) end),
-      downloaded_models: safe_call(fn -> list_downloaded_models(session, opts) end),
-      jobs: safe_call(fn -> list_jobs_summary(session, opts) end)
+      quota: segment_result(by_label, :quota, &Slurm.parse_quota/1),
+      available_gpus:
+        segment_result(by_label, :available_gpus, fn output ->
+          output |> Slurm.parse_sinfo() |> Slurm.partition_summary()
+        end),
+      downloaded_models:
+        segment_result(by_label, :downloaded_models, &Model.parse_remote_listing/1),
+      jobs: segment_result(by_label, :jobs, &Slurm.parse_jobs/1)
     }
+  end
+
+  defp segment_result(by_label, label, parse_fun) do
+    case Map.get(by_label, label) do
+      nil ->
+        %{ok?: false, error: "startup summary missing segment #{label}"}
+
+      %{status: status, output: output} when status != 0 ->
+        %{
+          ok?: false,
+          error: "#{label} failed (exit #{status}): #{String.slice(String.trim(output), 0, 200)}"
+        }
+
+      %{output: output} ->
+        %{ok?: true, value: parse_fun.(output)}
+    end
   end
 
   @doc """
@@ -1361,15 +1500,23 @@ defmodule HpcConnect do
   def install_remote_scripts!(session, opts \\ [])
 
   def install_remote_scripts!(%Session{ssh_conn: nil} = session, opts) do
+    if SteadyConnection.enabled?(session) do
+      SteadyConnection.ensure_server(session)
+    end
+
     remote_root = session.work_dir
     remote_scripts = Scripts.remote_script_dir(session)
 
+    # Combine directory creation and (optional) permission fix in one SSH call.
+    setup_cmd =
+      "mkdir -p #{Shell.escape(remote_root)} #{Shell.escape(remote_scripts)}" <>
+        if(Keyword.get(opts, :reset_permission, false),
+          do: " && chmod 755 #{Shell.escape(remote_root)} #{Shell.escape(remote_scripts)}",
+          else: ""
+        )
+
     run_command_with_retry!(
-      SSH.ssh_command(
-        session,
-        "mkdir -p #{Shell.escape(remote_root)} #{Shell.escape(remote_scripts)}",
-        "Create remote hpc_connect directories"
-      )
+      SSH.ssh_command(session, setup_cmd, "Create remote hpc_connect directories")
     )
 
     SSH.upload!(session, Scripts.local_script_dir(), remote_root,
@@ -1377,16 +1524,6 @@ defmodule HpcConnect do
       normalize_line_endings: :lf,
       normalize_extensions: [".sh"]
     )
-
-    if Keyword.get(opts, :reset_permission, false) do
-      run_command_with_retry!(
-        SSH.ssh_command(
-          session,
-          "chmod 755 #{Shell.escape(session.work_dir)} #{Shell.escape(remote_scripts)}",
-          "Ensure read/write/execute permissions on hpc_connect dirs"
-        )
-      )
-    end
 
     :ok
   end
@@ -1445,6 +1582,25 @@ defmodule HpcConnect do
   @spec remote_sif_path(Session.t(), binary()) :: binary()
   def remote_sif_path(%Session{} = session, name \\ "vllm"),
     do: Slurm.remote_sif_path(session, name)
+
+  @doc """
+  Lists files matching a glob pattern on the remote cluster with a single SSH
+  call. Returns basenames (e.g. `["vampire.sif", "cvc5.sif"]`).
+
+  Handles missing directories gracefully — returns `[]` when nothing matches
+  or the directory does not exist.
+
+  ## Examples
+
+      HpcConnect.list_remote_files(session,
+        Path.join(session.work_dir, "singularity_images/*.sif")
+      )
+      HpcConnect.list_remote_files(session,
+        Path.join(session.work_dir, "singularity_def_files/*.def")
+      )
+  """
+  @spec list_remote_files(Session.t(), binary()) :: [binary()]
+  defdelegate list_remote_files(session, remote_glob), to: Slurm
 
   @doc """
   Uploads a local Singularity definition file to the remote cluster.
@@ -2136,7 +2292,6 @@ defmodule HpcConnect do
           # This prevents hanging forever when a fast job finishes before squeue sees it.
           case job_terminal_state(session, job_id) do
             nil ->
-              IO.puts("Waiting for GPU allocation ...")
               interruptible_sleep(interval_ms)
               do_wait_for_node_with_progress(session, job_id, interval_ms, deadline, connect_opts)
 
@@ -3694,16 +3849,44 @@ defmodule HpcConnect do
   @spec close_master(port()) :: :ok
   def close_master(master_port) when is_port(master_port), do: SSH.close_master(master_port)
 
+  @doc """
+  Returns `true` when the session has the steady OS SSH connection enabled.
+  """
+  @spec steady_connection?(Session.t()) :: boolean()
+  def steady_connection?(%Session{} = session), do: SteadyConnection.enabled?(session)
+
+  @doc """
+  Ensures a steady OS SSH ControlMaster connection is established for the session.
+
+  When `session.steady_connection` is `true`, runs a lightweight probe that
+  triggers OpenSSH `ControlMaster=auto` to open (or reuse) the persistent master
+  connection. All subsequent OS SSH/SCP commands multiplex over it and
+  auto-reconnect with exponential backoff on transient failures.
+
+  Returns the session with `master_socket` set. A no-op when steady is disabled.
+  """
+  @spec open_steady_connection!(Session.t(), keyword()) :: Session.t()
+  def open_steady_connection!(%Session{} = session, opts \\ []) do
+    SteadyConnection.ensure_connected!(session, opts)
+  end
+
+  @doc """
+  Tears down the steady OS SSH master connection (`ssh -O exit`) and removes the
+  stale socket. Returns `:ok`. A no-op when steady is disabled.
+  """
+  @spec close_steady_connection(Session.t()) :: :ok
+  def close_steady_connection(%Session{} = session), do: SteadyConnection.disconnect(session)
+
   defp script_missing?(output, script_name) do
     String.contains?(output, [script_name, "No such file or directory", "cannot execute"])
   end
 
-  defp with_retry(fun, opts, retries \\ nil, delay_ms \\ 3_000)
+  defp with_retry(fun, opts, retries \\ nil, attempt \\ 0)
 
-  defp with_retry(fun, opts, nil, delay_ms),
-    do: with_retry(fun, opts, Keyword.get(opts, :retries, 3), delay_ms)
+  defp with_retry(fun, opts, nil, attempt),
+    do: with_retry(fun, opts, Keyword.get(opts, :retries, 3), attempt)
 
-  defp with_retry(fun, opts, retries, delay_ms) do
+  defp with_retry(fun, opts, retries, attempt) do
     fun.()
   rescue
     e in RuntimeError ->
@@ -3711,14 +3894,14 @@ defmodule HpcConnect do
       transient? = Enum.any?(@transient_errors, &String.contains?(msg, &1))
 
       if transient? and retries > 0 do
-        Process.sleep(delay_ms)
-        with_retry(fun, opts, retries - 1, delay_ms)
+        Process.sleep(retry_delay(opts, attempt))
+        with_retry(fun, opts, retries - 1, attempt + 1)
       else
         reraise e, __STACKTRACE__
       end
   end
 
-  defp safe_call(fun, retries \\ 3, delay_ms \\ 3_000) do
+  defp safe_call(fun, retries \\ 3, attempt \\ 0) do
     %{ok?: true, value: fun.()}
   rescue
     e ->
@@ -3726,8 +3909,8 @@ defmodule HpcConnect do
       transient? = Enum.any?(@transient_errors, &String.contains?(msg, &1))
 
       if transient? and retries > 0 do
-        Process.sleep(delay_ms)
-        safe_call(fun, retries - 1, delay_ms)
+        Process.sleep(Backoff.delay(attempt))
+        safe_call(fun, retries - 1, attempt + 1)
       else
         %{ok?: false, error: msg}
       end

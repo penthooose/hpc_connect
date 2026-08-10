@@ -63,9 +63,11 @@ run_task() {
   command=$(printf '%s' "$command_b64" | base64 -d)
 
   # Extract the SIF path from the command (apptainer exec <sif_path> ...)
+  # The sif path may be quoted (e.g. "${HPC_WORK_DIR:-...}/vampire.sif"
+  # or '/home/hpc/.../vampire.sif'), so strip surrounding quotes after extraction.
   sif_path=""
   if [[ "$command" == apptainer\ exec\ * ]]; then
-    sif_path=$(echo "$command" | awk '{print $3}')
+    sif_path=$(echo "$command" | awk '{print $3}' | sed -e 's/^["\x27]//;s/["\x27]$//')
   fi
 
   export PROBLEM_PATH="$problem_path"

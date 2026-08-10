@@ -141,6 +141,43 @@ HpcConnect.exit(boot)
 
 ---
 
+## Steady SSH connection (faster + more reliable)
+
+By default every OS `ssh` command spawns a fresh process with its own TCP
+handshake and key exchange (~1–2 s each through a jump host). Enable the steady
+connection to multiplex all commands over **one persistent
+`ssh <target> "bash -s"` shell**:
+
+- no per-command handshake → multi-command worksteps (bootstrap, image builds,
+  benchmark runs) get dramatically faster
+- **auto-reconnect**: if the shell drops (network, jump-host hiccup) the next
+  command transparently reopens it
+- **exponential backoff** retries on transient failures
+- works on **all platforms**, including Windows (Win32-OpenSSH does not support
+  OpenSSH `ControlMaster` multiplexing; this approach needs no ControlMaster)
+
+Activate per session (`.env`):
+
+```env
+HPC_CONNECT_STEADY_CONNECTION=true
+# optional: HPC_CONNECT_STEADY_TIMEOUT_SECONDS=30
+```
+
+Or per call: `HpcConnect.Session.local(env_file: ".env", steady_connection: true)`.
+
+Runtime control:
+
+```elixir
+session = HpcConnect.open_steady_connection!(session)   # pre-warm + verify
+HpcConnect.steady_connection?(session)                  # enabled?
+HpcConnect.close_steady_connection(session)             # tear the shell down
+```
+
+`bootstrap/1` pre-warms the shell automatically when the flag is set, and the
+startup summary + remote script install are also batched into fewer SSH calls.
+
+---
+
 ## Platform support
 
 HpcConnect is designed so that:

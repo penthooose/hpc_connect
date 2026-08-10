@@ -19,7 +19,9 @@ defmodule HpcConnect.Session do
     :work_dir,
     :vault_dir,
     :port_range,
-    # Path to an SSH ControlMaster socket (set by SSH.open_master!/1)
+    # Steady OS SSH connection enabled (ControlMaster multiplexing + backoff)
+    :steady_connection,
+    # Path to an SSH ControlMaster socket (set by SSH.open_master!/1 or steady)
     :master_socket,
     # Erlang :ssh persistent connection reference (set by SSH.open_connection!/1)
     :ssh_conn,
@@ -47,6 +49,7 @@ defmodule HpcConnect.Session do
           work_dir: binary(),
           vault_dir: binary(),
           port_range: {pos_integer(), pos_integer()},
+          steady_connection: boolean(),
           master_socket: binary() | nil,
           ssh_conn: pid() | reference() | nil,
           tunnel_port: port() | nil,
@@ -91,6 +94,7 @@ defmodule HpcConnect.Session do
       |> Keyword.put_new(:proxy_jump, Map.get(env_map, "HPC_CONNECT_PROXY_JUMP"))
       |> Keyword.put_new(:work_dir, Map.get(env_map, "HPC_CONNECT_WORK_DIR"))
       |> Keyword.put_new(:vault_dir, Map.get(env_map, "HPC_CONNECT_VAULT_DIR"))
+      |> put_steady_from_env(env_map)
       |> put_port_range_from_env(env_map)
 
     new(cluster, opts)
@@ -128,7 +132,9 @@ defmodule HpcConnect.Session do
   @spec remote_env_prefix(t()) :: binary()
   def remote_env_prefix(%__MODULE__{} = session) do
     session.env
-    |> Enum.reject(fn {key, _value} -> String.starts_with?(key, "HPC_CONNECT_") end)
+    |> Enum.reject(fn {key, _value} ->
+      String.starts_with?(key, "HPC_CONNECT_") or String.starts_with?(key, "STEADY_SSH_")
+    end)
     |> Enum.sort_by(fn {key, _value} -> key end)
     |> Enum.map_join(" && ", fn {key, value} -> "export #{key}=#{Shell.escape(value)}" end)
   end
@@ -235,6 +241,13 @@ defmodule HpcConnect.Session do
         parse_port_range(env("HPC_CONNECT_PORT_RANGE")) || {8000, 8999}
       )
 
+    steady_connection =
+      Keyword.get(
+        opts,
+        :steady_connection,
+        parse_bool(env("HPC_CONNECT_STEADY_CONNECTION") || env("STEADY_SSH_CONNECTION"))
+      )
+
     env_overrides = Keyword.get(opts, :env, %{})
 
     env_overrides =
@@ -259,11 +272,29 @@ defmodule HpcConnect.Session do
       work_dir: work_dir,
       vault_dir: vault_dir,
       port_range: port_range,
+      steady_connection: steady_connection,
       env: env_overrides
     }
   end
 
   defp env(name), do: System.get_env(name)
+
+  defp parse_bool(nil), do: false
+  defp parse_bool(value) when is_boolean(value), do: value
+
+  defp parse_bool(value) when is_binary(value) do
+    value |> String.trim() |> String.downcase() |> then(&(&1 in ["1", "true", "yes", "on"]))
+  end
+
+  defp parse_bool(_), do: false
+
+  defp put_steady_from_env(opts, env_map) do
+    case Map.get(env_map, "HPC_CONNECT_STEADY_CONNECTION") ||
+           Map.get(env_map, "STEADY_SSH_CONNECTION") do
+      nil -> opts
+      value -> Keyword.put_new(opts, :steady_connection, parse_bool(value))
+    end
+  end
 
   defp normalize_local_path(path) when is_binary(path) and path != "" do
     Path.expand(path)
@@ -300,6 +331,18 @@ defmodule HpcConnect.Session do
 
       {:vault_dir, "~/vault/hpc_connect/" <> suffix} when is_binary(derived_vault_dir) ->
         Path.join(derived_vault_dir, suffix)
+
+      {:vault_dir, "$HPCVAULT/" <> suffix} when is_binary(derived_vault_dir) ->
+        Path.join(derived_vault_dir, suffix)
+
+      {:vault_dir, "$HPCVAULT" <> suffix} when is_binary(derived_vault_dir) ->
+        derived_vault_dir <> suffix
+
+      {:vault_dir, "$HPCVAULT/" <> suffix} when is_binary(derived_vault_dir) ->
+        Path.join(derived_vault_dir, suffix)
+
+      {:vault_dir, "$HPCVAULT" <> suffix} when is_binary(derived_vault_dir) ->
+        derived_vault_dir <> suffix
 
       _ ->
         trimmed

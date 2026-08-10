@@ -26,7 +26,8 @@ defmodule HpcConnect.Livebook do
       known_hosts_file: credentials.known_hosts_file,
       credential_dir: credentials.credential_dir,
       proxy_jump: nil,
-      port_range: Keyword.get(opts, :port_range)
+      port_range: Keyword.get(opts, :port_range),
+      steady_connection: Keyword.get(opts, :steady_connection)
     ]
 
     cluster
@@ -250,7 +251,8 @@ defmodule HpcConnect.Livebook do
         connect_opts: Keyword.get(prepared_opts, :connect_opts, []),
         work_dir: Keyword.get(prepared_opts, :work_dir),
         vault_dir: Keyword.get(prepared_opts, :vault_dir),
-        port_range: Keyword.get(prepared_opts, :port_range)
+        port_range: Keyword.get(prepared_opts, :port_range),
+        steady_connection: Keyword.get(opts, :steady_connection)
       )
 
     Map.merge(result, %{mode: :livebook, ui_rendered?: ui_rendered?})
@@ -286,7 +288,8 @@ defmodule HpcConnect.Livebook do
         identity_file: key_path,
         work_dir: Keyword.get(opts, :work_dir),
         vault_dir: Keyword.get(opts, :vault_dir),
-        port_range: Keyword.get(opts, :port_range)
+        port_range: Keyword.get(opts, :port_range),
+        steady_connection: Keyword.get(opts, :steady_connection)
       )
 
     session = Session.new(cluster, session_opts)
