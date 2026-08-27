@@ -54,6 +54,46 @@ session = boot.session
 
 Native SSH is optional. The default local bootstrap flow uses the normal OS SSH path.
 
+## Connection setup (unified)
+
+`connection_setup/1` is the one-call setup `bootstrap/1` builds on — use it
+directly when you only need a session (no startup status gathering).
+
+```elixir
+result =
+	HpcConnect.connection_setup(
+		mode: :local,
+		cluster: :alex,
+		username: "you",
+		key_path: Path.expand("~/.ssh/id_fau"),
+		env_file: ".env"
+	)
+
+session = result.session
+```
+
+## Steady SSH connection (recommended)
+
+Multiplexes all commands over one persistent `ssh <target> "bash -s"` shell
+with auto-reconnect and exponential backoff — no per-command handshake.
+Enable it in `.env`:
+
+```dotenv
+HPC_CONNECT_STEADY_CONNECTION=true
+HPC_CONNECT_STEADY_TIMEOUT_SECONDS=30   # per-command ssh connect timeout
+```
+
+or per call: `bootstrap(..., steady_connection: true)` /
+`connection_setup(..., steady_connection: true)`. Query and control it:
+
+```elixir
+HpcConnect.steady_connection?(session)          # boolean
+HpcConnect.open_steady_connection!(session)     # open / repair the steady shell
+HpcConnect.close_steady_connection(session)     # close it
+```
+
+Works on all platforms (including Windows, which lacks OpenSSH ControlMaster).
+
 ---
 
 ## Status queries
@@ -63,6 +103,9 @@ HpcConnect.available_gpu_summary(session)
 HpcConnect.list_downloaded_models(session)
 HpcConnect.list_jobs_summary(session)
 HpcConnect.quota_summary(session)
+HpcConnect.check_free_nodes(session)          # sinfo-style free-node check
+HpcConnect.startup_summary(session)           # what bootstrap gathered at connect time
+HpcConnect.connect!(session, "hostname")      # run a one-off remote command
 ```
 
 ## Models and images
@@ -70,6 +113,8 @@ HpcConnect.quota_summary(session)
 ```elixir
 HpcConnect.download_model(session, "meta-llama/Llama-3.2-1B-Instruct")
 HpcConnect.build_sif(session, "vllm")
+HpcConnect.build_sif(session, "vllm", force_rebuild: true)  # rebuild even if the .sif exists
+HpcConnect.put_hf_token(session, System.get_env("HF_TOKEN")) # gated models after bootstrap
 ```
 
 ## Start vLLM
@@ -105,6 +150,26 @@ reconnected =
 		app: "vllm",
 		args: [port: 50200]
 	)
+```
+
+## Manual port-forward / tunnel
+
+`start_app` normally handles the tunnel; use these only when you need a manual
+forward (e.g. after `wait_for_job_node/2`):
+
+```elixir
+node = HpcConnect.wait_for_job_node(session, job_id)
+proxy = HpcConnect.start_proxy(session, node, remote_port: 8000, local_port: 50200)
+port = HpcConnect.open_proxy!(proxy)
+# ... use proxy.base_url ...
+HpcConnect.close_proxy(port)
+```
+
+## Submit vLLM directly via Apptainer
+
+```elixir
+HpcConnect.submit_vllm_apptainer(session, "meta-llama/Llama-3.2-1B-Instruct",
+	partition: "a40", gpus: 1, walltime: "02:00:00", port: 50200)
 ```
 
 ## Allocate a GPU without starting an app

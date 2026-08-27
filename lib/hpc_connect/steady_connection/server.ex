@@ -184,12 +184,21 @@ defmodule HpcConnect.SteadyConnection.Server do
 
     Port.open(
       {:spawn_executable, SSH.ssh_binary()},
-      [:binary, :exit_status, :stderr_to_stdout, args: args]
+      [:binary, :exit_status, :stderr_to_stdout] ++ hide_on_windows() ++ [args: args]
     )
   rescue
     e ->
       Logger.error("[HpcConnect] steady shell spawn failed: #{Exception.message(e)}")
       nil
+  end
+
+  # On Windows, ssh.exe would otherwise flash a console window. System.cmd adds
+  # :hide automatically, but raw Port.open needs it explicitly.
+  defp hide_on_windows do
+    case :os.type() do
+      {:win32, _} -> [:hide]
+      _ -> []
+    end
   end
 
   defp shell_args(%Session{} = session) do

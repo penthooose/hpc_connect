@@ -74,6 +74,7 @@ defmodule HpcConnect.TunnelManager do
           {:args, _} -> true
           _ -> false
         end)
+        |> maybe_hide_on_windows()
         |> Kernel.++(args: args)
 
       port =
@@ -99,6 +100,15 @@ defmodule HpcConnect.TunnelManager do
       %{output: output, exit_status: exit_status} = _entry ->
         alive? = Port.info(port) != nil
         {:reply, {:ok, %{alive?: alive?, output: output, exit_status: exit_status}}, state}
+    end
+  end
+
+  # On Windows, ssh/scp would otherwise flash a console window. System.cmd adds
+  # :hide automatically; raw Port.open needs it explicitly (ignored on Unix).
+  defp maybe_hide_on_windows(opts) do
+    case :os.type() do
+      {:win32, _} -> if :hide in opts, do: opts, else: [:hide | opts]
+      _ -> opts
     end
   end
 

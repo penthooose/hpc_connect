@@ -249,6 +249,24 @@ HpcConnect.bootstrap(mode: :local, native_ssh: false, ...)
 This is a good fallback when your regular OpenSSH key works, but native Erlang
 SSH has trouble with key format or proxy handling.
 
+### Steady SSH connection
+
+HpcConnect can multiplex every `ssh` command over **one persistent**
+`ssh <target> "bash -s"` shell (no per-command handshake) with auto-reconnect
+and exponential backoff. Enable it in `.env`:
+
+```dotenv
+HPC_CONNECT_STEADY_CONNECTION=true
+HPC_CONNECT_STEADY_TIMEOUT_SECONDS=30   # per-command ssh connect timeout (default 30)
+```
+
+or per call: `bootstrap(..., steady_connection: true)` /
+`connection_setup(..., steady_connection: true)`. Query and control the
+steady shell with `HpcConnect.steady_connection?/1`,
+`HpcConnect.open_steady_connection!/1`, and
+`HpcConnect.close_steady_connection/1`. This works on all platforms,
+including Windows (which lacks OpenSSH ControlMaster support).
+
 ---
 
 ## 5. Hugging Face token handling

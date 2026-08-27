@@ -88,11 +88,15 @@ run_task() {
 
   start_epoch_ms=$(date +%s%3N)
 
+  # CRITICAL: run the prover with stdin from /dev/null, NOT from the loop's
+  # tasks file. The while-read loop feeds the TSV via stdin; if the apptainer
+  # subprocess inherits that fd it consumes the remaining task lines and the
+  # next read hits EOF, so only the first task would ever run.
   if command -v /usr/bin/time >/dev/null 2>&1; then
     /usr/bin/time -f 'elapsed_seconds=%e\nmax_rss_kb=%M' -o "$resource_file" \
-      timeout --preserve-status "${TIMEOUT_SECONDS}s" bash -lc "$command" > "$out_file" 2>&1 || exit_status=$?
+      timeout --preserve-status "${TIMEOUT_SECONDS}s" bash -lc "$command" < /dev/null > "$out_file" 2>&1 || exit_status=$?
   else
-    timeout --preserve-status "${TIMEOUT_SECONDS}s" bash -lc "$command" > "$out_file" 2>&1 || exit_status=$?
+    timeout --preserve-status "${TIMEOUT_SECONDS}s" bash -lc "$command" < /dev/null > "$out_file" 2>&1 || exit_status=$?
   fi
 
   end_epoch_ms=$(date +%s%3N)
