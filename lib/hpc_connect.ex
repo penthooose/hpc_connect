@@ -1659,6 +1659,19 @@ defmodule HpcConnect do
     do: Slurm.build_sif_blocking(session, opts)
 
   @doc """
+  Builds several SIF images in a single sbatch job on a compute node, one after
+  the other. Use when `build_on_login_node: false` so all builds are chained in
+  one job instead of one job per image.
+
+  `specs` is a list of `%{name: String.t(), force_rebuild: boolean()}`.
+
+  Returns `%{job_id: integer(), sifs: %{name => remote_sif_path}}`.
+  """
+  @spec build_sif_batch_blocking(Session.t(), [map()], keyword()) :: map()
+  def build_sif_batch_blocking(session, specs, opts \\ []) when is_list(specs),
+    do: Slurm.build_sif_batch_blocking(session, specs, opts)
+
+  @doc """
   Builds a Singularity/Apptainer image and waits for completion.
 
   Supports both forms:

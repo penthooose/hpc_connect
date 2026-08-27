@@ -1028,7 +1028,7 @@ defmodule HpcConnect.Slurm do
       end
 
     # Default to a build-capable cluster unless the caller disables redirection.
-    build_cluster = Keyword.get(opts, :build_cluster, :woody)
+    build_cluster = Keyword.get(opts, :build_cluster, :alex)
 
     build_session =
       if build_cluster do
@@ -1037,24 +1037,15 @@ defmodule HpcConnect.Slurm do
         session
       end
 
-    local_def = Keyword.get(opts, :local_def_path)
-
-    def_path =
-      if is_binary(local_def) do
-        upload_def_file(build_session, name, local_def)
-      else
-        remote_path = remote_def_path(build_session, name)
-
-        if remote_def_exists?(build_session, remote_path) do
-          remote_path
-        else
-          upload_def_file(build_session, name, nil)
-        end
-      end
+    def_path = resolve_def_path(build_session, name, opts)
 
     sif_path = remote_sif_path(build_session, name)
     force_rebuild = Keyword.get(opts, :force_rebuild, false)
-    use_slurm = Keyword.get(opts, :use_slurm, false)
+
+    # `build_on_login_node: true` (default) runs the build directly on the login
+    # node; `false` routes it through an sbatch job on a compute node.
+    build_on_login_node = Keyword.get(opts, :build_on_login_node, true)
+    use_slurm = Keyword.get(opts, :use_slurm, false) or not build_on_login_node
 
     if not force_rebuild and remote_file_exists?(build_session, sif_path) do
       Logger.info("[HpcConnect] SIF already exists: #{sif_path}")
@@ -1104,6 +1095,10 @@ defmodule HpcConnect.Slurm do
 
     proxy_exports = proxy_env_exports(session)
 
+    # When forcing a rebuild the old .sif would still satisfy the "file exists"
+    # completion check below, so remove it before the build starts.
+    cleanup = if force_env == "", do: "", else: "rm -f #{Shell.escape(sif_path)} && "
+
     remote =
       "mkdir -p #{Shell.escape(logs_dir)} && " <>
         "chmod 755 #{Shell.escape(logs_dir)} && " <>
@@ -1111,6 +1106,7 @@ defmodule HpcConnect.Slurm do
         force_env <>
         "export HPC_WORK_DIR=#{Shell.escape(session.work_dir)} && " <>
         "export DEF_NAME=#{Shell.escape(name)} && " <>
+        cleanup <>
         "nohup bash #{Shell.escape(Path.join(script_dir, "build_sif.sh"))} " <>
         "</dev/null > #{Shell.escape(log_file)} 2>&1 & disown && echo launched"
 
@@ -1271,6 +1267,8 @@ defmodule HpcConnect.Slurm do
   end
 
   def build_sif_blocking(%Session{} = session, opts) do
+    ensure_pipe_noise_filter()
+
     if use_default_build_cluster_fallbacks?(opts) do
       build_sif_blocking_with_fallbacks(session, opts, default_build_cluster_fallbacks(opts), [])
     else
@@ -1278,16 +1276,10 @@ defmodule HpcConnect.Slurm do
     end
   end
 
-  defp default_build_cluster_fallbacks(opts) do
-    if cpu_only_slurm_build?(opts) do
-      [:fritz, :alex, :helma, :woody]
-    else
-      [:woody, :alex, :helma]
-    end
-  end
-
-  defp cpu_only_slurm_build?(opts) do
-    Keyword.get(opts, :use_slurm, false) and not Keyword.has_key?(opts, :gres)
+  # Build-cluster preference: alex first, then helma, then woody (all share the
+  # filesystem, so the resulting SIF is visible from the primary cluster).
+  defp default_build_cluster_fallbacks(_opts) do
+    [:alex, :helma, :woody]
   end
 
   defp do_build_sif_blocking(%Session{} = session, opts) do
@@ -1299,24 +1291,29 @@ defmodule HpcConnect.Slurm do
     wait_session = Map.get(result, :build_session, session)
 
     cond do
-      # SIF already existed before we started
+      # Direct (login-node) background build started — poll by file existence.
+      # The direct path always sets :log_file, so a forced rebuild (where the
+      # old .sif still exists until the build replaces it) is not mistaken for
+      # "SIF already exists".
+      is_nil(job_id) and Map.has_key?(result, :log_file) ->
+        Logger.info("[HpcConnect] Waiting for direct build to complete. SIF: #{sif_path}")
+
+        Logger.info(
+          "[HpcConnect] Tail the build log: ssh #{wait_session.cluster.ssh_alias} " <>
+            "'tail -f #{Map.get(result, :log_file)}'"
+        )
+
+        wait_for_sif_direct!(wait_session, sif_path, timeout, interval)
+
+      # SIF already existed before we started (build skipped)
       is_nil(job_id) and remote_file_exists?(wait_session, sif_path) ->
         Logger.info("[HpcConnect] SIF already exists: #{sif_path}")
         sif_path
 
-      # Direct background build started — poll by file existence
       is_nil(job_id) ->
-        log_hint = Map.get(result, :log_file)
-
-        Logger.info("[HpcConnect] Waiting for direct build to complete. SIF: #{sif_path}")
-
-        if log_hint do
-          Logger.info(
-            "[HpcConnect] Tail the build log: ssh #{wait_session.cluster.ssh_alias} 'tail -f #{log_hint}'"
-          )
-        end
-
-        wait_for_sif_direct!(wait_session, sif_path, timeout, interval)
+        raise RuntimeError,
+              "Apptainer build for #{sif_path} returned neither a job id nor a " <>
+                "direct-build log — cannot wait for it."
 
       # SLURM job submitted — poll via sacct + file existence
       true ->
@@ -1330,7 +1327,224 @@ defmodule HpcConnect.Slurm do
     end
   end
 
-  # Fallback order for the default build-cluster path: woody -> alex -> helma.
+  # ── Chained compute-node batch build ─────────────────────────────────────
+
+  @doc """
+  Builds several SIF images inside a single sbatch job, one after the other, on
+  a compute node. Used when `build_on_login_node: false` so all prover images
+  are chained in one job instead of one job per image.
+
+  `specs` is a list of `%{name: String.t(), force_rebuild: boolean()}`. The
+  `.def` files are uploaded (or reused) per spec, then one job script runs
+  `build_sif.sh` for each spec sequentially.
+
+  Returns `%{job_id: integer(), sifs: %{name => remote_sif_path}, build_session}`.
+  """
+  @spec build_sif_batch_blocking(Session.t(), [map()], keyword()) :: map()
+  def build_sif_batch_blocking(%Session{} = session, specs, opts \\ []) when is_list(specs) do
+    ensure_pipe_noise_filter()
+
+    build_cluster = Keyword.get(opts, :build_cluster, :alex)
+
+    build_session =
+      if build_cluster do
+        clone_session_for_cluster(session, build_cluster)
+      else
+        session
+      end
+
+    prepared =
+      Enum.map(specs, fn spec ->
+        name = to_string(Map.fetch!(spec, :name))
+
+        %{
+          name: name,
+          force_rebuild: Map.get(spec, :force_rebuild, false),
+          def_path: resolve_def_path(build_session, name, put_local_def(spec, opts))
+        }
+      end)
+
+    job = submit_batch_build_job(build_session, prepared, opts)
+    sifs = wait_batch_build!(build_session, job, opts)
+
+    %{job_id: job.job_id, sifs: sifs, build_session: build_session}
+  end
+
+  defp submit_batch_build_job(session, prepared, opts) do
+    partition = Keyword.get(opts, :partition)
+    walltime = Keyword.get(opts, :walltime, "04:00:00")
+    cpus = Keyword.get(opts, :cpus, 4)
+
+    logs_dir = Path.join(session.work_dir, "sbatch_logs")
+    script_dir = Scripts.remote_script_dir(session)
+    job_script_path = Path.join(script_dir, "build_sif_batch_submit.sh")
+
+    partition_line = if partition, do: "#SBATCH --partition=#{partition}", else: ""
+    gres = Keyword.get(opts, :gres, session.cluster.require_gres)
+    gres_line = if gres, do: "#SBATCH --gres=#{gres}", else: ""
+
+    build_lines =
+      Enum.map_join(prepared, "\n", fn p ->
+        force = if p.force_rebuild, do: "1", else: "0"
+
+        "export DEF_NAME=#{p.name} && export FORCE_REBUILD=#{force} && " <>
+          "bash #{Path.join(Scripts.remote_script_dir(session), "build_sif.sh")} || exit 1"
+      end)
+
+    job_script = """
+    #!/bin/bash -l
+    #SBATCH --job-name=hpc_connect_build_sif_batch
+    #{partition_line}
+    #{gres_line}
+    #SBATCH --ntasks=1
+    #SBATCH --cpus-per-task=#{cpus}
+    #SBATCH --time=#{walltime}
+    #SBATCH --output=#{logs_dir}/build_sif_batch_%j.out
+    #SBATCH --error=#{logs_dir}/build_sif_batch_%j.err
+
+    #{proxy_script_exports(session)}
+    export HPC_WORK_DIR=#{session.work_dir}
+
+    #{build_lines}
+    """
+
+    b64 = job_script |> String.replace("\r", "") |> Base.encode64() |> String.replace("\n", "")
+
+    remote =
+      "mkdir -p #{Shell.escape(logs_dir)} #{Shell.escape(script_dir)} && " <>
+        "echo #{b64} | base64 -d > #{Shell.escape(job_script_path)} && " <>
+        "sbatch --parsable #{Shell.escape(job_script_path)}"
+
+    output =
+      ssh_run_with_retry!(
+        session,
+        remote,
+        "Submit batch Apptainer build for #{length(prepared)} image(s)"
+      )
+
+    %{job_id: extract_job_id!(output), prepared: prepared, logs_dir: logs_dir}
+  end
+
+  defp wait_batch_build!(session, job, opts) do
+    timeout = Keyword.get(opts, :timeout, 3_600_000)
+    interval = Keyword.get(opts, :interval, 15_000)
+    job_id = job.job_id
+    sifs = Map.new(job.prepared, fn p -> {p.name, remote_sif_path(session, p.name)} end)
+
+    Logger.info(
+      "[HpcConnect] Batch build job #{job_id} submitted (#{length(job.prepared)} image(s)). Waiting..."
+    )
+
+    wait_batch_build_loop!(session, job_id, sifs, timeout, interval)
+  end
+
+  defp wait_batch_build_loop!(_session, _job_id, _sifs, timeout, _interval) when timeout <= 0 do
+    raise RuntimeError, "Timed out waiting for batch Apptainer build to complete"
+  end
+
+  defp wait_batch_build_loop!(session, job_id, sifs, timeout, interval) do
+    Logger.debug(
+      "[HpcConnect] Waiting for batch build job #{job_id} (#{div(timeout, 1000)}s remaining)..."
+    )
+
+    Process.sleep(interval)
+    state = job_state(session, job_id)
+
+    cond do
+      state in ~w(FAILED CANCELLED TIMEOUT NODE_FAIL OUT_OF_MEMORY) ->
+        raise RuntimeError,
+              "Apptainer batch build job #{job_id} failed (state: #{state}). " <>
+                "Check logs with: sacct -j #{job_id} --format=JobID,State,ExitCode,Reason"
+
+      state == "COMPLETED" ->
+        missing = Enum.reject(sifs, fn {_name, path} -> remote_file_exists?(session, path) end)
+
+        if missing == [] do
+          Logger.info(
+            "[HpcConnect] Batch build job #{job_id} completed: #{length(sifs)} SIF(s) ready"
+          )
+
+          sifs
+        else
+          raise RuntimeError,
+                "Batch build job #{job_id} COMPLETED but SIF(s) missing: " <>
+                  "#{inspect(Enum.map(missing, &elem(&1, 0)))}. " <>
+                  "Check job output: sacct -j #{job_id} --format=JobID,State,ExitCode,Reason"
+        end
+
+      true ->
+        wait_batch_build_loop!(session, job_id, sifs, timeout - interval, interval)
+    end
+  end
+
+  defp resolve_def_path(build_session, name, opts) do
+    case Keyword.get(opts, :local_def_path) do
+      local_def when is_binary(local_def) ->
+        upload_def_file(build_session, name, local_def)
+
+      _ ->
+        remote_path = remote_def_path(build_session, name)
+
+        if remote_def_exists?(build_session, remote_path) do
+          remote_path
+        else
+          upload_def_file(build_session, name, nil)
+        end
+    end
+  end
+
+  # Carries a spec-level :local_def_path into the shared opts so the batch build
+  # uploads each prover's own .def (falling back to the shared opts / bundled).
+  defp put_local_def(spec, opts) do
+    case Map.get(spec, :local_def_path) do
+      path when is_binary(path) -> Keyword.put(opts, :local_def_path, path)
+      _ -> opts
+    end
+  end
+
+  # ── Pipe-noise suppression ───────────────────────────────────────────────
+
+  # OTP logger primary filter that drops the benign Windows "broken pipe" noise
+  # emitted when an SSH call to an unreachable fallback cluster fails (e.g.
+  # `Writer crashed (:"Die Pipe wird gerade geschlossen.")`). The real
+  # connectivity failure is still handled by the fallback logic; this only
+  # silences the runtime's noisy console messages.
+  defp ensure_pipe_noise_filter do
+    case :logger.add_primary_filter(:hpc_connect_pipe_noise, {&pipe_noise_filter/2, :ok}) do
+      :ok -> :ok
+      {:error, {:already_exist, _}} -> :ok
+      _ -> :ok
+    end
+  end
+
+  # Primary-filter return contract: `:stop` drops the event, `:ignore` skips
+  # this filter (the event is still logged). See logger_backend:do_apply_filters.
+  defp pipe_noise_filter(%{msg: msg}, _extra) do
+    if pipe_noise?(pipe_msg_text(msg)), do: :stop, else: :ignore
+  end
+
+  defp pipe_noise_filter(_event, _extra), do: :ignore
+
+  defp pipe_msg_text({:string, s}), do: s
+  defp pipe_msg_text({:report, report}), do: inspect(report)
+  defp pipe_msg_text({format, args}) when is_list(args), do: safe_format(format, args)
+  defp pipe_msg_text(other), do: inspect(other)
+
+  defp safe_format(format, args) do
+    try do
+      :io_lib.format(format, args) |> IO.iodata_to_binary()
+    rescue
+      _ -> inspect({format, args})
+    end
+  end
+
+  defp pipe_noise?(text) do
+    String.contains?(text, "Writer crashed") or
+      String.contains?(text, "init got unexpected") or
+      String.contains?(text, "Failed to write log message to stdout")
+  end
+
+  # Fallback order for the default build-cluster path: alex -> helma -> woody.
   defp build_sif_blocking_with_fallbacks(session, _opts, [], errors) do
     attempted =
       errors
