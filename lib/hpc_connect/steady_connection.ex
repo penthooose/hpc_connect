@@ -8,7 +8,7 @@ defmodule HpcConnect.SteadyConnection do
   `HpcConnect.SSH` is routed through a long-lived shell owned by a
   `HpcConnect.SteadyConnection.Server` process instead of spawning a fresh `ssh`
   process per command. This eliminates the per-command TCP handshake + key
-  exchange (~1–2 s saved per command) and works on every platform — including
+  exchange (~1-2 s saved per command) and works on every platform, including
   Win32-OpenSSH, which does **not** support OpenSSH `ControlMaster` multiplexing.
 
   Reliability:
@@ -22,7 +22,7 @@ defmodule HpcConnect.SteadyConnection do
   Activation: `steady_connection: true` on the session (usually
   `HPC_CONNECT_STEADY_CONNECTION=true` in `.env`). Tuning:
 
-    * `HPC_CONNECT_STEADY_TIMEOUT_SECONDS` – ssh connect timeout (default `30`)
+    * `HPC_CONNECT_STEADY_TIMEOUT_SECONDS` - ssh connect timeout (default `30`)
     * `:timeout` per command (default `120_000` ms)
 
   The registry (ETS) maps a stable per-session key to its `Server` process and
@@ -38,9 +38,7 @@ defmodule HpcConnect.SteadyConnection do
   @registry_name __MODULE__.Registry
   @table :hpc_connect_steady
 
-  # ---------------------------------------------------------------------------
   # Introspection
-  # ---------------------------------------------------------------------------
 
   @doc """
   Returns a stable identity key for a session (used for registry lookup).
@@ -56,9 +54,7 @@ defmodule HpcConnect.SteadyConnection do
   @spec enabled?(Session.t()) :: boolean()
   def enabled?(%Session{} = session), do: session.steady_connection == true
 
-  # ---------------------------------------------------------------------------
   # Registry
-  # ---------------------------------------------------------------------------
 
   @doc """
   Ensures the registry keeper (ETS owner) is running.
@@ -133,9 +129,7 @@ defmodule HpcConnect.SteadyConnection do
   def drop_server(%Session{} = session), do: drop_server(session_key(session))
   def drop_server(key) when is_binary(key), do: ets_delete(key)
 
-  # ---------------------------------------------------------------------------
   # Connection lifecycle
-  # ---------------------------------------------------------------------------
 
   @doc """
   Ensures a steady shell is established for the session and verifies it with a
@@ -185,9 +179,7 @@ defmodule HpcConnect.SteadyConnection do
     end
   end
 
-  # ---------------------------------------------------------------------------
   # Execution
-  # ---------------------------------------------------------------------------
 
   @doc """
   Runs a remote command over the steady shell with auto-reconnect and
@@ -195,7 +187,7 @@ defmodule HpcConnect.SteadyConnection do
   `:closed`).
 
   Falls back to a plain OS `ssh` run when no steady server is registered
-  (session not pre-warmed) — graceful degradation, no crash.
+  (session not pre-warmed); graceful degradation, no crash.
   """
   @spec run_remote(Session.t() | binary(), binary(), keyword()) :: {binary(), term()}
   def run_remote(session_or_key, remote_command, opts \\ [])
@@ -245,7 +237,7 @@ defmodule HpcConnect.SteadyConnection do
         do_run_remote(key, remote_command, retries_left, forever?, attempt + 1, timeout_ms)
 
       retries_left > 0 and transient_steady_failure?(output, status) ->
-        # Shell died mid-command – force reconnect and retry with backoff.
+        # Shell died mid-command; force reconnect and retry with backoff.
         _ = Server.reconnect(server)
         Process.sleep(steady_backoff(attempt, forever?))
         do_run_remote(key, remote_command, retries_left - 1, forever?, attempt + 1, timeout_ms)
@@ -262,7 +254,7 @@ defmodule HpcConnect.SteadyConnection do
           )
         end
 
-        # The server was busy (GenServer.call timeout) – it stays registered, so
+        # The server was busy (GenServer.call timeout); it stays registered, so
         # retrying with backoff is safe.
         Process.sleep(steady_backoff(attempt, forever?))
 
@@ -296,9 +288,7 @@ defmodule HpcConnect.SteadyConnection do
     match?(%{__exception__: true}, e) and Exception.message(e) =~ "timeout"
   end
 
-  # ---------------------------------------------------------------------------
   # Keeper GenServer (owns the ETS table)
-  # ---------------------------------------------------------------------------
 
   def init(:ok) do
     _table =

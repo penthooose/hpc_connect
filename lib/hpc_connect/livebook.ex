@@ -39,7 +39,7 @@ defmodule HpcConnect.Livebook do
   Renders a single Livebook form and returns bootstrap-ready options (lower-level
   helper kept for the single-form flow and used by `connection_setup/1`).
 
-  For notebooks, prefer `HpcConnect.prepare_livebook_session/1` — the full
+  For notebooks, prefer `HpcConnect.prepare_livebook_session/1`: the full
   browser setup overlay in the first cell, then `HpcConnect.bootstrap/1` in the
   second cell.
 
@@ -47,15 +47,15 @@ defmodule HpcConnect.Livebook do
   and the options are only normalized/validated.
 
   Options:
-  - `:cluster` – built-in cluster selection default (default: `"fritz"`)
-  - `:username` – optional pre-filled username
-  - `:uploaded_key_path` – optional direct uploaded-key path to skip UI
-  - `:uploaded_filename` – optional display name for the uploaded key
-  - `:hf_token` – optional Hugging Face token for gated model access
-  - `:remote_command` – probe command (default: `"hostname && whoami"`)
-  - `:submit_label` – submit button label for the form
-  - `:persist_form` – when `true`, persist non-secret form defaults for reuse
-  - `:persist_path` – custom path for persisted defaults
+  - `:cluster` - built-in cluster selection default (default: `"fritz"`)
+  - `:username` - optional pre-filled username
+  - `:uploaded_key_path` - optional direct uploaded-key path to skip UI
+  - `:uploaded_filename` - optional display name for the uploaded key
+  - `:hf_token` - optional Hugging Face token for gated model access
+  - `:remote_command` - probe command (default: `"hostname && whoami"`)
+  - `:submit_label` - submit button label for the form
+  - `:persist_form` - when `true`, persist non-secret form defaults for reuse
+  - `:persist_path` - custom path for persisted defaults
 
   Persisted defaults include cluster, username, and remote command.
   The uploaded SSH key and optional Hugging Face token are intentionally never persisted.
@@ -367,7 +367,7 @@ defmodule HpcConnect.Livebook do
         Map.get(env_map, "HPC_CONNECT_USERNAME") ||
         Keyword.get(opts, :username, "")
 
-    # A configured key path that exists on disk is used directly (persistent —
+    # A configured key path that exists on disk is used directly (persistent,
     # never deleted by cleanup). Otherwise the interactive upload panel is shown.
     configured_key =
       SshKey.configured_path(
@@ -416,7 +416,7 @@ defmodule HpcConnect.Livebook do
 
     key_notice =
       if configured_key do
-        "Using the configured SSH key ``#{configured_key}`` — upload a different " <>
+        "Using the configured SSH key ``#{configured_key}``. Upload a different " <>
           "key below to override it for this session."
       else
         "Upload your SSH key below (or set `HPC_CONNECT_IDENTITY_FILE` to an " <>
@@ -604,7 +604,7 @@ defmodule HpcConnect.Livebook do
   defp cluster_option_label(%Cluster{} = cluster) do
     [Atom.to_string(cluster.name), cluster.host, cluster.notes]
     |> Enum.reject(&is_nil_or_blank?/1)
-    |> Enum.join(" — ")
+    |> Enum.join(" - ")
   end
 
   defp prepare_default_cluster(opts, persisted, env_map) do

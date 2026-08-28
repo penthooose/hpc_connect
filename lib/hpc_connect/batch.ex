@@ -28,10 +28,10 @@ defmodule HpcConnect.Batch do
   given order.
 
   Options:
-    * `:retries` – transient SSH retries (default `3`)
-    * `:connect_opts` – forwarded to `SSH.exec/3` on native sessions
-    * `:run_fun` – test hook: `(script -> {output, status})` overriding execution
-    * `:suffix` – test hook: fixed marker suffix (default random)
+    * `:retries` - transient SSH retries (default `3`)
+    * `:connect_opts` - forwarded to `SSH.exec/3` on native sessions
+    * `:run_fun` - test hook: `(script -> {output, status})` overriding execution
+    * `:suffix` - test hook: fixed marker suffix (default random)
   """
   @spec run(Session.t(), [{binary(), binary()}], keyword()) :: [result()]
   def run(%Session{} = session, commands, opts \\ []) when is_list(commands) do
@@ -47,9 +47,7 @@ defmodule HpcConnect.Batch do
     parse_output(output, commands, suffix, status)
   end
 
-  # ---------------------------------------------------------------------------
   # Script building
-  # ---------------------------------------------------------------------------
 
   defp build_script(commands, suffix) do
     commands
@@ -62,12 +60,10 @@ defmodule HpcConnect.Batch do
     end)
   end
 
-  # ---------------------------------------------------------------------------
   # Execution
-  # ---------------------------------------------------------------------------
 
   defp run_remote(%Session{ssh_conn: conn} = session, script, opts) when not is_nil(conn) do
-    # Native :ssh session – already persistent, single exec via bash for the
+    # Native :ssh session (already persistent); single bash exec for the
     # `{ ...; }` group semantics to match the OS path.
     SSH.exec(session, "bash -lc #{Shell.escape(script)}", Keyword.get(opts, :connect_opts, []))
   end
@@ -94,9 +90,7 @@ defmodule HpcConnect.Batch do
       status in [:closed, :timeout]
   end
 
-  # ---------------------------------------------------------------------------
   # Output parsing
-  # ---------------------------------------------------------------------------
 
   defp parse_output(output, commands, suffix, overall_status) do
     commands

@@ -2,27 +2,20 @@ defmodule HpcConnect.Livebook.Setup do
   @moduledoc """
   Livebook setup overlay for HPC Connect.
 
-  Renders a Kino form to configure **every** env var `HpcConnect` reads, so a
+  Renders a Kino form to configure every env var `HpcConnect` reads, so a
   notebook can be run from a container/server with no local `.env` file and no
-  SSH access to the machine running it — everything is configured in the
-  browser instead.
+  SSH access to the machine running it. Everything is configured in the browser.
 
   ## Behaviour
 
-  - Field defaults are resolved in this order:
-    1. previously persisted value (from an earlier notebook session), so you
-       never retype everything when reopening the notebook;
-    2. value from the `.env` / `.env.example` file (only fills blank fields);
-    3. a sensible built-in default (e.g. `$HOME/.cache/hpc_connect`).
-    4. the SSH identity field additionally auto-detects an existing private key
-       in the user's `~/.ssh` (cross-platform) when nothing is persisted or
-       configured, so the default points at a real key instead of a hardcoded
-       name. The configured-paths report always prints the effective SSH key
-       path and marks staged uploads with `(temp)`.
-  - Pressing **Setup** applies the form values to the OS env, writes them to a
-    temp `.env` file for `HpcConnect.bootstrap/1`, and prints the resolved
-    paths. Values are **always** persisted (except secrets) and only fill blank
-    fields on the next notebook open.
+  - Field defaults resolve in this order: previously persisted value, then the
+    `.env` / `.env.example` value (only fills blank fields), then a sensible
+    built-in default (e.g. `$HOME/.cache/hpc_connect`). The SSH identity field
+    also auto-detects a key in the user's `~/.ssh` when nothing is configured.
+  - Pressing **Setup** applies the values to the OS env, writes them to a temp
+    `.env` file for `HpcConnect.bootstrap/1`, and prints the resolved paths.
+    Values are always persisted (except secrets) and only fill blank fields on
+    the next notebook open.
   - Secret fields (`HUGGINGFACE_HUB_TOKEN`) are never persisted.
 
   ## Usage (notebook, first cell)
@@ -48,7 +41,7 @@ defmodule HpcConnect.Livebook.Setup do
       )
 
   Pass `mode: :local` to `prepare_livebook_session/1` to skip the UI (used by
-  tests / non-Livebook runs) — the form defaults are applied directly.
+  tests / non-Livebook runs); the form defaults are applied directly.
   """
 
   alias HpcConnect.{Cluster, EnvFile}
@@ -75,7 +68,7 @@ defmodule HpcConnect.Livebook.Setup do
   @spec inputs() :: [spec()]
   def inputs do
     [
-      # ── HPC connection ────────────────────────────────────────────────────
+      # HPC connection
       select("HPC_CONNECT_CLUSTER", :cluster, "HPC · Cluster", cluster_options(), "fritz"),
       text("HPC_CONNECT_USERNAME", :username, "HPC · Username", ""),
       text("HPC_CONNECT_IDENTITY_FILE", :identity_file, "HPC · SSH identity file", ""),
@@ -111,7 +104,7 @@ defmodule HpcConnect.Livebook.Setup do
         "false"
       ),
       text("HPC_CONNECT_REMOTE_COMMAND", :remote_command, "HPC · Probe command", "hostname && whoami"),
-      # ── Secrets (never persisted) ────────────────────────────────────────
+      # Secrets (never persisted)
       secret("HUGGINGFACE_HUB_TOKEN", :hf_token, "HuggingFace token (optional)")
     ]
   end
@@ -122,13 +115,13 @@ defmodule HpcConnect.Livebook.Setup do
   writes them to a temp `.env` file for `HpcConnect.bootstrap/1`, prints the
   resolved paths, and returns:
 
-    * `:env_map` — non-blank env vars that were applied
-    * `:env_file` — path to the temp `.env` file (pass to `bootstrap/1`)
-    * `:values` — all form values (including blanks)
-    * `:persisted_path` — where values are persisted between notebook opens
-    * `:ssh_key_path` — the effective SSH identity file (a staged temp key when
+    * `:env_map` - non-blank env vars that were applied
+    * `:env_file` - path to the temp `.env` file (pass to `bootstrap/1`)
+    * `:values` - all form values (including blanks)
+    * `:persisted_path` - where values are persisted between notebook opens
+    * `:ssh_key_path` - the effective SSH identity file (a staged temp key when
       uploaded, otherwise the configured `~/.ssh` path)
-    * `:ssh_key_temporary?` — whether `:ssh_key_path` is a temporary upload that
+    * `:ssh_key_temporary?` - whether `:ssh_key_path` is a temporary upload that
       `cleanup/1` will delete
   """
   @spec prepare(keyword()) :: map()
@@ -155,12 +148,11 @@ defmodule HpcConnect.Livebook.Setup do
     end
   end
 
-  # Livebook setup: renders the form + a status frame, then blocks until the
-  # first submit. A persistent owner (`HpcConnect.Livebook.Form`) keeps the
-  # subscription alive after the cell finishes, so values can be edited and
-  # re-submitted without re-running the cell — each submit re-applies the env,
-  # re-writes the temp `.env`, and re-renders the configured paths into the
-  # status frame.
+  # Renders the form and a status frame, then blocks until the first submit. A
+  # persistent owner (`HpcConnect.Livebook.Form`) keeps the subscription alive
+  # after the cell finishes, so values can be edited and re-submitted without
+  # re-running the cell. Each submit re-applies the env, re-writes the temp
+  # `.env`, and re-renders the configured paths into the status frame.
   defp prepare_livebook(opts, defaults, persist_path) do
     # The upload field is ALWAYS shown so a previously-configured key can be
     # replaced by an upload later. A configured path that exists is still used
@@ -250,16 +242,16 @@ defmodule HpcConnect.Livebook.Setup do
   defp validate_setup(values) do
     cond do
       not non_blank?(values["HPC_CONNECT_USERNAME"]) ->
-        {:error, "HPC username is missing — enter it and press Setup again."}
+        {:error, "HPC username is missing. Enter it and press Setup again."}
 
       not non_blank?(values["HPC_CONNECT_IDENTITY_FILE"]) ->
         {:error,
-         "No SSH identity file — upload a key or set HPC_CONNECT_IDENTITY_FILE, then press Setup again."}
+         "No SSH identity file. Upload a key or set HPC_CONNECT_IDENTITY_FILE, then press Setup again."}
 
       not File.exists?(Path.expand(values["HPC_CONNECT_IDENTITY_FILE"])) ->
         {:error,
-         "The SSH identity file #{values["HPC_CONNECT_IDENTITY_FILE"]} does not exist — " <>
-           "upload a key or fix the path, then press Setup again."}
+         "The SSH identity file #{values["HPC_CONNECT_IDENTITY_FILE"]} does not exist. " <>
+           "Upload a key or fix the path, then press Setup again."}
 
       true ->
         :ok
@@ -429,7 +421,7 @@ defmodule HpcConnect.Livebook.Setup do
     end
   end
 
-  # ── field helpers ─────────────────────────────────────────────────────────
+  # field helpers
 
   defp text(env, key, label, default),
     do: %{key: key, env: env, label: label, type: :text, default: default}
@@ -458,8 +450,8 @@ defmodule HpcConnect.Livebook.Setup do
   end
 
   @doc false
-  # Kino ≥ 0.19 requires select options as `{value, label}` tuples, not a flat
-  # string list — convert the spec's string options at render time.
+  # Kino >= 0.19 requires select options as `{value, label}` tuples, not a flat
+  # string list, so the spec's string options are converted at render time.
   @spec select_options([binary()]) :: [{binary(), binary()}]
   def select_options(options) when is_list(options), do: Enum.map(options, &{&1, &1})
 
@@ -477,7 +469,7 @@ defmodule HpcConnect.Livebook.Setup do
 
   @doc """
   Deletes any temporary SSH key uploaded by the setup overlay (never a
-  persistent `~/.ssh` key) and prints a short notice — no error when nothing
+  persistent `~/.ssh` key) and prints a short notice. No error when nothing
   is left to delete.
   """
   @spec cleanup(keyword()) :: :ok
@@ -488,7 +480,7 @@ defmodule HpcConnect.Livebook.Setup do
   @doc false
   defp submit_label(opts), do: Keyword.get(opts, :submit_label, @default_submit_label)
 
-  # ── persistence / env resolution ──────────────────────────────────────────
+  # persistence / env resolution
 
   defp session_tmp_base(opts) do
     Keyword.get(opts, :tmp_base, Path.join(System.tmp_dir!(), @tmp_base))
@@ -543,7 +535,7 @@ defmodule HpcConnect.Livebook.Setup do
     :ok
   end
 
-  # ── Kino indirection (no hard compile-time Kino dependency) ───────────────
+  # Kino indirection (no hard compile-time Kino dependency)
 
   defp ensure_kino_available! do
     unless Code.ensure_loaded?(kino_module()) and Code.ensure_loaded?(kino_input_module()) and

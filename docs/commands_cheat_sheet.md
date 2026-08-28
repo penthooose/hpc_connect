@@ -13,7 +13,7 @@ See also:
 
 ## Livebook setup + bootstrap
 
-First cell — configure everything in the browser overlay:
+First cell, configure everything in the browser overlay:
 
 ```elixir
 setup =
@@ -27,7 +27,7 @@ env_map = setup.env_map
 env_file = setup.env_file
 ```
 
-Second cell — bootstrap:
+Second cell, bootstrap:
 
 ```elixir
 boot =
@@ -64,7 +64,7 @@ Native SSH is optional. The default local bootstrap flow uses the normal OS SSH 
 
 ## Connection setup (unified)
 
-`connection_setup/1` is the one-call setup `bootstrap/1` builds on — use it
+`connection_setup/1` is the one-call setup `bootstrap/1` builds on; use it
 directly when you only need a session (no startup status gathering).
 
 ```elixir
@@ -83,7 +83,7 @@ session = result.session
 ## Steady SSH connection (recommended)
 
 Multiplexes all commands over one persistent `ssh <target> "bash -s"` shell
-with auto-reconnect and exponential backoff — no per-command handshake.
+with auto-reconnect and exponential backoff; no per-command handshake.
 Enable it in `.env`:
 
 ```dotenv

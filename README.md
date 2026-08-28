@@ -28,7 +28,7 @@ It standardizes:
 Use this on a shared or local Livebook runtime when the SSH key is uploaded through the notebook UI.
 
 ```elixir
-# Cell 1 — configure everything in the browser overlay
+# Cell 1, configure everything in the browser overlay
 setup =
   HpcConnect.prepare_livebook_session(
     env_file: Path.expand("../.env", __DIR__),
@@ -39,7 +39,7 @@ setup =
 env_map = setup.env_map
 env_file = setup.env_file
 
-# Cell 2 — bootstrap with the configured values
+# Cell 2, bootstrap with the configured values
 boot =
   HpcConnect.bootstrap(
     mode: :local,
@@ -156,7 +156,7 @@ HpcConnect.exit(boot)
 ## Steady SSH connection (faster + more reliable)
 
 By default every OS `ssh` command spawns a fresh process with its own TCP
-handshake and key exchange (~1–2 s each through a jump host). Enable the steady
+handshake and key exchange (~1-2 s each through a jump host). Enable the steady
 connection to multiplex all commands over **one persistent
 `ssh <target> "bash -s"` shell**:
 

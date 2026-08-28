@@ -497,7 +497,7 @@ defmodule HpcConnect.SSH do
   Opens an SSH ControlMaster background connection and returns `{updated_session, master_port}`.
 
   All subsequent SSH/SCP commands built from `updated_session` will multiplex over the
-  established connection — no new TCP handshake or key exchange per command.
+  established connection; no new TCP handshake or key exchange per command.
 
   The connection lives as long as the returned port. Close with `close_master/1` or by
   closing the port directly.
@@ -636,9 +636,7 @@ defmodule HpcConnect.SSH do
     end
   end
 
-  # ---------------------------------------------------------------------------
   # Persistent Erlang :ssh connection
-  # ---------------------------------------------------------------------------
 
   @doc """
   Opens a persistent Erlang `:ssh` connection.
@@ -1078,7 +1076,7 @@ defmodule HpcConnect.SSH do
   When `local_port` is `0` the OS picks a free port and the actual port is returned.
 
   This is the native equivalent of the OS `ssh -N -L local_port:target_host:target_port`
-  command. The tunnel stays alive as long as `conn` is alive — no background
+  command. The tunnel stays alive as long as `conn` is alive; no background
   process or OS port is required.
 
   Returns `{:ok, actual_local_port}` or `{:error, reason}`.
@@ -1136,7 +1134,7 @@ defmodule HpcConnect.SSH do
      `localhost:local_port` → `localhost:remote_port` on the compute node.
 
   Returns `{compute_conn, actual_local_port}`. **`compute_conn` must be kept alive**
-  (e.g. stored in the session or result map) — closing it will tear down the tunnel.
+  (e.g. stored in the session or result map); closing it will tear down the tunnel.
   """
   @spec open_native_compute_tunnel!(
           Session.t(),
@@ -1331,7 +1329,7 @@ defmodule HpcConnect.SSH do
   The session must have been updated by `open_connection!/1`. Falls back to
   the OS OpenSSH (`ssh`) path when `session.ssh_conn` is `nil`.
 
-  Returns `{output_binary, exit_status}` — same contract as `run/2`.
+  Returns `{output_binary, exit_status}`; same contract as `run/2`.
   """
   @spec exec(Session.t(), binary(), keyword()) :: {binary(), non_neg_integer()}
   def exec(%Session{ssh_conn: nil} = session, command, opts) do
@@ -1381,7 +1379,7 @@ defmodule HpcConnect.SSH do
     retries = Keyword.get(opts, :retries, 3)
     # Respect the session's retry-forever flag (HPC_CONNECT_RETRY_FOREVER) so
     # uploads also ride out gateway throttling instead of dying after a few
-    # fixed attempts — consistent with the ssh command retry layer.
+    # fixed attempts, consistent with the ssh command retry layer.
     forever? = Keyword.get(opts, :retry_forever, session.retry_forever || false)
 
     {upload_path, cleanup_dir} = prepare_upload_source(local_path, recursive?, opts)
@@ -1525,7 +1523,7 @@ defmodule HpcConnect.SSH do
     Enum.reduce(segments, "", fn seg, acc ->
       dir = acc <> "/" <> seg
       :ssh_sftp.make_dir(sftp, String.to_charlist(dir), timeout)
-      # ignore error — dir may already exist
+      # ignore error; dir may already exist
       dir
     end)
 

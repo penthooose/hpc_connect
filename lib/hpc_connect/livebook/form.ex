@@ -8,7 +8,7 @@ defmodule HpcConnect.Livebook.Form do
   again does nothing. This module fixes that: the first cell run renders the
   form, attaches it to the owner, and blocks (`await/2`) until the first submit.
   The owner stays subscribed afterwards, so the user can **edit the values and
-  press submit again** without re-running the cell — each submit re-invokes the
+  press submit again** without re-running the cell. Each submit re-invokes the
   handler and re-renders the status frame (if any) with fresh feedback.
 
   ## Usage
@@ -19,10 +19,10 @@ defmodule HpcConnect.Livebook.Form do
 
   The handler is `fun.(data, event) -> {result, frame_content}`, where:
 
-    * `data` — the form values map (`event.data`)
-    * `event` — the full submit event (includes `:origin`)
-    * `result` — returned to the `await/2` caller
-    * `frame_content` — a Kino term rendered into `status_frame` (or `nil`)
+    * `data` - the form values map (`event.data`)
+    * `event` - the full submit event (includes `:origin`)
+    * `result` - returned to the `await/2` caller
+    * `frame_content` - a Kino term rendered into `status_frame` (or `nil`)
 
   The owner is registered under a `:global` name derived from the given `name`,
   so it is created once per runtime and survives Livebook cell processes.
@@ -84,8 +84,8 @@ defmodule HpcConnect.Livebook.Form do
 
   @impl true
   def handle_call({:attach, form, status_frame, handler}, _from, state) do
-    # Drop a previous subscription (best-effort — the old widget may already
-    # be destroyed after a cell re-run, which is harmless).
+    # Drop a previous subscription (best-effort; the old widget may already be
+    # destroyed after a cell re-run, which is harmless).
     if state.tag, do: safe_unsubscribe(state.form)
 
     tag = {__MODULE__, make_ref()}
@@ -108,8 +108,8 @@ defmodule HpcConnect.Livebook.Form do
   def handle_info({tag, %{type: :submit} = event}, %{tag: tag} = state) do
     data = Map.get(event, :data, %{})
 
-    # The handler returns either `{result, frame_content}` (valid — reply to the
-    # awaiting cell) or `{:retry, frame_content}` (invalid — render the feedback
+    # The handler returns either `{result, frame_content}` (valid; reply to the
+    # awaiting cell) or `{:retry, frame_content}` (invalid; render the feedback
     # into the frame and KEEP the waiter so the cell stays blocked until a valid
     # submit). A raised handler is treated the same way as `:retry`.
     waiter =

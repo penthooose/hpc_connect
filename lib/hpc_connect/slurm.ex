@@ -79,8 +79,8 @@ defmodule HpcConnect.Slurm do
   Runs `sinfo` on the remote cluster and returns the raw output string.
 
   Options:
-  - `:partition` – limit to a specific partition (e.g. `"a100"`)
-  - `:connect_opts` – keyword options forwarded to `SSH.run/2`
+  - `:partition` - limit to a specific partition (e.g. `"a100"`)
+  - `:connect_opts` - keyword options forwarded to `SSH.run/2`
   """
   @spec query_sinfo(Session.t(), keyword()) :: binary()
   def query_sinfo(%Session{} = session, opts \\ []) do
@@ -290,9 +290,9 @@ defmodule HpcConnect.Slurm do
   a conda environment.
 
   Options:
-  - `:modules` – list of module names (default: `default_modules/0`)
-  - `:conda_env` – name of the conda env to activate (optional)
-  - `:source_bash_profile` – whether to source `~/.bash_profile` (default: `true`)
+  - `:modules` - list of module names (default: `default_modules/0`)
+  - `:conda_env` - name of the conda env to activate (optional)
+  - `:source_bash_profile` - whether to source `~/.bash_profile` (default: `true`)
   """
   @spec module_load_preamble(keyword()) :: binary()
   def module_load_preamble(opts \\ []) do
@@ -348,10 +348,10 @@ defmodule HpcConnect.Slurm do
   Cancels a SLURM job by ID.
 
   Options:
-  - `:connect_opts` – keyword options forwarded to `SSH.run/2`
+  - `:connect_opts` - keyword options forwarded to `SSH.run/2`
 
   Internal/testing hooks:
-  - `:run_fun` – custom function `(command, connect_opts) -> {output, status}`
+  - `:run_fun` - custom function `(command, connect_opts) -> {output, status}`
   """
   @spec cancel_job(Session.t(), binary() | pos_integer(), keyword()) :: binary()
   def cancel_job(%Session{} = session, job_id, opts \\ []) do
@@ -605,14 +605,14 @@ defmodule HpcConnect.Slurm do
   Submits a vLLM batch job via `sbatch` and returns the SLURM job ID.
 
   Options:
-  - `:partition` – GPU partition (default: `"a100"`)
-  - `:gpus` – number of GPUs (default: `1`)
-  - `:walltime` – time limit (default: `"02:00:00"`)
-  - `:port` – port for vLLM server (default: `8000`)
-  - `:ntasks` – number of tasks (optional)
-  - `:cpus_per_task` – CPUs per task (optional)
-  - `:modules` – list of modules to load (default: `[]`)
-  - `:conda_env` – conda env to activate (optional)
+  - `:partition` - GPU partition (default: `"a100"`)
+  - `:gpus` - number of GPUs (default: `1`)
+  - `:walltime` - time limit (default: `"02:00:00"`)
+  - `:port` - port for vLLM server (default: `8000`)
+  - `:ntasks` - number of tasks (optional)
+  - `:cpus_per_task` - CPUs per task (optional)
+  - `:modules` - list of modules to load (default: `[]`)
+  - `:conda_env` - conda env to activate (optional)
   """
   @spec submit_vllm_job(Session.t(), Model.t(), keyword()) :: vllm_job_result()
   def submit_vllm_job(%Session{} = session, %Model{} = model, opts \\ []) do
@@ -837,8 +837,8 @@ defmodule HpcConnect.Slurm do
   Polls `squeue` until the compute node is assigned (job state RUNNING).
 
   Options:
-  - `:timeout` – ms to wait total (default: `300_000` = 5 min)
-  - `:interval` – ms between polls (default: `10_000` = 10 s)
+  - `:timeout` - ms to wait total (default: `300_000` = 5 min)
+  - `:interval` - ms between polls (default: `10_000` = 10 s)
   """
   @spec wait_for_job_node(Session.t(), binary() | pos_integer(), keyword()) :: binary()
   def wait_for_job_node(%Session{} = session, job_id, opts \\ []) do
@@ -1002,16 +1002,16 @@ defmodule HpcConnect.Slurm do
   Submits an Apptainer build job via `sbatch` (CPU-only, no GPU needed).
 
   Uploads the definition file, then submits `build_sif.sh` as a batch job.
-  Returns `%{job_id, sif_path, def_path}` immediately — use `wait_for_job_done/3`
+  Returns `%{job_id, sif_path, def_path}` immediately; use `wait_for_job_done/3`
   or poll `squeue -j <job_id>` to know when the build finishes.
 
   Options:
-  - `:name`            – image/def stem name (default: `"vllm"`)
-  - `:local_def_path`  – override local .def file (default: bundled `priv/scripts/<name>.def`)
-  - `:partition`       – partition for build job (default: `"standard"` or cluster default)
-  - `:walltime`        – build time limit (default: `"02:00:00"`)
-  - `:cpus`            – CPUs for build (default: `4`)
-  - `:force_rebuild`   – set `"1"` to rebuild even if .sif exists (default: `"0"`)
+  - `:name`            - image/def stem name (default: `"vllm"`)
+  - `:local_def_path`  - override local .def file (default: bundled `priv/scripts/<name>.def`)
+  - `:partition`       - partition for build job (default: `"standard"` or cluster default)
+  - `:walltime`        - build time limit (default: `"02:00:00"`)
+  - `:cpus`            - CPUs for build (default: `4`)
+  - `:force_rebuild`   - set `"1"` to rebuild even if .sif exists (default: `"0"`)
   """
   @spec build_sif_job(Session.t(), keyword() | binary()) :: map()
   def build_sif_job(session, args \\ [])
@@ -1072,7 +1072,7 @@ defmodule HpcConnect.Slurm do
 
     Logger.info(
       "[HpcConnect] Routing apptainer build via #{target_cluster.name} " <>
-        "(shared FS — SIF will be visible from #{session.cluster.name})"
+        "(shared FS; SIF will be visible from #{session.cluster.name})"
     )
 
     %Session{
@@ -1287,7 +1287,7 @@ defmodule HpcConnect.Slurm do
     wait_session = Map.get(result, :build_session, session)
 
     cond do
-      # Direct (login-node) background build started — poll by file existence.
+      # Direct (login-node) background build started; poll by file existence.
       # The direct path always sets :log_file, so a forced rebuild (where the
       # old .sif still exists until the build replaces it) is not mistaken for
       # "SIF already exists".
@@ -1309,9 +1309,9 @@ defmodule HpcConnect.Slurm do
       is_nil(job_id) ->
         raise RuntimeError,
               "Apptainer build for #{sif_path} returned neither a job id nor a " <>
-                "direct-build log — cannot wait for it."
+                "direct-build log; cannot wait for it."
 
-      # SLURM job submitted — poll via sacct + file existence
+      # SLURM job submitted; poll via sacct + file existence
       true ->
         Logger.info("[HpcConnect] Build job #{job_id} submitted. Waiting for SIF at #{sif_path}")
 
@@ -1323,7 +1323,7 @@ defmodule HpcConnect.Slurm do
     end
   end
 
-  # ── Chained compute-node batch build ─────────────────────────────────────
+  # Chained compute-node batch build
 
   @doc """
   Builds several SIF images inside a single sbatch job, one after the other, on
@@ -1498,7 +1498,7 @@ defmodule HpcConnect.Slurm do
     end
   end
 
-  # ── Pipe-noise suppression ───────────────────────────────────────────────
+  # Pipe-noise suppression
 
   # OTP logger primary filter that drops the benign Windows "broken pipe" noise
   # emitted when an SSH call to an unreachable fallback cluster fails (e.g.
@@ -1735,19 +1735,19 @@ defmodule HpcConnect.Slurm do
   the job is waiting for resource availability.
 
   Options:
-  - `:partition`     – target partition (default: cluster default or `"a100"`)
-  - `:gpus`          – number of GPUs (default: `1`); set `0` for CPU-only jobs
-  - `:walltime`      – time limit (default: `"02:00:00"`)
-  - `:port`          – app port (default: `8000`)
-  - `:cpus`          – cpus-per-task (default: `8`)
-  - `:nodes`         – number of nodes (optional)
-  - `:ntasks`        – number of tasks (optional)
-  - `:constraint`    – SLURM constraint (optional)
-  - `:mem`           – memory request (optional)
-  - `:exclusive`     – whether to request exclusive node access (default: `false`)
-  - `:sif_name`      – stem name of the .sif (default: app name)
-  - `:sif_path`      – override full remote sif path
-  - `:app_env`       – extra env vars to pass (map, default: `%{}`)
+  - `:partition`     - target partition (default: cluster default or `"a100"`)
+  - `:gpus`          - number of GPUs (default: `1`); set `0` for CPU-only jobs
+  - `:walltime`      - time limit (default: `"02:00:00"`)
+  - `:port`          - app port (default: `8000`)
+  - `:cpus`          - cpus-per-task (default: `8`)
+  - `:nodes`         - number of nodes (optional)
+  - `:ntasks`        - number of tasks (optional)
+  - `:constraint`    - SLURM constraint (optional)
+  - `:mem`           - memory request (optional)
+  - `:exclusive`     - whether to request exclusive node access (default: `false`)
+  - `:sif_name`      - stem name of the .sif (default: app name)
+  - `:sif_path`      - override full remote sif path
+  - `:app_env`       - extra env vars to pass (map, default: `%{}`)
   """
   @spec submit_apptainer(Session.t(), keyword()) :: map()
   def submit_apptainer(%Session{} = session, opts \\ []) do
@@ -1911,17 +1911,17 @@ defmodule HpcConnect.Slurm do
   This is now a wrapper around `submit_apptainer/2`.
 
   Options:
-  - `:partition`     – GPU partition (default: cluster default or `"a100"`)
-  - `:gpus`          – number of GPUs (default: `1`)
-  - `:walltime`      – time limit (default: `"02:00:00"`)
-  - `:port`          – vLLM port (default: `8000`)
-  - `:cpus`          – cpus-per-task (default: `8`)
-  - `:sif_name`      – stem name of the .sif (default: `"vllm"`)
-  - `:sif_path`      – override full remote sif path
-  - `:tensor_parallel` – TP size (default: `1`)
-  - `:gpu_mem_util`  – GPU memory fraction (default: `"0.90"`)
-  - `:max_model_len` – max context tokens (default: `8192`)
-  - `:hf_token`      – HuggingFace token env value
+  - `:partition`     - GPU partition (default: cluster default or `"a100"`)
+  - `:gpus`          - number of GPUs (default: `1`)
+  - `:walltime`      - time limit (default: `"02:00:00"`)
+  - `:port`          - vLLM port (default: `8000`)
+  - `:cpus`          - cpus-per-task (default: `8`)
+  - `:sif_name`      - stem name of the .sif (default: `"vllm"`)
+  - `:sif_path`      - override full remote sif path
+  - `:tensor_parallel` - TP size (default: `1`)
+  - `:gpu_mem_util`  - GPU memory fraction (default: `"0.90"`)
+  - `:max_model_len` - max context tokens (default: `8192`)
+  - `:hf_token`      - HuggingFace token env value
   """
   @spec submit_vllm_apptainer(Session.t(), Model.t() | binary(), keyword()) :: map()
   def submit_vllm_apptainer(%Session{} = session, model_or_repo, opts \\ []) do

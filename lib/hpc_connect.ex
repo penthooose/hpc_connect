@@ -72,7 +72,7 @@ defmodule HpcConnect do
   `HpcConnect.Livebook.Setup`), so a notebook works from a container/server with
   no local `.env` and no SSH access to the machine running it.
 
-  First cell — configure:
+  First cell, configure:
 
       setup =
         HpcConnect.prepare_livebook_session(
@@ -84,7 +84,7 @@ defmodule HpcConnect do
       env_map = setup.env_map
       env_file = setup.env_file
 
-  Second cell — bootstrap:
+  Second cell, bootstrap:
 
       boot =
         HpcConnect.bootstrap(
@@ -96,8 +96,8 @@ defmodule HpcConnect do
         )
 
   Field defaults are pre-filled from `.env` / `.env.example` (via `:env_file` /
-  `:fallback_env_file`) and from the last session (values are **always**
-  persisted — except secrets — and only fill blank fields on the next open).
+  `:fallback_env_file`) and from the last session (values are always persisted,
+  except secrets, and only fill blank fields on the next open).
   The SSH identity field auto-detects an existing `~/.ssh` key; an uploaded key
   wins over a configured path and is stored temporarily (removed by
   `HpcConnect.cleanup_livebook_setup/1`).
@@ -139,7 +139,7 @@ defmodule HpcConnect do
   (quota, downloaded models, free GPUs, jobs).
 
   Options:
-  - `:reset_permission` (default: `false`) – when `true`, explicitly runs
+  - `:reset_permission` (default: `false`) - when `true`, explicitly runs
     remote `chmod 755` on hpc_connect working directories during bootstrap.
   """
   @spec bootstrap(keyword()) :: map()
@@ -362,7 +362,7 @@ defmodule HpcConnect do
                 raise RuntimeError,
                       "Could not auto-create native PEM key fallback for #{mode} mode: #{reason}\n" <>
                         "Run manually:\n#{manual_cmd}\n" <>
-                        "Then upload #{candidate}.pub to https://portal.hpc.fau.de/ui/user and wait 10–30 minutes for propagation."
+                        "Then upload #{candidate}.pub to https://portal.hpc.fau.de/ui/user and wait 10-30 minutes for propagation."
             end
         end
 
@@ -451,7 +451,7 @@ defmodule HpcConnect do
     "New native-SSH PEM key created: #{candidate_path}\n" <>
       pub_line <>
       "Portal: https://portal.hpc.fau.de/ui/user\n" <>
-      "Upload the public key there, then wait 10–30 minutes for propagation.\n" <>
+      "Upload the public key there, then wait 10-30 minutes for propagation.\n" <>
       "Re-run bootstrap once the key is active on the cluster."
   end
 
@@ -650,8 +650,8 @@ defmodule HpcConnect do
 
   @doc """
   Deletes any temporary SSH key uploaded by the `prepare_livebook_session/1`
-  setup overlay (never a persistent `~/.ssh` key) and prints a short notice —
-  no error when nothing is left to delete. Runs the notebook-end cleanup.
+  setup overlay (never a persistent `~/.ssh` key) and prints a short notice,
+  with no error when nothing is left to delete. Runs the notebook-end cleanup.
   """
   @spec cleanup_livebook_setup(keyword()) :: :ok
   def cleanup_livebook_setup(opts \\ []) do
@@ -834,7 +834,7 @@ defmodule HpcConnect do
     host = preflight_host(session)
     timeout_ms = 3_000
     # The gateway throttles/refuses connections under load (econnrefused); ride
-    # that out with a short backoff — 3 attempts by default, forever when the
+    # that out with a short backoff, 3 attempts by default, forever when the
     # session opts into retry-forever (HPC_CONNECT_RETRY_FOREVER=true).
     max_attempts = if session.retry_forever, do: :forever, else: 3
 
@@ -1117,12 +1117,12 @@ defmodule HpcConnect do
   occasionally drops connections.
 
   Options:
-    * `:retries` – max attempts (default `3`)
-    * `:retry_delay_ms` – fixed delay when provided (backward compat)
-    * `:retry_backoff_mode` – `:exponential` (default) | `:linear`
+    * `:retries` - max attempts (default `3`)
+    * `:retry_delay_ms` - fixed delay when provided (backward compat)
+    * `:retry_backoff_mode` - `:exponential` (default) | `:linear`
     * `:retry_backoff_base_ms`, `:retry_backoff_factor`, `:retry_backoff_max_ms`,
-      `:retry_backoff_jitter` – backoff tuning (retry-forever defaults to a
-      linear 10 s → 60 s schedule to wait out gateway throttling)
+      `:retry_backoff_jitter` - backoff tuning (retry-forever defaults to a
+      linear 10 s -> 60 s schedule to wait out gateway throttling)
   """
   @spec run_command_with_retry!(Command.t(), keyword()) :: binary()
   def run_command_with_retry!(%Command{} = command, opts \\ []) do
@@ -1342,7 +1342,7 @@ defmodule HpcConnect do
 
   @doc """
   Allocates a GPU node via `sbatch --wrap="sleep <secs>"` and returns once the job
-  is RUNNING. No OS process or CMD window is opened — works in Livebook.
+  is RUNNING. No OS process or CMD window is opened; works in Livebook.
 
   Returns `%{job_id, node, partition, gpus, walltime}`.
 
@@ -1383,11 +1383,11 @@ defmodule HpcConnect do
   metadata and the `scancel` output for that job.
 
   Options:
-  - `:connect_opts` – keyword options forwarded to the underlying SSH commands
+  - `:connect_opts` - keyword options forwarded to the underlying SSH commands
 
   Internal/testing hooks:
-  - `:list_jobs_fun` – custom function `(session -> [job_map])`
-  - `:cancel_job_fun` – custom function `(session, job_id -> binary())`
+  - `:list_jobs_fun` - custom function `(session -> [job_map])`
+  - `:cancel_job_fun` - custom function `(session, job_id -> binary())`
   """
   @spec cancel_all_jobs(Session.t() | map(), keyword()) :: [map()]
   def cancel_all_jobs(result_or_session, opts \\ [])
@@ -1615,7 +1615,7 @@ defmodule HpcConnect do
   remote script is missing.
 
   Options:
-  - `:reset_permission` (default: `false`) – when `true`, runs `chmod 755`
+  - `:reset_permission` (default: `false`) - when `true`, runs `chmod 755`
     on remote hpc_connect directories after upload.
   """
   @spec install_remote_scripts!(Session.t(), keyword()) :: :ok
@@ -1709,7 +1709,7 @@ defmodule HpcConnect do
   Lists files matching a glob pattern on the remote cluster with a single SSH
   call. Returns basenames (e.g. `["vampire.sif", "cvc5.sif"]`).
 
-  Handles missing directories gracefully — returns `[]` when nothing matches
+  Handles missing directories gracefully; returns `[]` when nothing matches
   or the directory does not exist.
 
   ## Examples
@@ -1744,11 +1744,11 @@ defmodule HpcConnect do
 
   Options: `:name`, `:local_def_path`, `:partition`, `:walltime`, `:cpus`,
   `:force_rebuild`, `:timeout`, `:interval`,
-  `:build_cluster` – route the build through a different cluster that supports
+  `:build_cluster` - route the build through a different cluster that supports
   user namespaces (default: `:woody`; AlmaLinux login nodes support apptainer
   builds, Ubuntu-based systems like TinyX do not). Pass `build_cluster: nil`
   to build on the session's own cluster.
-  `:apptainer_tmpdir` – override apptainer's tmp/cache directory. Unset by default;
+  `:apptainer_tmpdir` - override apptainer's tmp/cache directory. Unset by default;
   apptainer manages its own cache under `~/.apptainer` on the remote node, which
   means `apptainer cache clean` works naturally. Set only if you need to redirect
   the cache to a specific path.
@@ -1843,20 +1843,20 @@ defmodule HpcConnect do
   the job is waiting for resource availability.
 
   Options:
-  - `:app`           – application name (required; used to find start_<app>.sh)
-  - `:partition`     – target partition (default: cluster default or `"a100"`)
-  - `:gpus`          – number of GPUs (default: `1`); set `0` for CPU-only jobs
-  - `:walltime`      – time limit (default: `"02:00:00"`)
-  - `:port`          – app port (default: `8000`)
-  - `:cpus`          – cpus-per-task (default: `8`)
-  - `:nodes`         – number of nodes (optional)
-  - `:ntasks`        – number of tasks (optional)
-  - `:constraint`    – SLURM constraint (optional)
-  - `:mem`           – memory request (optional)
-  - `:exclusive`     – exclusive node access (default: `false`)
-  - `:sif_name`      – stem name of the .sif (default: app name)
-  - `:sif_path`      – override full remote sif path
-  - `:app_env`       – extra environment variables (map, default: `%{}`)
+  - `:app`           - application name (required; used to find start_<app>.sh)
+  - `:partition`     - target partition (default: cluster default or `"a100"`)
+  - `:gpus`          - number of GPUs (default: `1`); set `0` for CPU-only jobs
+  - `:walltime`      - time limit (default: `"02:00:00"`)
+  - `:port`          - app port (default: `8000`)
+  - `:cpus`          - cpus-per-task (default: `8`)
+  - `:nodes`         - number of nodes (optional)
+  - `:ntasks`        - number of tasks (optional)
+  - `:constraint`    - SLURM constraint (optional)
+  - `:mem`           - memory request (optional)
+  - `:exclusive`     - exclusive node access (default: `false`)
+  - `:sif_name`      - stem name of the .sif (default: app name)
+  - `:sif_path`      - override full remote sif path
+  - `:app_env`       - extra environment variables (map, default: `%{}`)
 
   Example:
       HpcConnect.submit_apptainer(session, app: "vllm", gpus: 2, port: 8080)
@@ -1895,12 +1895,12 @@ defmodule HpcConnect do
   vLLM convenience controls (`app: "vllm"` only):
   - `:native_ssh` (default: `false`) enables a persistent native `:ssh` session
     (existing `session.ssh_conn` is used only when this is explicitly `true`)
-  - `:native_ssh_fallback_to_os` (default: `false`) — when `true`, falls back
+  - `:native_ssh_fallback_to_os` (default: `false`) - when `true`, falls back
     to managed OpenSSH commands/tunnel if native `:ssh` cannot connect
   - `:proxy_jump_via_native` (default: `true`) enables native ProxyJump tunnel
     (`:ssh.tcpip_tunnel_to_server`) when direct connect is blocked
   - `:proxy_jump_via_os` (default: `true` when ProxyJump is required,
-    otherwise `false`) — enables managed OpenSSH ProxyJump tunnel fallback if
+    otherwise `false`); enables managed OpenSSH ProxyJump tunnel fallback if
     native jump tunneling cannot be established; set `false` for strict
     native-only behavior
     - `:auto_proxy` (default depends on `:native_ssh`) where:
@@ -2483,7 +2483,7 @@ defmodule HpcConnect do
   end
 
   defp safe_release_gpu(%Session{} = session, job_id) do
-    IO.puts("Interrupt received — releasing pending GPU job #{job_id} ...")
+    IO.puts("Interrupt received; releasing pending GPU job #{job_id} ...")
     _ = release_gpu(session, job_id)
     :ok
   rescue
@@ -2647,8 +2647,8 @@ defmodule HpcConnect do
   Returns the number of canceled jobs.
 
   Internal/testing hooks:
-  - `:list_jobs_fun` – custom function `(session -> [job_map])`
-  - `:cancel_job_fun` – custom function `(session, job_id -> binary())`
+  - `:list_jobs_fun` - custom function `(session -> [job_map])`
+  - `:cancel_job_fun` - custom function `(session, job_id -> binary())`
   """
   @spec cancel_pending_waits(Session.t()) :: non_neg_integer()
   def cancel_pending_waits(%Session{} = session), do: cancel_pending_waits(session, [])
@@ -3862,7 +3862,7 @@ defmodule HpcConnect do
 
   After this call, `updated_session.ssh_conn` is set and all commands (including
   `connect!/2`, `download_model/3`, `install_remote_scripts!/1`, etc.) run over the
-  established connection — **no new OS processes, no CMD windows, works in Livebook**.
+  established connection; no new OS processes, no CMD windows, works in Livebook.
 
   Native mode avoids OS ssh tunneling by default. If direct native connect needs
   an explicit OpenSSH ProxyJump tunnel fallback, pass `proxy_jump_via_os: true`.
@@ -3895,7 +3895,7 @@ defmodule HpcConnect do
 
   Options: `:partition`, `:gpus`, `:walltime`, `:ntasks`, `:timeout` (ms, default 300_000).
 
-  Deprecated: use `allocate_gpu/2` instead — it is now the persistent sbatch-based allocator.
+  Deprecated: use `allocate_gpu/2` instead; it is now the persistent sbatch-based allocator.
   """
   @spec hold_gpu(Session.t(), keyword()) :: map()
   def hold_gpu(%Session{} = session, opts \\ []), do: allocate_gpu(session, opts)
@@ -3963,7 +3963,7 @@ defmodule HpcConnect do
   Opens an SSH ControlMaster background connection for the session.
 
   Returns `{updated_session, master_port}`. Pass `updated_session` to subsequent
-  API calls — all SSH commands will multiplex over the established connection,
+  API calls; all SSH commands will multiplex over the established connection,
   eliminating the per-command handshake overhead (~1-2 s saved per command).
 
   Close with `SSH.close_master(master_port)` or `Port.close(master_port)`.

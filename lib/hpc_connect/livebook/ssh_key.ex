@@ -6,15 +6,15 @@ defmodule HpcConnect.Livebook.SshKey do
   Resolution order for the effective SSH identity file:
 
     1. a **configured** path (`:identity_file` opt or `HPC_CONNECT_IDENTITY_FILE`)
-       that already exists on disk → `{:configured, path}` (treated as persistent —
+       that already exists on disk -> `{:configured, path}` (treated as persistent,
        cleanup never touches it);
-    2. an **uploaded** key (Kino file ref or path) → `{:uploaded, path}`;
-    3. otherwise → `:missing` (callers show the interactive upload panel).
+    2. an **uploaded** key (Kino file ref or path) -> `{:uploaded, path}`;
+    3. otherwise -> `:missing` (callers show the interactive upload panel).
 
   Uploaded keys are **staged** into a stable temp location (with safe 600
   permissions on Unix) and both the staged copy and the original upload are
   recorded in a small registry file under the temp dir, so a notebook-end
-  cleanup (`cleanup/0`) can remove exactly those temp artifacts — and never a
+  cleanup (`cleanup/0`) can remove exactly those temp artifacts and never a
   persistent `~/.ssh` key. `cleanup/0` never raises and prints a short notice
   even when nothing is left to delete.
   """
@@ -28,7 +28,7 @@ defmodule HpcConnect.Livebook.SshKey do
   Resolves the effective SSH identity file. An **uploaded** key wins when
   provided (the explicit user choice); otherwise a **configured** path
   (`:identity_file` opt or `HPC_CONNECT_IDENTITY_FILE`) that already exists on
-  disk is used — treated as persistent, cleanup never touches it; otherwise
+  disk is used (treated as persistent, cleanup never touches it); otherwise
   `:missing` (callers show an error / keep the setup cell waiting).
   """
   @spec resolve(keyword(), term()) :: resolution()
@@ -47,7 +47,7 @@ defmodule HpcConnect.Livebook.SshKey do
 
   @doc """
   Returns the configured identity path if it is set and exists on disk,
-  otherwise `nil`. The candidate is canonicalized first (`normalize_path/1` —
+  otherwise `nil`. The candidate is canonicalized first (`normalize_path/1`:
   `~` expanded, forward-slash separators), then checked on disk, so detection
   never sees mixed `\\`/`/` separators.
   """
@@ -67,7 +67,7 @@ defmodule HpcConnect.Livebook.SshKey do
   @doc """
   Canonicalizes a path for cross-platform handling: trims whitespace, expands
   `~`, and returns an absolute path with forward-slash separators (valid on
-  both Windows and Linux — `Path.expand` normalizes `\\` to `/` on Windows).
+  both Windows and Linux; `Path.expand` normalizes `\` to `/` on Windows).
 
   Returns `nil` for blank input. Run this **before** existence checks so
   detection always sees the unified form of the path.
@@ -99,7 +99,7 @@ defmodule HpcConnect.Livebook.SshKey do
 
   Prefers `id_ed25519`, then `id_rsa`, then `id_ecdsa`; falls back to the first
   `id_*` file (ignoring `*.pub`) when none of those exist. Returns `nil` when
-  `.ssh` has no private key — callers then show the upload panel. Pass `home`
+  `.ssh` has no private key; callers then show the upload panel. Pass `home`
   to override the home directory (mainly for tests).
   """
   @spec default_identity_path(binary() | nil) :: binary() | nil
@@ -179,7 +179,7 @@ defmodule HpcConnect.Livebook.SshKey do
   def cleanup_notice(opts \\ []) do
     case cleanup(opts) do
       [] ->
-        IO.puts("No temporary SSH key found — nothing to delete (key already gone).")
+        IO.puts("No temporary SSH key found; nothing to delete (key already gone).")
 
       paths ->
         IO.puts("Deleted temporary SSH key(s):")
@@ -192,7 +192,7 @@ defmodule HpcConnect.Livebook.SshKey do
     :ok
   end
 
-  # ── helpers ───────────────────────────────────────────────────────────────
+  # helpers
 
   defp detect_key(ssh_dir) do
     preferred =

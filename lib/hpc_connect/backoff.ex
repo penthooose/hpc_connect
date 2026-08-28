@@ -14,11 +14,11 @@ defmodule HpcConnect.Backoff do
   `:mode`, `:jitter?`) and the `retry_backoff_*`-prefixed variants used by
   callers (see `options/1`), so tuning actually takes effect.
 
-    * `:base_ms` / `:retry_backoff_base_ms` – initial delay / linear step (default `1_000`)
-    * `:factor` / `:retry_backoff_factor` – exponential multiplier (default `2.0`)
-    * `:max_ms` / `:retry_backoff_max_ms` – upper bound (default `30_000`)
-    * `:mode` / `:retry_backoff_mode` – `:exponential` (default) | `:linear`
-    * `:jitter?` / `:retry_backoff_jitter` – add up to 20% jitter (default `false`)
+    * `:base_ms` / `:retry_backoff_base_ms` - initial delay / linear step (default `1_000`)
+    * `:factor` / `:retry_backoff_factor` - exponential multiplier (default `2.0`)
+    * `:max_ms` / `:retry_backoff_max_ms` - upper bound (default `30_000`)
+    * `:mode` / `:retry_backoff_mode` - `:exponential` (default) | `:linear`
+    * `:jitter?` / `:retry_backoff_jitter` - add up to 20% jitter (default `false`)
   """
 
   @defaults [mode: :exponential, base_ms: 1_000, factor: 2.0, max_ms: 30_000, jitter?: false]
@@ -38,7 +38,7 @@ defmodule HpcConnect.Backoff do
 
     capped =
       case mode do
-        # Linear: step * (attempt + 1) — attempt 0 → 1 step, attempt 1 → 2 steps, ...
+        # Linear: step * (attempt + 1); attempt 0 -> 1 step, attempt 1 -> 2 steps, ...
         :linear -> min(trunc(base_ms * (attempt + 1)), max_ms)
         _ -> min(trunc(base_ms * :math.pow(factor, attempt)), max_ms)
       end

@@ -27,9 +27,7 @@ defmodule HpcConnect.SteadyConnection.Server do
   @default_command_timeout_ms 120_000
   @max_output_chars 1_000_000
 
-  # ---------------------------------------------------------------------------
   # Public API
-  # ---------------------------------------------------------------------------
 
   @spec start_link(Session.t()) :: GenServer.on_start()
   def start_link(%Session{} = session) do
@@ -87,9 +85,7 @@ defmodule HpcConnect.SteadyConnection.Server do
     GenServer.call(server, :debug_kill_port)
   end
 
-  # ---------------------------------------------------------------------------
   # GenServer callbacks
-  # ---------------------------------------------------------------------------
 
   @impl true
   def init(%Session{} = session) do
@@ -131,8 +127,8 @@ defmodule HpcConnect.SteadyConnection.Server do
 
   @impl true
   def handle_info({port, {:data, data}}, %{port: port} = state) do
-    # Data that arrives outside a run_command call (e.g. leftover keepalive
-    # output or a slow command that was abandoned) — drop it.
+    # Data arriving outside a run_command call (leftover keepalive output or an
+    # abandoned slow command) is dropped.
     _ = data
     {:noreply, state}
   end
@@ -155,9 +151,7 @@ defmodule HpcConnect.SteadyConnection.Server do
     :ok
   end
 
-  # ---------------------------------------------------------------------------
   # Port lifecycle
-  # ---------------------------------------------------------------------------
 
   defp ensure_port(%{port: port} = state) do
     if live_port?(port) do
@@ -280,9 +274,7 @@ defmodule HpcConnect.SteadyConnection.Server do
     end
   end
 
-  # ---------------------------------------------------------------------------
   # Output framing
-  # ---------------------------------------------------------------------------
 
   defp collect_until_marker(port, suffix, timeout_ms) do
     deadline = System.monotonic_time(:millisecond) + timeout_ms
