@@ -28,23 +28,35 @@ It standardizes:
 Use this on a shared or local Livebook runtime when the SSH key is uploaded through the notebook UI.
 
 ```elixir
-boot =
+# Cell 1 — configure everything in the browser overlay
+setup =
   HpcConnect.prepare_livebook_session(
-    cluster: :alex,
-    remote_command: "hostname && whoami",
-    persist_form: true,
-    submit_label: "Connect to HPC"
+    env_file: Path.expand("../.env", __DIR__),
+    fallback_env_file: Path.expand("../.env.example", __DIR__),
+    submit_label: "Setup"
   )
-  |> HpcConnect.bootstrap()
+
+env_map = setup.env_map
+env_file = setup.env_file
+
+# Cell 2 — bootstrap with the configured values
+boot =
+  HpcConnect.bootstrap(
+    mode: :local,
+    env_file: env_file,
+    cluster: env_map["HPC_CONNECT_CLUSTER"] || "fritz",
+    username: env_map["HPC_CONNECT_USERNAME"],
+    key_path: env_map["HPC_CONNECT_IDENTITY_FILE"]
+  )
 
 session = boot.session
 ```
 
 Notes:
 
-- the form collects **cluster**, **username**, **SSH private key**, and optional **HF token**
-- the uploaded SSH key is copied into a temporary credential directory
-- the optional HF token is used for gated Hugging Face models and is **not persisted**
+- the overlay configures **every** env var `HpcConnect` reads (cluster, username, SSH key, proxy, work/vault dirs, steady connection, retry, ...)
+- values are pre-filled from `.env` / `.env.example` and persisted between notebook opens (secrets are never persisted; files only fill blank fields)
+- the SSH identity field auto-detects an existing `~/.ssh` key, or you can upload one (stored temporarily; removed by `HpcConnect.cleanup_livebook_setup/1`)
 - `boot.startup` summarizes GPUs, models, quota, and jobs
 
 Most important Livebook cleanup commands:

@@ -11,31 +11,39 @@ See also:
 
 ---
 
-## Livebook bootstrap
+## Livebook setup + bootstrap
+
+First cell — configure everything in the browser overlay:
+
+```elixir
+setup =
+	HpcConnect.prepare_livebook_session(
+		env_file: Path.expand("../.env", __DIR__),
+		fallback_env_file: Path.expand("../.env.example", __DIR__),
+		submit_label: "Setup"
+	)
+
+env_map = setup.env_map
+env_file = setup.env_file
+```
+
+Second cell — bootstrap:
 
 ```elixir
 boot =
-	HpcConnect.prepare_livebook_session(
-		cluster: :alex,
-		remote_command: "hostname && whoami",
-		persist_form: true,
-		submit_label: "Connect to HPC"
+	HpcConnect.bootstrap(
+		mode: :local,
+		env_file: env_file,
+		cluster: env_map["HPC_CONNECT_CLUSTER"] || "fritz",
+		username: env_map["HPC_CONNECT_USERNAME"],
+		key_path: env_map["HPC_CONNECT_IDENTITY_FILE"]
 	)
-	|> HpcConnect.bootstrap()
 
 session = boot.session
 ```
 
-Optional: provide a Hugging Face token during bootstrap for gated models.
-
-```elixir
-boot =
-	HpcConnect.prepare_livebook_session(
-		cluster: :alex,
-		hf_token: System.get_env("HF_TOKEN")
-	)
-	|> HpcConnect.bootstrap()
-```
+Optional: provide a Hugging Face token for gated models (`HUGGINGFACE_HUB_TOKEN`
+in the overlay, or `hf_token:` in `bootstrap/1`).
 
 ## Local bootstrap
 

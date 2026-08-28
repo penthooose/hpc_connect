@@ -36,14 +36,12 @@ defmodule HpcConnect.Livebook do
   end
 
   @doc """
-  Renders a single Livebook form and returns bootstrap-ready options.
+  Renders a single Livebook form and returns bootstrap-ready options (lower-level
+  helper kept for the single-form flow and used by `connection_setup/1`).
 
-  This is the compact notebook-oriented entrypoint intended to keep Livebook
-  setup to one cell:
-
-      boot =
-        HpcConnect.prepare_livebook_session(cluster: :alex)
-        |> HpcConnect.bootstrap()
+  For notebooks, prefer `HpcConnect.prepare_livebook_session/1` — the full
+  browser setup overlay in the first cell, then `HpcConnect.bootstrap/1` in the
+  second cell.
 
   If `:username` and `:uploaded_key_path` are already provided, no UI is shown
   and the options are only normalized/validated.

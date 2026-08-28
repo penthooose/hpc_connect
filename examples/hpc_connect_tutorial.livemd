@@ -1,4 +1,4 @@
-# HPC Connect test notebook
+# HPC Connect Tutorial
 
 ```elixir
 Mix.install([
@@ -6,25 +6,37 @@ Mix.install([
 ])
 ```
 
-## Setup and bootstrap
+## 1. Configure the environment (setup overlay)
 
-`HpcConnect.prepare_livebook_session/1` helper wraps the Livebook-only
-`Kino.Input.*` UI into a single form. The text/select values can optionally be
-reused on the next notebook open via `persist_form: true`, but the uploaded SSH
-key must still be selected again each time, as it will be overwritten to not persist.
+```elixir
+setup =
+	HpcConnect.prepare_livebook_session(
+		env_file: Path.expand("../.env", __DIR__),
+		fallback_env_file: Path.expand("../.env.example", __DIR__),
+		submit_label: "Setup"
+	)
+
+env_map = setup.env_map
+env_file = setup.env_file
+ssh_key_path = setup.ssh_key_path
+```
+
+## 2. Bootstrap the HPC session
+
+Use the preconfigured values from the §1 overlay directly, so this works on any
+machine / server without relying on a local `.env`. `env_file` (the
+overlay-written temp .env) supplies the remaining session settings (work/vault
+dirs, steady connection, retry, ...).
 
 ```elixir
 boot =
-	HpcConnect.prepare_livebook_session(
-		cluster: :alex,
-    steady_connection: false,
-		# optional for gated HF models:
-		# hf_token: System.get_env("HF_TOKEN"),
-		remote_command: "hostname && whoami",
-		persist_form: true,
-		submit_label: "Connect to HPC"
+	HpcConnect.bootstrap(
+		mode: :local,
+		env_file: env_file,
+		cluster: env_map["HPC_CONNECT_CLUSTER"] || "helma",
+		username: env_map["HPC_CONNECT_USERNAME"],
+		key_path: env_map["HPC_CONNECT_IDENTITY_FILE"]
 	)
-	|> HpcConnect.bootstrap()
 
 session = boot.session
 boot

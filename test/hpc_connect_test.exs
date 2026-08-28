@@ -589,41 +589,45 @@ defmodule HpcConnectTest do
     refute File.exists?(uploaded_key_path)
   end
 
-  test "prepare_livebook_session normalizes direct values without requiring kino UI" do
+  test "prepare_livebook_session in :local mode applies defaults and writes a temp env" do
     tmp_dir =
       Path.join([
         System.tmp_dir!(),
-        "livebook",
-        "test_session",
-        "registered_files"
+        "livebook_setup_test_#{System.unique_integer([:positive])}"
       ])
 
     File.mkdir_p!(tmp_dir)
+    on_exit(fn -> File.rm_rf!(tmp_dir) end)
 
-    uploaded_key_path = Path.join(tmp_dir, "id_team_prepare_livebook")
-    File.write!(uploaded_key_path, "FAKE_PRIVATE_KEY")
+    env_file = Path.join(tmp_dir, "input.env")
+    File.write!(env_file, "HPC_CONNECT_CLUSTER=alex\nHPC_CONNECT_USERNAME=hpcusr01\n")
 
-    opts =
+    env_keys = HpcConnect.Livebook.Setup.inputs() |> Enum.map(& &1.env)
+    before_env = Map.new(env_keys, &{&1, System.get_env(&1)})
+
+    on_exit(fn ->
+      Enum.each(before_env, fn {k, v} ->
+        if v, do: System.put_env(k, v), else: System.delete_env(k)
+      end)
+    end)
+
+    setup =
       HpcConnect.prepare_livebook_session(
-        cluster: :alex,
-        username: "  hpcusr01  ",
-        uploaded_key_path: uploaded_key_path,
-        hf_token: "hf_test_token",
-        remote_command: "",
-        work_dir: "$HOME/.cache/hpc_connect",
-        vault_dir: "$HOME/vault/hpc_connect"
+        mode: :local,
+        env_file: env_file,
+        env_output_path: Path.join(tmp_dir, "out.env"),
+        persist_path: Path.join(tmp_dir, "setup.json"),
+        tmp_base: Path.join(tmp_dir, "sess")
       )
 
-    assert opts[:mode] == :livebook
-    assert opts[:cluster] == :alex
-    assert opts[:username] == "hpcusr01"
-    assert opts[:uploaded_key_path] == Path.expand(uploaded_key_path)
-    assert opts[:uploaded_filename] == "id_team_prepare_livebook"
-    assert opts[:hf_token] == "hf_test_token"
-    assert opts[:remote_command] == "hostname && whoami"
-    refute Keyword.has_key?(opts, :work_dir)
-    refute Keyword.has_key?(opts, :vault_dir)
-    assert opts[:ui_rendered?] == false
+    assert setup.env_map["HPC_CONNECT_CLUSTER"] == "alex"
+    assert setup.env_map["HPC_CONNECT_USERNAME"] == "hpcusr01"
+    assert File.exists?(setup.env_file)
+    assert File.read!(setup.env_file) =~ "HPC_CONNECT_CLUSTER=alex"
+    assert setup.persisted_path == Path.join(tmp_dir, "setup.json")
+    assert Map.has_key?(setup, :ssh_key_path)
+    assert Map.has_key?(setup, :ssh_key_temporary?)
+    assert setup.ssh_key_temporary? == false
   end
 
   test "livebook ignores explicit work_dir and vault_dir overrides and derives defaults" do

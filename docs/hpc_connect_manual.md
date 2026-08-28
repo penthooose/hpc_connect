@@ -56,23 +56,28 @@ On Windows, use Win32-OpenSSH. On Linux, OpenSSH is usually already available.
 Use this when the SSH key is uploaded through the notebook.
 
 ```elixir
-boot =
+setup =
 	HpcConnect.prepare_livebook_session(
-		cluster: :alex,
-		remote_command: "hostname && whoami",
-		persist_form: true
+		env_file: Path.expand("../.env", __DIR__),
+		fallback_env_file: Path.expand("../.env.example", __DIR__),
+		submit_label: "Setup"
 	)
-	|> HpcConnect.bootstrap()
 
-session = boot.session
+env_map = setup.env_map
+env_file = setup.env_file
 ```
 
-Important details:
+````elixir
+boot =
+	HpcConnect.bootstrap(
+		mode: :local,
+		env_file: env_file,
+		cluster: env_map["HPC_CONNECT_CLUSTER"] || "fritz",
 
-- a temporary credential directory is created under the system temp directory
+- the overlay configures **every** env var `HpcConnect` reads and persists non-secret values between notebook opens
+- a temporary credential directory is created under the system temp directory for uploaded keys
 - a generated SSH config is used for Livebook sessions
-- the uploaded key is copied into that temp directory
-- an optional Hugging Face token can be supplied during bootstrap
+- an optional Hugging Face token can be supplied in the overlay (never persisted)
 - the token is **not persisted** by the Livebook form defaults
 - you may also pass `env_file: ".env"` if the runtime can read that file
 
@@ -89,7 +94,7 @@ boot =
 		key_path: Path.expand("~/.ssh/id_fau"),
 		env_file: ".env"
 	)
-```
+````
 
 In local mode the key is used directly from disk; it is not copied into a Livebook temp directory.
 Native SSH is **not** enabled by default in the standard local bootstrap flow.
@@ -305,11 +310,14 @@ Examples:
 
 ```elixir
 boot =
-	HpcConnect.prepare_livebook_session(
-		cluster: :alex,
+	HpcConnect.bootstrap(
+		mode: :local,
+		env_file: env_file,
+		cluster: env_map["HPC_CONNECT_CLUSTER"] || "fritz",
+		username: env_map["HPC_CONNECT_USERNAME"],
+		key_path: env_map["HPC_CONNECT_IDENTITY_FILE"],
 		hf_token: System.get_env("HF_TOKEN")
 	)
-	|> HpcConnect.bootstrap()
 ```
 
 ```elixir

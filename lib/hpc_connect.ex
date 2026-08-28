@@ -67,33 +67,49 @@ defmodule HpcConnect do
   end
 
   @doc """
-  Renders a single Livebook setup form and returns bootstrap-ready options.
+  Renders the interactive Livebook setup overlay and returns a config map for
+  the next cell. Everything is configured in the browser (see
+  `HpcConnect.Livebook.Setup`), so a notebook works from a container/server with
+  no local `.env` and no SSH access to the machine running it.
 
-  This keeps notebooks compact by collapsing cluster selection, username,
-  uploaded SSH key, and the common probe/path settings into one interactive
-  step:
+  First cell — configure:
+
+      setup =
+        HpcConnect.prepare_livebook_session(
+          env_file: Path.expand("../.env", __DIR__),
+          fallback_env_file: Path.expand("../.env.example", __DIR__),
+          submit_label: "Setup"
+        )
+
+      env_map = setup.env_map
+      env_file = setup.env_file
+
+  Second cell — bootstrap:
 
       boot =
-        HpcConnect.prepare_livebook_session(cluster: :alex, persist_form: true)
-        |> HpcConnect.bootstrap()
+        HpcConnect.bootstrap(
+          mode: :local,
+          env_file: env_file,
+          cluster: env_map["HPC_CONNECT_CLUSTER"] || "fritz",
+          username: env_map["HPC_CONNECT_USERNAME"],
+          key_path: env_map["HPC_CONNECT_IDENTITY_FILE"]
+        )
 
-  The Kino-based UI is only available inside Livebook. Outside Livebook, pass
-  the options directly (for example `mode: :local` with `:username` and
-  `:key_path`).
+  Field defaults are pre-filled from `.env` / `.env.example` (via `:env_file` /
+  `:fallback_env_file`) and from the last session (values are **always**
+  persisted — except secrets — and only fill blank fields on the next open).
+  The SSH identity field auto-detects an existing `~/.ssh` key; an uploaded key
+  wins over a configured path and is stored temporarily (removed by
+  `HpcConnect.cleanup_livebook_setup/1`).
 
-  When `persist_form: true` is used, only non-secret defaults are persisted.
-  The uploaded private key itself is never persisted.
+  The returned map contains `:env_map`, `:env_file`, `:values`,
+  `:persisted_path`, `:ssh_key_path`, and `:ssh_key_temporary?`.
 
-  Form defaults are pre-filled from `.env` / `.env.example` (via `:env_file` /
-  `:fallback_env_file`, default `.env`). If `HPC_CONNECT_IDENTITY_FILE` (or
-  `:identity_file`) points at an existing key, it is used directly and the
-  upload panel is skipped; otherwise the SSH key is uploaded temporarily and
-  removed by `HpcConnect.cleanup_livebook_session/1` at the end of the session
-  (a persistent `~/.ssh` key is never deleted).
+  Pass `mode: :local` to skip the UI (used by tests / non-Livebook runs).
   """
-  @spec prepare_livebook_session(keyword()) :: keyword()
+  @spec prepare_livebook_session(keyword()) :: map()
   def prepare_livebook_session(opts \\ []) do
-    Livebook.prepare_session(opts)
+    Livebook.Setup.prepare(opts)
   end
 
   @doc """
@@ -630,6 +646,16 @@ defmodule HpcConnect do
   def cleanup_livebook_session(result_or_session, opts \\ []) do
     result_or_session
     |> Livebook.connection_cleanup(Keyword.put_new(opts, :delete_uploaded, true))
+  end
+
+  @doc """
+  Deletes any temporary SSH key uploaded by the `prepare_livebook_session/1`
+  setup overlay (never a persistent `~/.ssh` key) and prints a short notice —
+  no error when nothing is left to delete. Runs the notebook-end cleanup.
+  """
+  @spec cleanup_livebook_setup(keyword()) :: :ok
+  def cleanup_livebook_setup(opts \\ []) do
+    Livebook.Setup.cleanup(opts)
   end
 
   @doc """
