@@ -6,7 +6,8 @@ defmodule HpcConnect.Livebook do
   uploaded file path returned by `Kino.Input.file_path/1`.
   """
 
-  alias HpcConnect.{Cluster, Credentials, Session}
+  alias HpcConnect.{Cluster, Credentials, EnvFile, Session}
+  alias HpcConnect.Livebook.{Form, SshKey}
 
   @type setup_mode :: :livebook | :local
   @default_remote_command "hostname && whoami"
@@ -359,7 +360,24 @@ defmodule HpcConnect.Livebook do
   defp prepare_session_interactive(opts) do
     ensure_kino_available!()
     persisted = load_prepare_defaults(opts)
-    default_cluster = prepare_default_cluster(opts, persisted)
+    env_map = prepare_env_map(opts)
+
+    default_cluster = prepare_default_cluster(opts, persisted, env_map)
+
+    default_username =
+      persisted["username"] ||
+        Map.get(env_map, "HPC_CONNECT_USERNAME") ||
+        Keyword.get(opts, :username, "")
+
+    # A configured key path that exists on disk is used directly (persistent —
+    # never deleted by cleanup). Otherwise the interactive upload panel is shown.
+    configured_key =
+      SshKey.configured_path(
+        identity_file:
+          Map.get(env_map, "HPC_CONNECT_IDENTITY_FILE") ||
+            Keyword.get(opts, :identity_file) ||
+            SshKey.default_identity_path()
+      )
 
     cluster_input =
       kino_input_select(
@@ -370,14 +388,10 @@ defmodule HpcConnect.Livebook do
 
     username_input =
       kino_input_text("HPC username",
-        default: persisted["username"] || Keyword.get(opts, :username, "")
+        default: default_username
       )
 
-    upload_input =
-      kino_input_file(
-        "Upload the team SSH private key",
-        accept: :any
-      )
+    key_fields = [ssh_key: kino_input_file("Upload the team SSH private key", accept: :any)]
 
     hf_token_input =
       kino_input_text("HF token (optional)",
@@ -388,22 +402,30 @@ defmodule HpcConnect.Livebook do
       kino_input_text("Probe command",
         default:
           persisted["remote_command"] ||
+            Map.get(env_map, "HPC_CONNECT_REMOTE_COMMAND") ||
             Keyword.get(opts, :remote_command, @default_remote_command)
       )
 
     form =
       kino_control_form(
-        [
-          cluster: cluster_input,
-          username: username_input,
-          ssh_key: upload_input,
-          hf_token: hf_token_input,
-          remote_command: remote_command_input
-        ],
+        [cluster: cluster_input, username: username_input] ++
+          key_fields ++
+          [hf_token: hf_token_input, remote_command: remote_command_input],
         submit: Keyword.get(opts, :submit_label, @default_submit_label)
       )
 
     status_frame = kino_frame_new(placeholder: false)
+
+    key_notice =
+      if configured_key do
+        "Using the configured SSH key ``#{configured_key}`` — upload a different " <>
+          "key below to override it for this session."
+      else
+        "Upload your SSH key below (or set `HPC_CONNECT_IDENTITY_FILE` to an " <>
+          "existing key). The key is stored **temporarily** and is deleted when " <>
+          "you run `HpcConnect.cleanup_livebook_session/1` (or end the session). " <>
+          "Your persistent `~/.ssh` key is never touched."
+      end
 
     layout =
       kino_layout_grid(
@@ -411,20 +433,21 @@ defmodule HpcConnect.Livebook do
           kino_markdown("""
           ## HPC Connect Livebook setup
 
-          Fill out the form once, submit, and the returned options can go
-          straight into `HpcConnect.bootstrap/1`.
+          Fill out the form and submit; you can edit and re-submit later.
+          Defaults are read from `.env` / `.env.example` when present.
+
+          #{key_notice}
 
           Non-secret defaults can be persisted for the next notebook run when
           `persist_form: true` is enabled. The uploaded SSH key is **never**
-          persisted and must be selected again. The optional HF token is used
-          for the current session only.
+          persisted. The optional HF token is used for the current session only.
           """),
           form,
           status_frame,
           kino_markdown("""
           ### Recommended cleanup
 
-          After you finish the notebook, use:
+          After you finish the notebook, run:
 
           `HpcConnect.cleanup_livebook_session(boot)`
 
@@ -439,18 +462,45 @@ defmodule HpcConnect.Livebook do
 
     kino_render(layout)
 
-    event = await_form_submit!(form)
-    render_connecting_status(status_frame, event)
-    data = Map.fetch!(event, :data)
+    # A persistent owner keeps the form subscription alive after this cell
+    # finishes, so values can be edited and re-submitted without re-running the
+    # cell. The cell blocks only for the first submit; later submits re-run the
+    # handler and re-render the status frame.
+    owner = Form.ensure(:hpc_livebook_prepare)
 
-    persist_prepare_defaults(opts, data)
+    handler = fn data, event ->
+      persist_prepare_defaults(opts, data)
 
+      case SshKey.resolve([identity_file: configured_key], Map.get(data, :ssh_key)) do
+        {:configured, key_path} ->
+          {build_prepared_session(opts, status_frame, data, event, key_path),
+           connecting_spinner_html()}
+
+        {:uploaded, key_path} ->
+          {build_prepared_session(opts, status_frame, data, event, key_path),
+           connecting_spinner_html()}
+
+        :missing ->
+          {:retry,
+           kino_markdown(
+             "**SSH key required:** upload your SSH private key or set " <>
+               "`HPC_CONNECT_IDENTITY_FILE` to an existing key path, then press " <>
+               "Setup again."
+           )}
+      end
+    end
+
+    :ok = Form.attach(owner, form, status_frame, handler)
+    Form.await(owner)
+  end
+
+  defp build_prepared_session(opts, status_frame, data, event, key_path) do
     build_prepared_session_opts(
       opts,
       %{
         username: Map.get(data, :username),
         cluster: Map.get(data, :cluster),
-        uploaded_key_path: uploaded_key_path_from_form!(Map.get(data, :ssh_key)),
+        uploaded_key_path: key_path,
         uploaded_filename: uploaded_filename_from_form(Map.get(data, :ssh_key)),
         hf_token: Map.get(data, :hf_token),
         remote_command: Map.get(data, :remote_command)
@@ -513,25 +563,6 @@ defmodule HpcConnect.Livebook do
     prepared_opts
   end
 
-  defp await_form_submit!(form) do
-    tag = {:hpc_connect_livebook_prepare, make_ref()}
-    :ok = kino_control_subscribe(form, tag)
-
-    receive do
-      {^tag, %{type: :submit} = event} -> event
-    end
-  end
-
-  defp render_connecting_status(status_frame, event) do
-    render_opts =
-      case Map.get(event, :origin) do
-        nil -> []
-        origin -> [to: origin]
-      end
-
-    kino_frame_render(status_frame, connecting_spinner_html(), render_opts)
-  end
-
   @spec clear_prepare_status(keyword()) :: :ok
   def clear_prepare_status(opts) when is_list(opts) do
     case Keyword.get(opts, :ui_status_frame) do
@@ -563,14 +594,6 @@ defmodule HpcConnect.Livebook do
   defp maybe_put_status_origin(opts, nil), do: opts
   defp maybe_put_status_origin(opts, origin), do: Keyword.put(opts, :ui_status_origin, origin)
 
-  defp uploaded_key_path_from_form!(nil) do
-    raise ArgumentError, "Livebook setup requires an uploaded SSH private key"
-  end
-
-  defp uploaded_key_path_from_form!(%{file_ref: file_ref}) do
-    kino_file_path(file_ref)
-  end
-
   defp uploaded_filename_from_form(nil), do: nil
   defp uploaded_filename_from_form(%{} = upload), do: Map.get(upload, :client_name)
 
@@ -586,13 +609,47 @@ defmodule HpcConnect.Livebook do
     |> Enum.join(" — ")
   end
 
-  defp prepare_default_cluster(opts, persisted) do
+  defp prepare_default_cluster(opts, persisted, env_map) do
     persisted_cluster = Map.get(persisted, "cluster")
-    requested = persisted_cluster || Keyword.get(opts, :cluster, :fritz)
+
+    requested =
+      persisted_cluster ||
+        env_cluster(env_map) ||
+        Keyword.get(opts, :cluster, :fritz)
 
     case resolve_cluster_choice(requested) do
       nil -> :fritz
       value -> value
+    end
+  end
+
+  defp env_cluster(env_map) do
+    Map.get(env_map, "HPC_CONNECT_CLUSTER") || Map.get(env_map, "HPC_CONNECT_SSH_ALIAS")
+  end
+
+  # Loads `.env` / `.env.example` defaults (`.env` itself already falls back to
+  # `.env.example` via `EnvFile.load/1`), or a custom `:env_file`/`:fallback_env_file`.
+  defp prepare_env_map(opts) do
+    case Keyword.get(opts, :env_file, ".env") do
+      false ->
+        %{}
+
+      nil ->
+        %{}
+
+      path when is_binary(path) ->
+        cond do
+          File.exists?(path) -> EnvFile.load(path)
+          path == ".env" -> EnvFile.load(".env")
+          true ->
+            case Keyword.get(opts, :fallback_env_file) do
+              fallback when is_binary(fallback) ->
+                if File.exists?(fallback), do: EnvFile.load(fallback), else: %{}
+
+              _ ->
+                %{}
+            end
+        end
     end
   end
 
@@ -652,7 +709,7 @@ defmodule HpcConnect.Livebook do
     Keyword.get(
       opts,
       :persist_path,
-      Path.join([System.tmp_dir!(), "hpc_connect", "livebook_prepare_defaults.json"])
+      Path.expand(Path.join([System.tmp_dir!(), "hpc_connect", "livebook_prepare_defaults.json"]))
     )
   end
 
@@ -705,9 +762,6 @@ defmodule HpcConnect.Livebook do
   defp kino_render(term), do: apply(kino_module(), :render, [term])
   defp kino_frame_new(opts), do: apply(kino_frame_module(), :new, [opts])
 
-  defp kino_frame_render(frame, term, opts),
-    do: apply(kino_frame_module(), :render, [frame, term, opts])
-
   defp kino_frame_clear(frame, opts), do: apply(kino_frame_module(), :clear, [frame, opts])
 
   defp kino_html_new(html), do: apply(kino_html_module(), :new, [html])
@@ -719,12 +773,8 @@ defmodule HpcConnect.Livebook do
   defp kino_input_file(label, opts), do: apply(kino_input_module(), :file, [label, opts])
   defp kino_control_form(fields, opts), do: apply(kino_control_module(), :form, [fields, opts])
 
-  defp kino_control_subscribe(control, tag),
-    do: apply(kino_control_module(), :subscribe, [control, tag])
-
   defp kino_layout_grid(items, opts), do: apply(kino_layout_module(), :grid, [items, opts])
   defp kino_markdown(text), do: apply(kino_markdown_module(), :new, [text])
-  defp kino_file_path(file_ref), do: apply(kino_input_module(), :file_path, [file_ref])
 
   defp connecting_spinner_html do
     kino_html_new("""

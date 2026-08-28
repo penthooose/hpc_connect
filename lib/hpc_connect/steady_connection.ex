@@ -211,19 +211,21 @@ defmodule HpcConnect.SteadyConnection do
 
       _pid ->
         retries = Keyword.get(opts, :retries, 3)
+        forever? = Keyword.get(opts, :retry_forever, session.retry_forever || false)
         timeout_ms = Keyword.get(opts, :timeout, 120_000)
-        do_run_remote(key, remote_command, retries, 0, timeout_ms)
+        do_run_remote(key, remote_command, retries, forever?, 0, timeout_ms)
     end
   end
 
   def run_remote(key, remote_command, opts)
       when is_binary(key) and is_binary(remote_command) do
     retries = Keyword.get(opts, :retries, 3)
+    forever? = Keyword.get(opts, :retry_forever, false)
     timeout_ms = Keyword.get(opts, :timeout, 120_000)
-    do_run_remote(key, remote_command, retries, 0, timeout_ms)
+    do_run_remote(key, remote_command, retries, forever?, 0, timeout_ms)
   end
 
-  defp do_run_remote(key, remote_command, retries_left, attempt, timeout_ms) do
+  defp do_run_remote(key, remote_command, retries_left, forever?, attempt, timeout_ms) do
     server = ets_lookup(key) || raise RuntimeError, "steady shell not found for #{key}"
 
     {output, status} = Server.run_command(server, remote_command, timeout_ms)
@@ -232,22 +234,46 @@ defmodule HpcConnect.SteadyConnection do
       status == 0 ->
         {output, 0}
 
+      transient_steady_failure?(output, status) and forever? ->
+        Logger.warning(
+          "[HpcConnect] steady shell transient failure (attempt #{attempt + 1}); " <>
+            "reconnecting and retrying until it works"
+        )
+
+        _ = Server.reconnect(server)
+        Process.sleep(steady_backoff(attempt, forever?))
+        do_run_remote(key, remote_command, retries_left, forever?, attempt + 1, timeout_ms)
+
       retries_left > 0 and transient_steady_failure?(output, status) ->
         # Shell died mid-command – force reconnect and retry with backoff.
         _ = Server.reconnect(server)
-        Process.sleep(Backoff.delay(attempt))
-        do_run_remote(key, remote_command, retries_left - 1, attempt + 1, timeout_ms)
+        Process.sleep(steady_backoff(attempt, forever?))
+        do_run_remote(key, remote_command, retries_left - 1, forever?, attempt + 1, timeout_ms)
 
       true ->
         {output, status}
     end
   rescue
     e ->
-      if retries_left > 0 and call_timeout?(e) do
+      if call_timeout?(e) and (forever? or retries_left > 0) do
+        if forever? do
+          Logger.warning(
+            "[HpcConnect] steady shell busy (attempt #{attempt + 1}); retrying until it works"
+          )
+        end
+
         # The server was busy (GenServer.call timeout) – it stays registered, so
         # retrying with backoff is safe.
-        Process.sleep(Backoff.delay(attempt))
-        do_run_remote(key, remote_command, retries_left - 1, attempt + 1, timeout_ms)
+        Process.sleep(steady_backoff(attempt, forever?))
+
+        do_run_remote(
+          key,
+          remote_command,
+          if(forever?, do: retries_left, else: retries_left - 1),
+          forever?,
+          attempt + 1,
+          timeout_ms
+        )
       else
         reraise e, __STACKTRACE__
       end
@@ -256,6 +282,14 @@ defmodule HpcConnect.SteadyConnection do
   defp transient_steady_failure?(output, status) do
     (status == 255 and is_binary(output) and SSH.transient_failure?(output)) or
       status in [:closed, :timeout]
+  end
+
+  # Retry-forever uses the long linear 10 s → 60 s gateway-wait schedule so a
+  # throttled jump gateway can clear between attempts; finite retries keep the
+  # fast exponential backoff.
+  defp steady_backoff(attempt, forever?) do
+    opts = if forever?, do: Backoff.forever_options([]), else: []
+    Backoff.delay(attempt, opts)
   end
 
   defp call_timeout?(e) do

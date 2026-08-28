@@ -94,6 +94,21 @@ HpcConnect.close_steady_connection(session)     # close it
 
 Works on all platforms (including Windows, which lacks OpenSSH ControlMaster).
 
+## Retry-forever on connection errors
+
+Transient SSH failures (`Connection refused`, `Connection timed out`, gateway
+throttling after too many requests) are retried with exponential backoff
+(1 s → 2 s → 4 s → … capped at 60 s). By default retries are finite (3, fail
+fast). To never give up until the connection works, set per session:
+
+```dotenv
+HPC_CONNECT_RETRY_FOREVER=true
+```
+
+or per call: `connect!(session, retry_forever: true)` /
+`SSH.exec(session, cmd, retry_forever: true)`. This applies to the steady
+shell, default `SSH.exec/exec!` calls, and the top-level connect path.
+
 ---
 
 ## Status queries

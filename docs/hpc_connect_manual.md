@@ -267,6 +267,28 @@ steady shell with `HpcConnect.steady_connection?/1`,
 `HpcConnect.close_steady_connection/1`. This works on all platforms,
 including Windows (which lacks OpenSSH ControlMaster support).
 
+### Retry-forever on connection errors
+
+All SSH layers (steady shell, default `SSH.exec/exec!`, and the top-level
+`connect!`/`run_command_with_retry!` path) retry transient failures —
+`Connection refused`, `Connection closed`, `Connection timed out`,
+`connect to host ...`, gateway throttling after too many requests — with
+exponential backoff (`1 s → 2 s → 4 s → …` capped at 60 s). The finite default
+is **3** attempts (fail fast). To never give up until the connection works,
+opt in per session:
+
+```dotenv
+HPC_CONNECT_RETRY_FOREVER=true
+```
+
+or per call: `connect!(session, retry_forever: true)` /
+`SSH.exec(session, cmd, retry_forever: true)`. The flag is stored on the
+`Session` struct (`session.retry_forever`), read from the env var at
+`Session.new/2` time, and threaded into every SSH entry point. When set, the
+call keeps retrying until it succeeds or is interrupted — intended for
+interactive notebook sessions on flaky gateways; tests and fail-fast callers
+leave it off.
+
 ---
 
 ## 5. Hugging Face token handling

@@ -51,6 +51,69 @@ defmodule HpcConnectTest do
     assert preview =~ "hpcusr01@alex.nhr.fau.de"
   end
 
+  describe "extended_debug tracing" do
+    test "session reads extended_debug from opts" do
+      on = HpcConnect.new_session(:helma, username: "u", extended_debug: true)
+      off = HpcConnect.new_session(:helma, username: "u")
+      assert on.extended_debug == true
+      assert off.extended_debug == false
+    end
+
+    test "ssh_command and scp_to_command carry extended_debug onto the Command" do
+      on = HpcConnect.new_session(:helma, username: "u", extended_debug: true)
+      off = HpcConnect.new_session(:helma, username: "u")
+
+      assert HpcConnect.SSH.ssh_command(on, "echo ok", "probe").extended_debug == true
+      assert HpcConnect.SSH.ssh_command(off, "echo ok", "probe").extended_debug == false
+
+      assert HpcConnect.SSH.scp_to_command(on, "/a", "/b", "up").extended_debug == true
+      assert HpcConnect.SSH.scp_to_command(off, "/a", "/b", "up").extended_debug == false
+    end
+
+    test "SSH.run prints a timestamped trace line before executing when enabled" do
+      command = %HpcConnect.Command{
+        binary: "nonexistent-binary-xyz",
+        args: [],
+        summary: "trace test",
+        remote_command: "echo hi",
+        extended_debug: true
+      }
+
+      output =
+        ExUnit.CaptureIO.capture_io(fn ->
+          try do
+            HpcConnect.SSH.run(command)
+          rescue
+            _ -> :ok
+          end
+        end)
+
+      assert output =~ "[hpc-ext-debug]"
+      assert output =~ "echo hi"
+    end
+
+    test "SSH.run prints nothing when extended_debug is off" do
+      command = %HpcConnect.Command{
+        binary: "nonexistent-binary-xyz",
+        args: [],
+        summary: "trace test",
+        remote_command: "echo hi",
+        extended_debug: false
+      }
+
+      output =
+        ExUnit.CaptureIO.capture_io(fn ->
+          try do
+            HpcConnect.SSH.run(command)
+          rescue
+            _ -> :ok
+          end
+        end)
+
+      refute output =~ "[hpc-ext-debug]"
+    end
+  end
+
   test "renders model cache exports into the vllm command" do
     session =
       HpcConnect.new_session(:helma,
@@ -208,7 +271,10 @@ defmodule HpcConnectTest do
       "OK"
     end
 
-    assert HpcConnect.connect!(session, "hostname", run_fun: run_fun) == "OK"
+    assert HpcConnect.connect!(session, "hostname",
+             run_fun: run_fun,
+             connect_preflight_fun: fn _ -> :ok end
+           ) == "OK"
 
     assert_receive {:livebook_connect_attempt, 1, first_preview}
     refute first_preview =~ "ProxyJump="
@@ -255,7 +321,10 @@ defmodule HpcConnectTest do
       end
     end
 
-    assert HpcConnect.connect!(session, "hostname", run_fun: run_fun) == "OK-NONE"
+    assert HpcConnect.connect!(session, "hostname",
+             run_fun: run_fun,
+             connect_preflight_fun: fn _ -> :ok end
+           ) == "OK-NONE"
 
     assert_receive {:livebook_connect_none_attempt, 1, first_preview}
     refute first_preview =~ "ProxyJump="

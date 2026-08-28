@@ -1021,11 +1021,7 @@ defmodule HpcConnect.Slurm do
   end
 
   def build_sif_job(%Session{} = session, opts) do
-    {name, opts} =
-      case opts do
-        name when is_binary(name) -> {name, []}
-        opts when is_list(opts) -> {Keyword.get(opts, :name, "vllm"), opts}
-      end
+    name = Keyword.get(opts, :name, "vllm")
 
     # Default to a build-capable cluster unless the caller disables redirection.
     build_cluster = Keyword.get(opts, :build_cluster, :alex)

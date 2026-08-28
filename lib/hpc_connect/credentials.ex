@@ -25,6 +25,7 @@ defmodule HpcConnect.Credentials do
       |> Path.join(
         "#{prefix}_#{System.system_time(:millisecond)}_#{System.unique_integer([:positive])}"
       )
+      |> Path.expand()
 
     File.mkdir_p!(credential_dir)
 
@@ -183,7 +184,7 @@ defmodule HpcConnect.Credentials do
   end
 
   defp registry_dir do
-    Path.join([System.tmp_dir!(), "hpc_connect", "cleanup_registry"])
+    Path.join([System.tmp_dir!(), "hpc_connect", "cleanup_registry"]) |> Path.expand()
   end
 
   defp registry_file_for(credential_dir) do

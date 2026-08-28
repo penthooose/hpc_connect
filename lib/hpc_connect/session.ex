@@ -21,6 +21,10 @@ defmodule HpcConnect.Session do
     :port_range,
     # Steady OS SSH connection enabled (ControlMaster multiplexing + backoff)
     :steady_connection,
+    # Retry transient SSH connection errors until they clear (default: false)
+    :retry_forever,
+    # Trace every SSH/SCP command to stdout (diagnostics; default: false)
+    :extended_debug,
     # Path to an SSH ControlMaster socket (set by SSH.open_master!/1 or steady)
     :master_socket,
     # Erlang :ssh persistent connection reference (set by SSH.open_connection!/1)
@@ -50,6 +54,8 @@ defmodule HpcConnect.Session do
           vault_dir: binary(),
           port_range: {pos_integer(), pos_integer()},
           steady_connection: boolean(),
+          retry_forever: boolean(),
+          extended_debug: boolean(),
           master_socket: binary() | nil,
           ssh_conn: pid() | reference() | nil,
           tunnel_port: port() | nil,
@@ -95,6 +101,8 @@ defmodule HpcConnect.Session do
       |> Keyword.put_new(:work_dir, Map.get(env_map, "HPC_CONNECT_WORK_DIR"))
       |> Keyword.put_new(:vault_dir, Map.get(env_map, "HPC_CONNECT_VAULT_DIR"))
       |> put_steady_from_env(env_map)
+      |> put_retry_forever_from_env(env_map)
+      |> put_extended_debug_from_env(env_map)
       |> put_port_range_from_env(env_map)
 
     new(cluster, opts)
@@ -145,9 +153,7 @@ defmodule HpcConnect.Session do
   # - prefer leading alpha prefix when it has at least 4 chars ("barz123h" -> "barz")
   # - otherwise strip trailing digits and use remaining stem when it has at least 4 chars
   #   ("hpcusr12" -> "hpcusr")
-  @spec derive_group(binary() | nil) :: binary() | nil
-  defp derive_group(nil), do: nil
-
+  @spec derive_group(binary()) :: binary() | nil
   defp derive_group(username) do
     with [leading] <- Regex.run(~r/^([A-Za-z]+)/, username, capture: :all_but_first),
          true <- String.length(leading) >= 4 do
@@ -248,6 +254,12 @@ defmodule HpcConnect.Session do
         parse_bool(env("HPC_CONNECT_STEADY_CONNECTION") || env("STEADY_SSH_CONNECTION"))
       )
 
+    retry_forever =
+      Keyword.get(opts, :retry_forever, parse_bool(env("HPC_CONNECT_RETRY_FOREVER")))
+
+    extended_debug =
+      Keyword.get(opts, :extended_debug, parse_bool(env("HPC_CONNECT_EXTENDED_DEBUG")))
+
     env_overrides = Keyword.get(opts, :env, %{})
 
     env_overrides =
@@ -273,6 +285,8 @@ defmodule HpcConnect.Session do
       vault_dir: vault_dir,
       port_range: port_range,
       steady_connection: steady_connection,
+      retry_forever: retry_forever,
+      extended_debug: extended_debug,
       env: env_overrides
     }
   end
@@ -293,6 +307,20 @@ defmodule HpcConnect.Session do
            Map.get(env_map, "STEADY_SSH_CONNECTION") do
       nil -> opts
       value -> Keyword.put_new(opts, :steady_connection, parse_bool(value))
+    end
+  end
+
+  defp put_retry_forever_from_env(opts, env_map) do
+    case Map.get(env_map, "HPC_CONNECT_RETRY_FOREVER") do
+      nil -> opts
+      value -> Keyword.put_new(opts, :retry_forever, parse_bool(value))
+    end
+  end
+
+  defp put_extended_debug_from_env(opts, env_map) do
+    case Map.get(env_map, "HPC_CONNECT_EXTENDED_DEBUG") do
+      nil -> opts
+      value -> Keyword.put_new(opts, :extended_debug, parse_bool(value))
     end
   end
 

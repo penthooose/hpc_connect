@@ -8,6 +8,8 @@ defmodule HpcConnect do
 
   import Kernel, except: [exit: 1]
 
+  require Logger
+
   alias HpcConnect.{
     Backoff,
     Batch,
@@ -81,6 +83,13 @@ defmodule HpcConnect do
 
   When `persist_form: true` is used, only non-secret defaults are persisted.
   The uploaded private key itself is never persisted.
+
+  Form defaults are pre-filled from `.env` / `.env.example` (via `:env_file` /
+  `:fallback_env_file`, default `.env`). If `HPC_CONNECT_IDENTITY_FILE` (or
+  `:identity_file`) points at an existing key, it is used directly and the
+  upload panel is skipped; otherwise the SSH key is uploaded temporarily and
+  removed by `HpcConnect.cleanup_livebook_session/1` at the end of the session
+  (a persistent `~/.ssh` key is never deleted).
   """
   @spec prepare_livebook_session(keyword()) :: keyword()
   def prepare_livebook_session(opts \\ []) do
@@ -376,7 +385,9 @@ defmodule HpcConnect do
         # reaches the process correctly via System.cmd/Port. Write a temp .bat
         # file that embeds the full command verbatim and execute it via cmd /c.
         bat_path =
-          Path.join(System.tmp_dir!(), "hpc_keygen_#{:erlang.unique_integer([:positive])}.bat")
+          Path.expand(
+            Path.join(System.tmp_dir!(), "hpc_keygen_#{:erlang.unique_integer([:positive])}.bat")
+          )
 
         bat_content =
           "@echo off\r\n\"#{keygen}\" -t rsa -b 4096 -m PEM -f \"#{path}\" -N \"\"\r\n"
@@ -716,7 +727,18 @@ defmodule HpcConnect do
   def connect!(%Session{ssh_conn: nil} = session, remote_command, opts) do
     run_fun = Keyword.get(opts, :run_fun, &run_command_with_retry!/2)
     connect_preflight_fun = Keyword.get(opts, :connect_preflight_fun, &preflight_connectivity/1)
-    run_opts = Keyword.drop(opts, [:run_fun, :connect_preflight_fun])
+
+    # Retry transient connection errors (gateway throttling / dropped links)
+    # until they clear (per-session opt-in via session.retry_forever), with a
+    # backoff cap of up to 90 s between attempts (the gateway can block for
+    # up to a minute+ after too many requests).
+    run_opts =
+      opts
+      |> Keyword.drop([:run_fun, :connect_preflight_fun])
+      |> Keyword.put_new(:retry_forever, session.retry_forever || false)
+      # Retry-forever uses a linear 10 s → 60 s schedule so the csnhr gateway's
+      # ~1-minute throttle window can clear between attempts.
+      |> Keyword.put_new(:retry_backoff_max_ms, 60_000)
 
     # Pre-warm the steady OS SSH shell so commands multiplex over it.
     if SteadyConnection.enabled?(session) do
@@ -760,30 +782,6 @@ defmodule HpcConnect do
     is_binary(dir) and dir != "" and is_binary(config) and config != ""
   end
 
-  defp preflight_connectivity(%Session{} = session) do
-    host = preflight_host(session)
-    timeout_ms = 3_000
-
-    case resolve_and_connect_host(host, 22, timeout_ms) do
-      :ok ->
-        :ok
-
-      {:error, {:dns, reason}} ->
-        {:error,
-         "Livebook SSH preflight failed: the runtime cannot resolve #{host} " <>
-           "for cluster #{session.cluster.name} (#{inspect(reason)}). " <>
-           "This is a network/DNS issue on the Livebook host, not an SSH key problem."}
-
-      {:error, {:tcp, reason}} ->
-        {:error,
-         "Livebook SSH preflight failed: the runtime can resolve #{host} but cannot open TCP port 22 " <>
-           "for cluster #{session.cluster.name} (#{inspect(reason)}). " <>
-           "This usually means outbound SSH is blocked from the shared Livebook server. " <>
-           "Try running Livebook locally or on a VPN-enabled machine, or ask the Livebook administrator " <>
-           "to allow egress to #{host}:22."}
-    end
-  end
-
   defp preflight_host(%Session{} = session) do
     session
     |> proxy_jump_source()
@@ -805,6 +803,73 @@ defmodule HpcConnect do
     |> String.split("@", parts: 2)
     |> List.last()
   end
+
+  defp preflight_connectivity(%Session{} = session) do
+    host = preflight_host(session)
+    timeout_ms = 3_000
+    # The gateway throttles/refuses connections under load (econnrefused); ride
+    # that out with a short backoff — 3 attempts by default, forever when the
+    # session opts into retry-forever (HPC_CONNECT_RETRY_FOREVER=true).
+    max_attempts = if session.retry_forever, do: :forever, else: 3
+
+    case preflight_probe(host, 22, timeout_ms, max_attempts, 0) do
+      :ok ->
+        :ok
+
+      {:error, {:dns, reason}} ->
+        {:error,
+         "Livebook SSH preflight failed: the runtime cannot resolve #{host} " <>
+           "for cluster #{session.cluster.name} (#{inspect(reason)}). " <>
+           "This is a network/DNS issue on the Livebook host, not an SSH key problem."}
+
+      {:error, {:tcp, reason}} ->
+        {:error,
+         "Livebook SSH preflight failed: the runtime can resolve #{host} but cannot open TCP port 22 " <>
+           "for cluster #{session.cluster.name} (#{inspect(reason)}). " <>
+           "This usually means outbound SSH is blocked from the shared Livebook server. " <>
+           "Try running Livebook locally or on a VPN-enabled machine, or ask the Livebook administrator " <>
+           "to allow egress to #{host}:22."}
+    end
+  end
+
+  # Transient TCP connect errors a flaky gateway raises when throttling; the
+  # preflight probe retries these instead of failing immediately.
+  @transient_tcp_errors [
+    :econnrefused,
+    :econnreset,
+    :etimedout,
+    :ehostunreach,
+    :ehostdown,
+    :enetunreach
+  ]
+
+  defp preflight_probe(host, port, timeout_ms, max_attempts, attempt) do
+    case resolve_and_connect_host(host, port, timeout_ms) do
+      :ok ->
+        :ok
+
+      {:error, {:tcp, reason}} = tcp_error when reason in @transient_tcp_errors ->
+        if retry_preflight?(max_attempts, attempt) do
+          Logger.warning(
+            "HpcConnect preflight: cannot open TCP port #{port} on #{host} " <>
+              "(#{inspect(reason)}), retrying (attempt #{attempt + 1})..."
+          )
+
+          Process.sleep(preflight_backoff_ms(attempt))
+          preflight_probe(host, port, timeout_ms, max_attempts, attempt + 1)
+        else
+          tcp_error
+        end
+
+      other ->
+        other
+    end
+  end
+
+  defp retry_preflight?(:forever, _attempt), do: true
+  defp retry_preflight?(max_attempts, attempt), do: attempt < max_attempts - 1
+
+  defp preflight_backoff_ms(attempt), do: min(2_000, 250 * round(:math.pow(2, attempt)))
 
   defp resolve_and_connect_host(host, port, timeout_ms)
        when is_binary(host) and host != "" and is_integer(port) do
@@ -873,8 +938,6 @@ defmodule HpcConnect do
         &String.contains?(message, &1)
       )
   end
-
-  defp recoverable_ssh_connect_error?(_), do: false
 
   defp run_first_successful_command(commands, run_fun, run_opts) do
     Enum.reduce_while(commands, :error, fn candidate, _acc ->
@@ -1030,47 +1093,80 @@ defmodule HpcConnect do
   Options:
     * `:retries` – max attempts (default `3`)
     * `:retry_delay_ms` – fixed delay when provided (backward compat)
+    * `:retry_backoff_mode` – `:exponential` (default) | `:linear`
     * `:retry_backoff_base_ms`, `:retry_backoff_factor`, `:retry_backoff_max_ms`,
-      `:retry_backoff_jitter` – exponential backoff tuning
+      `:retry_backoff_jitter` – backoff tuning (retry-forever defaults to a
+      linear 10 s → 60 s schedule to wait out gateway throttling)
   """
   @spec run_command_with_retry!(Command.t(), keyword()) :: binary()
   def run_command_with_retry!(%Command{} = command, opts \\ []) do
     retries = Keyword.get(opts, :retries, 3)
+    forever? = Keyword.get(opts, :retry_forever, false)
 
     opts_clean =
       Keyword.drop(opts, [
         :retries,
+        :retry_forever,
         :retry_delay_ms,
         :retry_backoff_base_ms,
         :retry_backoff_factor,
         :retry_backoff_max_ms,
+        :retry_backoff_mode,
         :retry_backoff_jitter
       ])
 
-    do_run_with_retry!(command, opts_clean, retries, opts)
+    do_run_with_retry!(command, opts_clean, retries, forever?, 0, opts)
   end
 
-  defp do_run_with_retry!(command, opts, retries_left, retry_opts) do
+  defp do_run_with_retry!(command, opts, retries_left, forever?, attempt, retry_opts) do
     run_command!(command, opts)
   rescue
     e in RuntimeError ->
       msg = Exception.message(e)
-      transient? = Enum.any?(@transient_errors, &String.contains?(msg, &1))
+      transient? = transient_message?(msg)
 
-      if transient? and retries_left > 0 do
-        Process.sleep(retry_delay(retry_opts, retries_left - 1))
-        do_run_with_retry!(command, opts, retries_left - 1, retry_opts)
-      else
-        reraise e, __STACKTRACE__
+      cond do
+        transient? and forever? ->
+          Logger.warning(
+            "[HpcConnect] transient SSH error (attempt #{attempt + 1}); " <>
+              "retrying until it works: #{truncate_transient_msg(msg)}"
+          )
+
+          Process.sleep(retry_delay(retry_opts, attempt, forever?))
+          do_run_with_retry!(command, opts, retries_left, forever?, attempt + 1, retry_opts)
+
+        transient? and retries_left > 0 ->
+          Process.sleep(retry_delay(retry_opts, attempt, forever?))
+          do_run_with_retry!(command, opts, retries_left - 1, forever?, attempt + 1, retry_opts)
+
+        true ->
+          reraise e, __STACKTRACE__
       end
   end
 
+  defp truncate_transient_msg(msg) when is_binary(msg) do
+    if byte_size(msg) > 160, do: binary_part(msg, 0, 160) <> "...", else: msg
+  end
+
+  # Case-insensitive transient-error detection (OpenSSH capitalizes messages
+  # inconsistently, so a raw case-sensitive match can let a retryable error
+  # "slide through" and fail instead of retrying).
+  defp transient_message?(msg) when is_binary(msg) do
+    down = String.downcase(msg)
+    Enum.any?(@transient_errors, &String.contains?(down, String.downcase(&1)))
+  end
+
   # Fixed delay when :retry_delay_ms is provided (backward compat), otherwise
-  # exponential backoff via HpcConnect.Backoff.
-  defp retry_delay(opts, attempt) when is_integer(attempt) and attempt >= 0 do
+  # Backoff. Retry-forever uses the long linear 10 s → 60 s gateway-wait
+  # schedule; finite retries keep the fast exponential.
+  defp retry_delay(opts, attempt, forever? \\ false) when is_integer(attempt) and attempt >= 0 do
     case Keyword.fetch(opts, :retry_delay_ms) do
-      {:ok, delay_ms} when is_integer(delay_ms) and delay_ms >= 0 -> delay_ms
-      _ -> Backoff.delay(attempt, Backoff.options(opts))
+      {:ok, delay_ms} when is_integer(delay_ms) and delay_ms >= 0 ->
+        delay_ms
+
+      _ ->
+        backoff = if forever?, do: Backoff.forever_options(opts), else: Backoff.options(opts)
+        Backoff.delay(attempt, backoff)
     end
   end
 
@@ -1887,8 +1983,6 @@ defmodule HpcConnect do
       &String.contains?(down, &1)
     )
   end
-
-  defp proxy_attach_retryable_error?(_), do: false
 
   @doc """
   Reconnects to an already submitted/running app job without submitting a new one.
@@ -3904,7 +3998,7 @@ defmodule HpcConnect do
   rescue
     e in RuntimeError ->
       msg = Exception.message(e)
-      transient? = Enum.any?(@transient_errors, &String.contains?(msg, &1))
+      transient? = transient_message?(msg)
 
       if transient? and retries > 0 do
         Process.sleep(retry_delay(opts, attempt))
@@ -3919,7 +4013,7 @@ defmodule HpcConnect do
   rescue
     e ->
       msg = Exception.message(e)
-      transient? = Enum.any?(@transient_errors, &String.contains?(msg, &1))
+      transient? = transient_message?(msg)
 
       if transient? and retries > 0 do
         Process.sleep(Backoff.delay(attempt))

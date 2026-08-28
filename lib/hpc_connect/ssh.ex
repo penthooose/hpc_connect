@@ -21,7 +21,8 @@ defmodule HpcConnect.SSH do
           [Session.target(session), "bash -lc #{Shell.escape(remote_command)}"],
       summary: summary,
       remote_command: remote_command,
-      session_key: steady_session_key(session)
+      session_key: steady_session_key(session),
+      extended_debug: session.extended_debug == true
     }
   end
 
@@ -40,7 +41,8 @@ defmodule HpcConnect.SSH do
         recursive_args ++
           scp_option_args(session) ++ [local_path, "#{Session.target(session)}:#{remote_path}"],
       summary: summary,
-      remote_command: nil
+      remote_command: nil,
+      extended_debug: session.extended_debug == true
     }
   end
 
@@ -49,6 +51,8 @@ defmodule HpcConnect.SSH do
 
   def run(%Command{session_key: key, remote_command: remote} = command, opts)
       when is_binary(key) and is_binary(remote) do
+    maybe_trace(command)
+
     # Steady path: route through the persistent OS SSH shell when a server is
     # registered; otherwise fall back to a one-shot OS ssh process.
     case SteadyConnection.lookup_server(key) do
@@ -58,27 +62,55 @@ defmodule HpcConnect.SSH do
   end
 
   def run(%Command{} = command, opts) do
+    maybe_trace(command)
     run_system_cmd(command, opts)
   end
 
+  # Diagnostics: with `extended_debug: true` on the session, print a timestamped
+  # line for every SSH/SCP command *before* it executes, so a crash or hang can
+  # be traced to the exact command (the last printed line is the culprit).
+  defp maybe_trace(%Command{extended_debug: true} = command) do
+    stamp = DateTime.utc_now() |> DateTime.truncate(:millisecond) |> DateTime.to_iso8601()
+    kind = if Path.basename(command.binary) =~ ~r/^scp/, do: "scp", else: "ssh"
+
+    detail =
+      case {command.session_key, command.remote_command} do
+        {key, remote} when is_binary(key) and is_binary(remote) ->
+          "steady[#{String.slice(key, -6, 6)}] #{remote}"
+
+        {_, remote} when is_binary(remote) ->
+          remote
+
+        _ ->
+          Enum.join([command.binary | command.args], " ")
+      end
+
+    IO.puts("[hpc-ext-debug] #{stamp} #{kind}: #{detail}")
+  end
+
+  defp maybe_trace(_), do: :ok
+
   defp run_system_cmd(%Command{binary: binary, args: args}, opts) do
-    retries = Keyword.get(opts, :retries, 1)
+    retries = Keyword.get(opts, :retries, 3)
+    forever? = Keyword.get(opts, :retry_forever, false)
 
     cmd_opts =
       [stderr_to_stdout: true] ++
         Keyword.drop(opts, [
           :retries,
+          :retry_forever,
           :retry_delay_ms,
           :retry_backoff_base_ms,
           :retry_backoff_factor,
           :retry_backoff_max_ms,
+          :retry_backoff_mode,
           :retry_backoff_jitter,
           # System.cmd/3 rejects :timeout; SSH connect timeout is handled via
           # the `-o ConnectTimeout` argument in the command args.
           :timeout
         ])
 
-    run_with_retry(binary, args, cmd_opts, retries, retries, opts)
+    run_with_retry(binary, args, cmd_opts, retries, retries, forever?, 0, opts)
   end
 
   @transient_openssh_errors [
@@ -96,28 +128,74 @@ defmodule HpcConnect.SSH do
     "could not resolve hostname"
   ]
 
-  defp run_with_retry(binary, args, cmd_opts, retries_left, total_retries, opts) do
+  defp run_with_retry(
+         binary,
+         args,
+         cmd_opts,
+         retries_left,
+         total_retries,
+         forever?,
+         attempt,
+         opts
+       ) do
     {output, status} = System.cmd(binary, args, cmd_opts)
 
-    if retries_left > 0 and retryable_openssh_failure?(binary, status, output) do
-      Process.sleep(retry_delay(opts, total_retries, retries_left))
-      run_with_retry(binary, args, cmd_opts, retries_left - 1, total_retries, opts)
-    else
-      {output, status}
+    cond do
+      retryable_openssh_failure?(binary, status, output) and forever? ->
+        Logger.warning(
+          "[HpcConnect] transient OpenSSH error (attempt #{attempt + 1}); " <>
+            "retrying until it works: #{truncate_msg(output)}"
+        )
+
+        Process.sleep(retry_delay(opts, attempt, forever?))
+
+        run_with_retry(
+          binary,
+          args,
+          cmd_opts,
+          retries_left,
+          total_retries,
+          forever?,
+          attempt + 1,
+          opts
+        )
+
+      retries_left > 0 and retryable_openssh_failure?(binary, status, output) ->
+        Process.sleep(retry_delay(opts, attempt, forever?))
+
+        run_with_retry(
+          binary,
+          args,
+          cmd_opts,
+          retries_left - 1,
+          total_retries,
+          forever?,
+          attempt + 1,
+          opts
+        )
+
+      true ->
+        {output, status}
     end
   end
 
   # Fixed delay when :retry_delay_ms is provided (backward compat), otherwise
-  # exponential backoff via HpcConnect.Backoff.
-  defp retry_delay(opts, total_retries, retries_left) do
+  # Backoff (attempt is 0-based and grows). Retry-forever uses the long linear
+  # 10 s → 60 s gateway-wait schedule; finite retries keep the fast exponential.
+  defp retry_delay(opts, attempt, forever?) do
     case Keyword.fetch(opts, :retry_delay_ms) do
       {:ok, delay_ms} when is_integer(delay_ms) and delay_ms >= 0 ->
         delay_ms
 
       _ ->
-        attempt = total_retries - retries_left
-        Backoff.delay(attempt, Backoff.options(opts))
+        backoff = if forever?, do: Backoff.forever_options(opts), else: Backoff.options(opts)
+        Backoff.delay(attempt, backoff)
     end
+  end
+
+  defp truncate_msg(msg) when is_binary(msg) do
+    msg = String.trim(msg)
+    if byte_size(msg) > 160, do: binary_part(msg, 0, 160) <> "...", else: msg
   end
 
   @doc """
@@ -631,7 +709,7 @@ defmodule HpcConnect.SSH do
                   {proxy_conn, nil, proxy_jump_conn, proxy_tunnel_port}
 
                 {:error, native_reason} ->
-                  if has_proxy_jump and proxy_jump_via_os do
+                  if proxy_jump_via_os do
                     case connect_via_os_proxy_jump(session, ssh_opts, timeout) do
                       {:ok, proxy_conn, os_port} ->
                         {proxy_conn, os_port, nil, nil}
@@ -1259,7 +1337,11 @@ defmodule HpcConnect.SSH do
   def exec(%Session{ssh_conn: nil} = session, command, opts) do
     # `System.cmd/3` does not accept `:timeout`; keep it for native `:ssh`
     # branch only and drop it when we fall back to OS ssh/scp commands.
-    os_opts = Keyword.drop(opts, [:timeout])
+    os_opts =
+      opts
+      |> Keyword.drop([:timeout])
+      |> Keyword.put_new(:retry_forever, session.retry_forever || false)
+
     session |> ssh_command(command, command) |> run(os_opts)
   end
 
@@ -1297,7 +1379,10 @@ defmodule HpcConnect.SSH do
   def upload!(%Session{ssh_conn: nil} = session, local_path, remote_path, opts) do
     recursive? = Keyword.get(opts, :recursive, false)
     retries = Keyword.get(opts, :retries, 3)
-    delay_ms = Keyword.get(opts, :retry_delay_ms, 3_000)
+    # Respect the session's retry-forever flag (HPC_CONNECT_RETRY_FOREVER) so
+    # uploads also ride out gateway throttling instead of dying after a few
+    # fixed attempts — consistent with the ssh command retry layer.
+    forever? = Keyword.get(opts, :retry_forever, session.retry_forever || false)
 
     {upload_path, cleanup_dir} = prepare_upload_source(local_path, recursive?, opts)
 
@@ -1307,7 +1392,7 @@ defmodule HpcConnect.SSH do
           recursive: recursive?
         )
 
-      run_scp_with_retry!(cmd, retries, delay_ms)
+      run_scp_with_retry!(cmd, retries, forever?, 0, opts)
     after
       cleanup_upload_source(cleanup_dir)
     end
@@ -1346,7 +1431,7 @@ defmodule HpcConnect.SSH do
     "Temporary failure in name resolution"
   ]
 
-  defp run_scp_with_retry!(%Command{} = cmd, retries_left, delay_ms) do
+  defp run_scp_with_retry!(%Command{} = cmd, retries_left, forever?, attempt, opts) do
     {output, status} = run(cmd, retries: 0)
 
     if status == 0 do
@@ -1355,17 +1440,49 @@ defmodule HpcConnect.SSH do
       message = String.trim(output)
       retryable? = scp_retryable_failure?(status, message)
 
-      if retryable? and retries_left > 0 do
-        Process.sleep(delay_ms)
-        run_scp_with_retry!(cmd, retries_left - 1, delay_ms)
-      else
-        raise RuntimeError, "scp failed (status #{status}): #{message}"
+      cond do
+        retryable? and forever? ->
+          Logger.warning(
+            "[HpcConnect] transient scp error (attempt #{attempt + 1}); " <>
+              "retrying until it works: #{truncate_scp_msg(message)}"
+          )
+
+          Process.sleep(scp_backoff(opts, attempt, forever?))
+          run_scp_with_retry!(cmd, retries_left, forever?, attempt + 1, opts)
+
+        retryable? and retries_left > 0 ->
+          Process.sleep(scp_backoff(opts, attempt, forever?))
+          run_scp_with_retry!(cmd, retries_left - 1, forever?, attempt + 1, opts)
+
+        true ->
+          raise RuntimeError, "scp failed (status #{status}): #{message}"
       end
     end
   end
 
+  # Fixed delay when :retry_delay_ms is provided (backward compat), otherwise
+  # Backoff (attempt is 0-based and grows). Retry-forever uses the long linear
+  # 10 s → 60 s gateway-wait schedule; finite retries keep the fast exponential.
+  defp scp_backoff(opts, attempt, forever?) do
+    case Keyword.fetch(opts, :retry_delay_ms) do
+      {:ok, delay_ms} when is_integer(delay_ms) and delay_ms >= 0 ->
+        delay_ms
+
+      _ ->
+        backoff = if forever?, do: Backoff.forever_options(opts), else: Backoff.options(opts)
+        Backoff.delay(attempt, backoff)
+    end
+  end
+
+  defp truncate_scp_msg(msg) when is_binary(msg) do
+    if byte_size(msg) > 160, do: binary_part(msg, 0, 160) <> "...", else: msg
+  end
+
   defp scp_retryable_failure?(status, message) when is_integer(status) and is_binary(message) do
-    status == 255 and Enum.any?(@transient_scp_errors, &String.contains?(message, &1))
+    down = String.downcase(message)
+
+    status == 255 and
+      Enum.any?(@transient_scp_errors, &String.contains?(down, String.downcase(&1)))
   end
 
   # Recursively uploads a directory tree via SFTP.
