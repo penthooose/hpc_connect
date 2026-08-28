@@ -21,7 +21,11 @@ defmodule HpcConnect.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:jason, "~> 1.4"}
+      {:jason, "~> 1.4"},
+      # Regular (not optional) so `Mix.install([{:hpc_connect, ...}])` in a
+      # Livebook notebook fetches Kino automatically — no need to add it to the
+      # notebook's own Mix.install. Only used for the interactive setup forms.
+      {:kino, "~> 0.19"}
     ]
   end
 end

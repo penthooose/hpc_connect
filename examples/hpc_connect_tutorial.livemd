@@ -2,8 +2,6 @@
 
 ```elixir
 Mix.install([
-	{:kino, "~> 0.19"},
-	{:table, "0.1.2"},
 	{:hpc_connect, github: "penthooose/hpc_connect", force: true}
 ])
 ```
