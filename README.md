@@ -79,7 +79,7 @@ boot =
     mode: :local,
     cluster: :alex,
     username: "your_hpc_username",
-    key_path: Path.expand("~/.ssh/id_fau"),
+    key_path: Path.expand("~/.ssh/id_hpc"),
     remote_command: "hostname && whoami",
     env_file: ".env"
   )
@@ -95,8 +95,8 @@ boot =
     mode: :local,
     cluster: :alex,
     username: "your_hpc_username",
-    key_path: Path.expand("~/.ssh/id_fau"),
-    hf_token: System.get_env("HF_TOKEN")
+    key_path: Path.expand("~/.ssh/id_hpc"),
+    hf_token: System.get_env("HUGGINGFACE_HUB_TOKEN")
   )
 ```
 

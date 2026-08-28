@@ -886,7 +886,7 @@ defmodule HpcConnectTest do
 
     session =
       HpcConnect.new_session(:alex,
-        username: "v135ca12",
+        username: "hpcusr01",
         ssh_alias: "alex",
         identity_file: "/tmp/id_hpc_test"
       )
@@ -915,7 +915,7 @@ defmodule HpcConnectTest do
 
     session =
       HpcConnect.new_session(:alex,
-        username: "v135ca12",
+        username: "hpcusr01",
         ssh_alias: "alex",
         identity_file: "/tmp/id_hpc_test"
       )
